@@ -18,6 +18,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -48,6 +49,8 @@ import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.twotone.Security
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -87,6 +90,7 @@ import org.json.JSONObject
 
 private data class RemoteFile(
     val path: String,
+    val kind: String,
     val size: Long,
     val modified: Double
 )
@@ -468,15 +472,16 @@ private fun FilesPage(initialRoot: String) {
     val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
+    val rootBoundary = initialRoot.trimEnd('/').ifEmpty { "/" }
 
-    fun loadPage(start: Int) {
+    fun loadPage(start: Int, scanRoot: String = root) {
         if (loading) return
         loading = true
-        status = "Scanning page at $start..."
+        status = "Scanning $scanRoot at $start..."
         val pageSize = limit.toIntOrNull()?.coerceIn(1, 10000) ?: 100
         scope.launch {
             val raw = withContext(Dispatchers.IO) {
-                service.callAttr("call_feature", "files", "scan", root, start, pageSize).toString()
+                service.callAttr("call_feature", "files", "scan", scanRoot, start, pageSize).toString()
             }
             try {
                 val result = JSONObject(raw)
@@ -490,7 +495,12 @@ private fun FilesPage(initialRoot: String) {
                 val newEntries = buildList {
                     for (index in 0 until page.length()) {
                         val item = page.optJSONObject(index) ?: continue
-                        add(RemoteFile(item.optString("path"), item.optLong("size"), item.optDouble("modified")))
+                        add(RemoteFile(
+                            item.optString("path"),
+                            item.optString("kind", "file"),
+                            item.optLong("size"),
+                            item.optDouble("modified")
+                        ))
                     }
                 }
                 entries = if (start == 0) newEntries else entries + newEntries
@@ -518,42 +528,76 @@ private fun FilesPage(initialRoot: String) {
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            OutlinedTextField(root, { root = it }, Modifier.weight(1f), singleLine = true, label = { Text("Remote root") })
-            OutlinedTextField(limit, { limit = it.filter(Char::isDigit) }, Modifier.weight(.35f), singleLine = true, label = { Text("Page") })
+            Button(enabled = root != rootBoundary, onClick = {
+                val parent = root.trimEnd('/').substringBeforeLast('/', rootBoundary).ifEmpty { "/" }
+                val parentRoot = if (parent.length < rootBoundary.length || !parent.startsWith(rootBoundary)) {
+                    rootBoundary
+                } else {
+                    parent
+                }
+                root = parentRoot
+                entries = emptyList()
+                nextOffset = 0
+                hasMore = false
+                scope.launch { listState.scrollToItem(0) }
+                loadPage(0, parentRoot)
+            }) { Text("Up") }
+            Text(root, modifier = Modifier.weight(1f).align(androidx.compose.ui.Alignment.CenterVertically), maxLines = 2)
+            Button(onClick = {
+                entries = emptyList()
+                nextOffset = 0
+                hasMore = false
+                loadPage(0, root)
+            }) { Text("Refresh") }
         }
-        Button(onClick = {
-            entries = emptyList()
-            nextOffset = 0
-            hasMore = false
-            loadPage(0)
-        }) { Text("Scan recursively") }
+        OutlinedTextField(
+            limit,
+            { limit = it.filter(Char::isDigit) },
+            Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Page size") }
+        )
         Text(status, style = MaterialTheme.typography.labelMedium)
         LazyColumn(state = listState, verticalArrangement = Arrangement.spacedBy(4.dp)) {
             items(entries) { entry ->
                 Row(
                     Modifier.fillMaxWidth().clickable {
-                        status = "Downloading ${entry.path}..."
-                        scope.launch {
-                            try {
-                                val transfer = withContext(Dispatchers.IO) {
-                                    service.callAttr("call_feature", "files", "upload", root.trimEnd('/') + "/" + entry.path).toString()
-                                }
-                                val transferJson = JSONObject(transfer)
-                                val url = transferJson.optString("url")
-                                if (url.isBlank()) error(transferJson.optString("error", "upload failed"))
-                                withContext(Dispatchers.IO) {
-                                    service.callAttr("download_remote_to_file", url, entry.path.substringAfterLast('/')).toString()
-                                }
-                                if (entry.path.lowercase().matches(Regex(".*\\.(jpg|jpeg|png|webp|gif)$"))) {
-                                    val encoded = withContext(Dispatchers.IO) {
-                                        service.callAttr("download_transfer_base64", url).toString()
+                        if (entry.kind == "directory") {
+                            val childRoot = root.trimEnd('/') + "/" + entry.path
+                            root = childRoot
+                            entries = emptyList()
+                            nextOffset = 0
+                            hasMore = false
+                            status = "Opening $childRoot..."
+                            scope.launch { listState.scrollToItem(0) }
+                            loadPage(0, childRoot)
+                        } else {
+                            val currentRoot = root
+                            status = "Downloading ${entry.path}..."
+                            scope.launch {
+                                try {
+                                    val transfer = withContext(Dispatchers.IO) {
+                                        service.callAttr("call_feature", "files", "upload", currentRoot.trimEnd('/') + "/" + entry.path).toString()
                                     }
-                                    val bytes = Base64.decode(encoded, Base64.DEFAULT)
-                                    preview = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                                    val transferJson = JSONObject(transfer)
+                                    if (!transferJson.optBoolean("ok", true)) error(transferJson.optString("error", "upload failed"))
+                                    val url = transferJson.optString("url")
+                                    if (url.isBlank()) error(transferJson.optString("error", "upload returned no URL"))
+                                    val saved = withContext(Dispatchers.IO) {
+                                        JSONObject(service.callAttr("download_remote_to_file", url, entry.path.substringAfterLast('/')).toString())
+                                    }
+                                    if (!saved.optBoolean("ok")) error(saved.optString("error", "download failed"))
+                                    if (entry.path.lowercase().matches(Regex(".*\\.(jpg|jpeg|png|webp|gif)$"))) {
+                                        val encoded = withContext(Dispatchers.IO) {
+                                            service.callAttr("download_transfer_base64", url).toString()
+                                        }
+                                        val bytes = Base64.decode(encoded, Base64.DEFAULT)
+                                        preview = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                                    }
+                                    status = "Saved to app script directory downloads/"
+                                } catch (error: Exception) {
+                                    status = "Download failed: ${error.message}"
                                 }
-                                status = "Saved to app script directory downloads/"
-                            } catch (error: Exception) {
-                                status = "Download failed: ${error.message}"
                             }
                         }
                     }.padding(vertical = 8.dp),
@@ -561,9 +605,12 @@ private fun FilesPage(initialRoot: String) {
                 ) {
                     Column(Modifier.weight(1f)) {
                         Text(entry.path, style = MaterialTheme.typography.bodyMedium)
-                        Text("${entry.size} B · ${entry.modified}", style = MaterialTheme.typography.bodySmall)
+                        Text(
+                            if (entry.kind == "directory") "Folder" else "${entry.size} B · ${entry.modified}",
+                            style = MaterialTheme.typography.bodySmall
+                        )
                     }
-                    Text("Download", style = MaterialTheme.typography.labelSmall)
+                    Text(if (entry.kind == "directory") "Open" else "Download", style = MaterialTheme.typography.labelSmall)
                 }
             }
             if (loading) item { Text("Loading...") }
@@ -577,14 +624,31 @@ private fun FilesPage(initialRoot: String) {
 @Composable
 private fun CameraPage() {
     var facing by remember { mutableStateOf(0) }
+    var cameraMenuExpanded by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Ready") }
     var preview by remember { mutableStateOf<ImageBitmap?>(null) }
     val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { facing = 0 }) { Text("Back") }
-            Button(onClick = { facing = 1 }) { Text("Front") }
+            Box {
+                Button(onClick = { cameraMenuExpanded = true }) {
+                    Text(if (facing == 0) "Back camera" else "Front camera")
+                }
+                DropdownMenu(
+                    expanded = cameraMenuExpanded,
+                    onDismissRequest = { cameraMenuExpanded = false }
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Back camera") },
+                        onClick = { facing = 0; cameraMenuExpanded = false }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Front camera") },
+                        onClick = { facing = 1; cameraMenuExpanded = false }
+                    )
+                }
+            }
             Button(onClick = {
                 status = "Capturing..."
                 preview = null
@@ -594,7 +658,10 @@ private fun CameraPage() {
                             service.callAttr("call_feature", "camera", "capture", facing).toString()
                         }
                         val result = JSONObject(raw)
-                        if (!result.optBoolean("ok")) error(result.optString("error", "capture failed"))
+                        if (!result.optBoolean("ok")) {
+                            status = result.toString(2)
+                            return@launch
+                        }
                         val url = result.optString("url")
                         if (url.isNotBlank()) {
                             val encoded = withContext(Dispatchers.IO) {

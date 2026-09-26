@@ -175,7 +175,7 @@ class ClientServiceTests(unittest.TestCase):
                 client_service._STATE.clear()
                 client_service._STATE.update(previous_state)
 
-    def test_rpc_success_log_correlates_response_without_logging_source_code(self):
+    def test_rpc_success_log_shows_request_source_and_response_metadata(self):
         previous_state = client_service._STATE.copy()
         with tempfile.TemporaryDirectory() as files_dir:
             try:
@@ -199,11 +199,14 @@ class ClientServiceTests(unittest.TestCase):
                 logs = "\n".join(json.loads(client_service.rpc_logs()))
                 self.assertIn("topic=sys/device/k12", logs)
                 self.assertIn("phase=response", logs)
+                self.assertIn("MQTT RESPONSE ENVELOPE", logs)
+                self.assertIn('"r": "{}"', logs)
                 self.assertIn("req_id=server-req-1", logs)
                 self.assertIn("server_time=1790421445203", logs)
                 self.assertIn("server=server-broker", logs)
                 self.assertIn("client=client-broker", logs)
-                self.assertNotIn("DO_NOT_LOG_RPC_SOURCE", logs)
+                self.assertIn("REQUEST CODE", logs)
+                self.assertIn("DO_NOT_LOG_RPC_SOURCE", logs)
                 parsed = client_service.parse_json_result(response)
                 self.assertEqual(parsed["_rpc"]["req_id"], "server-req-1")
                 health = json.loads(client_service.target_health("sys/device/k12"))
@@ -264,7 +267,28 @@ class ClientServiceTests(unittest.TestCase):
         ast.parse(code)
         self.assertIn("has_more", code)
         self.assertIn("next_offset", code)
-        self.assertIn("len(items) >= start + limit", code)
+        self.assertIn("seen < start", code)
+
+    def test_scan_returns_directories_first_and_pages_without_skipping(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "b-file.txt").write_text("b", encoding="utf-8")
+            Path(root, "a-folder").mkdir()
+            Path(root, "c-folder").mkdir()
+
+            first_env = {}
+            exec(feature_files.build_scan_code(root, offset=0, limit=2), first_env)
+            first = json.loads(first_env["r"])
+            self.assertEqual([item["kind"] for item in first["items"]], ["directory", "directory"])
+            self.assertEqual(first["next_offset"], 2)
+            self.assertTrue(first["has_more"])
+
+            second_env = {}
+            exec(feature_files.build_scan_code(root, offset=2, limit=2), second_env)
+            second = json.loads(second_env["r"])
+            self.assertEqual(len(second["items"]), 1)
+            self.assertEqual(second["items"][0]["kind"], "file")
+            self.assertEqual(second["next_offset"], 3)
+            self.assertFalse(second["has_more"])
 
     def test_path_cannot_escape_root(self):
         self.assertEqual(
@@ -305,7 +329,54 @@ class ClientServiceTests(unittest.TestCase):
 
     def test_parse_json_result_preserves_structured_rpc_errors(self):
         response = {"ok": False, "error": "RPC timeout", "elapsed_ms": 5000}
-        self.assertEqual(client_service.parse_json_result(response), response)
+        result = client_service.parse_json_result(response)
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"], "RPC timeout")
+        self.assertEqual(result["_rpc"]["elapsed_ms"], 5000)
+
+    def test_server_python_traceback_is_summarized_and_key_redacted(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                client_service.update_device_settings("sys/device/request", {
+                    "request_topic": "sys/device/k12",
+                    "private_key": "PRIVATE_KEY_SECRET",
+                })
+                response = {
+                    "ok": False,
+                    "req_id": "server-req-error",
+                    "server_from": "broker.example",
+                    "r": None,
+                    "error": "Traceback (most recent call last):\n  File \"<rpc>\", line 1\nRuntimeError: failed PRIVATE_KEY_SECRET",
+                }
+                with mock.patch.object(client_service, "_mqtt_client_module") as loader:
+                    loader.return_value.rpc.return_value = response
+                    result = client_service.rpc("raise RuntimeError('PRIVATE_KEY_SECRET')")
+
+                logs = "\n".join(json.loads(client_service.rpc_logs()))
+                self.assertIn("MQTT RESPONSE ENVELOPE", logs)
+                self.assertIn('"r": null', logs)
+                self.assertIn("Traceback (most recent call last)", logs)
+                parsed = client_service.parse_json_result(result)
+                self.assertIn("RuntimeError: failed <redacted>", logs)
+                self.assertNotIn("PRIVATE_KEY_SECRET", logs)
+                self.assertIn("REQUEST CODE", logs)
+                self.assertIn("raise RuntimeError", logs)
+                self.assertNotIn("PRIVATE_KEY_SECRET", logs)
+                self.assertEqual(parsed["error"], response["error"])
+                self.assertEqual(parsed["_rpc"]["server_from"], "broker.example")
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_parse_json_result_never_returns_null_or_non_object(self):
+        self.assertFalse(client_service.parse_json_result({"ok": True, "r": None})["ok"])
+        self.assertFalse(client_service.parse_json_result({"ok": True, "r": "null"})["ok"])
+        self.assertEqual(
+            client_service.parse_json_result({"ok": True, "r": "[1,2]"})["error"],
+            "target RPC result must be a JSON object, got list",
+        )
 
     def test_files_feature_actions_use_shared_rpc_and_return_json(self):
         page = {"ok": True, "items": [], "has_more": False, "next_offset": 0}

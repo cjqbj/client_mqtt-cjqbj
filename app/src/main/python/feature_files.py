@@ -10,7 +10,7 @@ def run():
     return FEATURE
 
 
-def build_scan_code(root, offset=0, limit=100, recursive=True):
+def build_scan_code(root, offset=0, limit=100, recursive=False):
     root_value = json.dumps(str(root), ensure_ascii=False)
     offset_value = max(0, int(offset))
     limit_value = max(1, min(int(limit), 10000))
@@ -23,6 +23,7 @@ recursive = {recursive_value!r}
 items = []
 errors = []
 has_more = False
+seen = 0
 base = os.path.realpath(root)
 if not os.path.isdir(root):
     r = json.dumps({{"ok": False, "error": "root is not a directory", "root": root}}, ensure_ascii=False)
@@ -35,18 +36,24 @@ else:
             dirs[:] = []
             continue
         dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(current, d))]
-        for name in names:
+        entries = [(name, "directory") for name in dirs]
+        entries.extend((name, "file") for name in names)
+        entries.sort(key=lambda item: (item[1] != "directory", item[0].casefold()))
+        for name, kind in entries:
             path = os.path.join(current, name)
             try:
                 real = os.path.realpath(path)
                 if not (real == base or real.startswith(base + os.sep)):
                     continue
                 stat = os.stat(path, follow_symlinks=False)
-                if len(items) >= start + limit:
+                if seen < start:
+                    seen += 1
+                    continue
+                if len(items) >= limit:
                     has_more = True
                     break
-                if len(items) >= start:
-                    items.append({{"path": os.path.relpath(path, root), "kind": "file", "size": stat.st_size, "modified": stat.st_mtime}})
+                items.append({{"path": os.path.relpath(path, root), "kind": kind, "size": stat.st_size, "modified": stat.st_mtime}})
+                seen += 1
             except OSError as exc:
                 errors.append({{"path": os.path.relpath(path, root), "error": repr(exc)}})
         if has_more or not recursive:

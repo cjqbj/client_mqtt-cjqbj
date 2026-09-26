@@ -119,7 +119,10 @@ def operation_logs():
 
 
 def _append_rpc_log(message):
-    entry = f"{time.strftime('%H:%M:%S')} {str(message).replace(chr(10), ' ')[:500]}"
+    text = str(message).replace("\r\n", "\n")
+    if len(text) > 20000:
+        text = text[:20000] + "\n...[diagnostic entry truncated]"
+    entry = f"{time.strftime('%H:%M:%S')} {text}"
     with _STATE["lock"]:
         logs = _STATE.setdefault("rpc_logs", [])
         logs.append(entry)
@@ -400,6 +403,51 @@ def _private_key_kind(value):
     return "raw-text"
 
 
+def _collect_config_strings(value):
+    if isinstance(value, dict):
+        for nested in value.values():
+            yield from _collect_config_strings(nested)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            yield from _collect_config_strings(nested)
+    elif isinstance(value, str) and value:
+        yield value
+
+
+def _redact_rpc_content(value, selected, limit=16000):
+    detail = str(value)
+    secrets = list(_collect_config_strings(load_config().get("aliyun", {})))
+    private_key = selected.get("private_key") if selected else None
+    if private_key:
+        secrets.append(str(private_key))
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        detail = detail.replace(secret, "<redacted>")
+    if len(detail) > limit:
+        detail = detail[:limit] + "\n...[content truncated]"
+    return detail
+
+
+def _redact_rpc_error(value, selected):
+    lines = [line.strip() for line in str(value).splitlines() if line.strip()]
+    detail = lines[-1] if lines else str(value)
+    return _redact_rpc_content(detail, selected, limit=1200).replace("\n", " ")
+
+
+def _remote_rpc_error(response, selected):
+    error = response.get("error") if isinstance(response, dict) else None
+    result_value = response.get("r") if isinstance(response, dict) else None
+    if isinstance(result_value, str):
+        try:
+            result_value = json.loads(result_value)
+        except ValueError:
+            result_value = None
+    if isinstance(result_value, dict) and result_value.get("ok") is False:
+        error = result_value.get("error") or error
+    if isinstance(response, dict) and response.get("ok") is False and not error:
+        error = "server returned ok=false without error details"
+    return _redact_rpc_error(error, selected) if error else None
+
+
 def update_device_settings(existing_device, values):
     if isinstance(values, str):
         values = json.loads(values)
@@ -527,6 +575,11 @@ def rpc(code, device=None):
             f"sys.__dict__.setdefault('_qgb_dict', {{}}).setdefault('aliyun_git', {{}}).update({aliyun})\n"
             + code
         )
+        safe_code = _redact_rpc_content(code, selected)
+        _append_rpc_log(
+            f"REQUEST CODE id={request_id} topic={topic} chars={len(code)}"
+            f"\n--- begin request code ---\n{safe_code}\n--- end request code ---"
+        )
         _append_rpc_log(f"INFO id={request_id} topic={topic} phase=request-sent")
         response = client_mqtt.rpc(
             code,
@@ -568,6 +621,7 @@ def rpc(code, device=None):
             f"WARN id={request_id} topic={topic} phase=timeout elapsed_ms={elapsed} "
             f"timeout={timeout:g}s brokers=[{broker_state}]"
         )
+        _append_rpc_log(f"MQTT RESPONSE id={request_id}: <no response before timeout>")
         return {
             "ok": False,
             "error": "RPC timeout",
@@ -579,12 +633,25 @@ def rpc(code, device=None):
     response["elapsed_ms"] = elapsed
     response["request_id"] = request_id
     _record_rpc_health(selected, True)
-    _append_rpc_log(
-        f"INFO id={request_id} req_id={response.get('req_id', 'unknown')} topic={topic} "
-        f"phase=response elapsed_ms={elapsed} server_time={response.get('server_time', 'unknown')} "
-        f"server={response.get('server_from', 'unknown')} client={response.get('client_from', 'unknown')} "
-        f"remote_latency_ms={response.get('latency_ms', 'unknown')}"
+    response_detail = _redact_rpc_content(
+        json.dumps(response, ensure_ascii=False, indent=2, default=str),
+        selected,
     )
+    _append_rpc_log(f"MQTT RESPONSE ENVELOPE id={request_id}\n{response_detail}")
+    remote_error = _remote_rpc_error(response, selected)
+    if remote_error:
+        _append_rpc_log(
+            f"ERROR id={request_id} req_id={response.get('req_id', 'unknown')} topic={topic} "
+            f"phase=target-error server={response.get('server_from', 'unknown')} "
+            f"remote_error={remote_error}"
+        )
+    else:
+        _append_rpc_log(
+            f"INFO id={request_id} req_id={response.get('req_id', 'unknown')} topic={topic} "
+            f"phase=response elapsed_ms={elapsed} server_time={response.get('server_time', 'unknown')} "
+            f"server={response.get('server_from', 'unknown')} client={response.get('client_from', 'unknown')} "
+            f"remote_latency_ms={response.get('latency_ms', 'unknown')}"
+        )
     return response
 
 
@@ -629,13 +696,33 @@ def parse_json_result(response):
     if not response:
         return {"ok": False, "error": "empty RPC response"}
     if isinstance(response, dict):
-        if "r" not in response:
-            return response
-        value = response["r"]
+        value = response.get("r")
     else:
         value = response
     try:
-        result = json.loads(value) if isinstance(value, str) else value
+        if isinstance(response, dict) and response.get("ok") is False:
+            result = {
+                "ok": False,
+                "error": response.get("error") or "RPC server returned ok=false",
+            }
+        elif isinstance(response, dict) and "r" not in response:
+            result = {"ok": False, "error": "RPC response is missing result field"}
+        elif value is None:
+            result = {
+                "ok": False,
+                "error": response.get("error") if isinstance(response, dict) and response.get("error")
+                else "target RPC returned null result",
+            }
+        else:
+            result = json.loads(value) if isinstance(value, str) else value
+        if result is None:
+            result = {"ok": False, "error": "target RPC returned JSON null"}
+        elif not isinstance(result, dict):
+            result = {
+                "ok": False,
+                "error": f"target RPC result must be a JSON object, got {type(result).__name__}",
+                "result": result,
+            }
         metadata_fields = (
             "req_id", "request_id", "server_time", "server_from", "latency_ms", "client_from", "elapsed_ms",
         )

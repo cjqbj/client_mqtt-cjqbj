@@ -22,10 +22,12 @@
 - 每个 feature 自己负责领域代码生成和 RPC 动作；`client_service` 只提供通用 RPC、JSON、配置和传输桥接，不新增 `build_wifi_code`、`scan_remote` 这类 feature 专属 helper。
 - Feature 返回结构化 JSON；普通信息由 Compose 展示，照片等媒体通过 feature 返回的短 URL/元数据交给 Compose 下载和预览，不能把媒体字节经 MQTT 返回。
 - `client_service.call_feature` 必须捕获 feature 的 Python 异常并返回结构化错误，不能让第三方脚本异常越过 Chaquopy 边界关闭 Activity；原生/JVM 崩溃不属于此保护范围。
-- RPC 必须写入 App 内可查看且可复制的有界诊断日志，包含关联 ID、topic、reply topic、key 是否配置及类型/标准化长度、阶段、耗时、响应 broker 和超时连接状态；不得记录 key 内容、Aliyun 凭据或 RPC 源码。
+- RPC 必须写入 App 内可查看且可复制的有界诊断日志，包含关联 ID、topic、reply topic、完整请求代码、MQTT envelope/raw response、目标 error/r、key 配置状态及类型/标准化长度、阶段、耗时和 broker 状态。
 - 通用设置必须提供在线探测开关和间隔；任一目标 topic 的成功 RPC 都更新其健康时间，并推迟该目标的下一次探测，避免重复 ping。
 - RPC 结果使用明确 JSON，不要为新协议依赖 Python 的 repr 输出。
 - 递归扫描必须限制分页大小并返回 `has_more`、`next_offset`；拒绝路径穿越、符号链接逃逸和无界递归。
+- files feature 的默认浏览页只扫描当前目录，结果同时包含 directory/file 项；Compose 负责进入子目录、返回上级和下载文件。分页 offset 必须基于已遍历条数。
+- RPC 的 `r` 为 null 或目标返回 `ok: false` 时，必须保留目标错误详情并作为结构化结果展示，不能转成裸 JSON null。
 - 扩大改动前先添加或更新针对性测试。
 - 每完成一个可验证里程碑，更新 `PROGRESS.md`；RPC 请求或响应契约变化时更新 `PROTOCOL.md`。
 - 架构、构建流程、feature API 或剩余工作发生变化时，分别同步 `ARCHITECTURE.md`、`BUILD.md`、`FEATURE_DEVELOPMENT.md` 或 `TODO.md`；不要把未验证事项写成已完成。

@@ -19,6 +19,8 @@
 - Wi-Fi query generation and files scan/upload code generation owned by their respective feature modules.
 - Compose JSON rendering and camera photo download/preview bridge.
 - Catchable Python feature failures, including `SystemExit`, reported as structured UI errors instead of escaping into the Activity.
+- Current-directory file browsing with folder-first rows, tap-to-enter, parent navigation, corrected pagination, and file-only downloads.
+- Preserve and display server error details when target RPC returns `ok: false` and `r: null`.
 - In-app RPC diagnostics with broker state and credential/source redaction.
 - Private-key standardization button backed by the upstream PEM normalizer.
 - Copyable RPC diagnostics and Wi-Fi result, including sanitized key configuration state.
