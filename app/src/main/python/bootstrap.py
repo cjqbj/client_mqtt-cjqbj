@@ -13,9 +13,21 @@ _UPDATE_DIR = None
 BUILTIN_FEATURES = ("files", "camera", "wifi")
 MAX_FEATURE_SIZE = 2 * 1024 * 1024
 
+import client_service
 
 def init_env(update_dir):
-    global _UPDATE_DIR
+    global _UPDATE_DIR,ghs
+    client_service._mqtt_client_module()  #
+    import server_http
+    import server_http
+    ghs = server_http.start_rpc_server(
+        port=1166,
+        ip='0.0.0.0',
+        globals=globals(),
+        locals=locals(),
+    )
+    print(f"RPC server started {ghs}")
+
     _UPDATE_DIR = os.path.abspath(str(update_dir))
     os.makedirs(_UPDATE_DIR, exist_ok=True)
     if _UPDATE_DIR in sys.path:
