@@ -58,6 +58,8 @@ A feature must not import Compose or Android Activity classes. It owns its domai
 - `client_service.standardize_private_key(value)` normalizes key expressions and PEM/OpenSSH inputs through upstream `get_standard_pem_bytes`.
 - `client_service.general_settings()` and `update_general_settings(values)` manage the app-wide online probe toggle and interval.
 - `client_service.target_health(device_ref)` returns per-target last RPC/probe state and in-flight count.
+- `client_service.selected_feature(device_ref=None)` and `select_feature(name, device_ref=None)` read/persist the last visible feature tab per target (plain feature name, `""` when unset).
+- `client_service.feature_settings(name, device_ref=None)` and `update_feature_settings(name, values, device_ref=None)` read and shallow-merge an opaque per-target JSON settings object owned by the feature.
 - Successful feature results retain transport fields such as request ID, server time, responding brokers, latency, and elapsed time in `_rpc`; Compose can display or copy them.
 - `feature_files.scan(...)` generates and sends bounded target scanning code.
 - `feature_files.upload(path)` generates and sends target-side Aliyun upload code.
@@ -69,6 +71,15 @@ A feature must not import Compose or Android Activity classes. It owns its domai
 Each target record has a stable `id` and its own `request_topic`, `remote_root`, private key, timeout, and server-signature fallback option. Aliyun JSON is global and stored once at the root of `client_mqtt.json`, not in target records. Both forms automatically write edits after a short debounce and poll the file once per second for external changes. Invalid in-progress Aliyun JSON is retained as a draft while the last valid object remains active. Before executing feature code, the RPC bridge initializes the target-side Aliyun configuration from the global setting. Private-key strings are passed unchanged to `multi_mqtt.get_standard_pem_bytes`; it supports integer expressions, including the configured value `233`, and key-file/PEM inputs.
 
 Each feature should be independently callable through `client_service.call_feature` and must not rely on another feature's code generator. Keep Android pages limited to presentation and dispatch; do not duplicate Wi-Fi, scan, upload, or camera RPC code in the Activity or generic service. The settings page downloads missing scripts through Python with per-request timeouts, alternating GitHub URLs, up to four attempts, and progress messages shown in the download log.
+
+## Per-target memory
+
+The app shell automatically persists two kinds of per-target UI state in `client_mqtt.json`, keyed by the target's stable `id` (topic renames do not lose it):
+
+- `selected_feature`: the last visible feature tab of each target. The shell writes it on every page switch and restores it once per target on cold start or target switch — feature authors get tab memory for free, nothing to implement.
+- `feature_settings`: an opaque JSON object per `(target, feature)` for settings the feature owns. Compose pages read it on launch and write back on user edits; Python feature code running under the currently selected target can read the same object with `client_service.feature_settings(name)` (`device_ref=None` selects the current target).
+
+Feature authors must not read or write `client_mqtt.json` themselves; call the two helpers above. Values are shallow-merged, so store flat preference keys (example: the camera feature stores `{"lens_facing": 0}` for the back/front choice, rendered as two explicit choice chips in its page). Do not store secrets or large blobs in feature settings.
 
 ## Runtime installation
 

@@ -375,6 +375,87 @@ def select_device(device_ref):
     return json.dumps({"ok": True, "device": selected}, ensure_ascii=False)
 
 
+def _normalize_feature_name(feature):
+    name = str(feature or "").strip()
+    if name.startswith("feature_"):
+        name = name[8:]
+    if not name:
+        raise ValueError("feature name is required")
+    return name
+
+
+def _memory_device_id(device_ref=None):
+    selected = _device_config(device_ref)
+    return str(selected.get("id") or selected.get("request_topic") or "")
+
+
+def selected_feature(device_ref=None):
+    """Return the persisted last-selected feature name for a target ("" if none).
+
+    Plain string (not JSON) so the UI can use the call result directly.
+    """
+    config = load_config()
+    mapping = config.get("selected_feature")
+    if not isinstance(mapping, dict):
+        return ""
+    return str(mapping.get(_memory_device_id(device_ref)) or "")
+
+
+def select_feature(feature, device_ref=None):
+    """Persist the last-selected feature name for a target."""
+    name = _normalize_feature_name(feature)
+    device_id = _memory_device_id(device_ref)
+    with _STATE["lock"]:
+        config = load_config()
+        mapping = config.get("selected_feature")
+        mapping = dict(mapping) if isinstance(mapping, dict) else {}
+        mapping[device_id] = name
+        config["selected_feature"] = mapping
+        save_config(config)
+    return json.dumps({"ok": True, "device_id": device_id, "feature": name}, ensure_ascii=False)
+
+
+def feature_settings(feature, device_ref=None):
+    """Return the persisted per-target settings JSON object for a feature ("{}" if none)."""
+    name = _normalize_feature_name(feature)
+    device_id = _memory_device_id(device_ref)
+    config = load_config()
+    all_settings = config.get("feature_settings")
+    if not isinstance(all_settings, dict):
+        return "{}"
+    per_device = all_settings.get(device_id)
+    if not isinstance(per_device, dict):
+        return "{}"
+    settings = per_device.get(name)
+    if not isinstance(settings, dict):
+        return "{}"
+    return json.dumps(settings, ensure_ascii=False)
+
+
+def update_feature_settings(feature, values, device_ref=None):
+    """Shallow-merge per-target settings for a feature; returns the merged JSON object."""
+    name = _normalize_feature_name(feature)
+    if isinstance(values, str):
+        values = json.loads(values)
+    if not isinstance(values, dict):
+        raise ValueError("feature settings must be a JSON object")
+    device_id = _memory_device_id(device_ref)
+    with _STATE["lock"]:
+        config = load_config()
+        all_settings = config.get("feature_settings")
+        all_settings = dict(all_settings) if isinstance(all_settings, dict) else {}
+        per_device = all_settings.get(device_id)
+        per_device = dict(per_device) if isinstance(per_device, dict) else {}
+        settings = per_device.get(name)
+        settings = dict(settings) if isinstance(settings, dict) else {}
+        settings.update(values)
+        per_device[name] = settings
+        all_settings[device_id] = per_device
+        config["feature_settings"] = all_settings
+        save_config(config)
+    return json.dumps(settings, ensure_ascii=False)
+
+
 def target_health(device_ref=None):
     selected = _device_config(device_ref)
     key = selected.get("id") or selected["request_topic"]

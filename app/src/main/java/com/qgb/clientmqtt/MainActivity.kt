@@ -62,8 +62,7 @@ import androidx.compose.material.icons.twotone.Security
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -183,6 +182,9 @@ private fun ClientMqttScreen() {
     // 冷启动恢复闸门：Python 端 selected_device_id 恢复完成前，
     // 轮询协程不得用 Kotlin 占位 topic 匹配并覆盖持久化选择。
     var restoreDone by remember { mutableStateOf(false) }
+    // 每个设备分别记住最后选中的 feature：记录已完成恢复的设备 id，
+    // 恢复完成前禁止回写，避免冷启动的占位页覆盖持久化选择。
+    var featureRestoredFor by remember { mutableStateOf("") }
     var targetRemoteRoot by remember { mutableStateOf("/data/data") }
     var onlineStatus by remember { mutableStateOf("checking") }
     var onlineProbeEnabled by remember { mutableStateOf(true) }
@@ -341,6 +343,33 @@ private fun ClientMqttScreen() {
     LaunchedEffect(features.size) {
         if (features.isNotEmpty() && pagerState.currentPage >= features.size) {
             pagerState.animateScrollToPage(features.lastIndex)
+        }
+    }
+
+    // 恢复当前设备上次选中的 feature tab（每设备只做一次；
+    // 特性表 3s 轮询会反复替换列表，靠 featureRestoredFor 挡掉重入）。
+    LaunchedEffect(selectedDeviceId, features) {
+        val deviceId = selectedDeviceId
+        if (deviceId.isBlank() || features.isEmpty() || featureRestoredFor == deviceId) return@LaunchedEffect
+        val saved = withContext(Dispatchers.IO) {
+            runCatching { service.callAttr("selected_feature", deviceId).toString() }.getOrDefault("")
+        }
+        val index = features.indexOfFirst { it.name == saved }
+        if (index >= 0 && pagerState.currentPage != index) {
+            pagerState.scrollToPage(index)
+        }
+        featureRestoredFor = deviceId
+    }
+
+    // 用户切页（点 tab 或滑动）后回写该设备的最后选中 feature。
+    LaunchedEffect(pagerState, selectedDeviceId, features.isNotEmpty()) {
+        snapshotFlow { pagerState.currentPage }.collect { page ->
+            val deviceId = selectedDeviceId
+            val feature = features.getOrNull(page) ?: return@collect
+            if (deviceId.isBlank() || featureRestoredFor != deviceId) return@collect
+            withContext(Dispatchers.IO) {
+                runCatching { service.callAttr("select_feature", feature.name, deviceId) }
+            }
         }
     }
 
@@ -564,7 +593,7 @@ private fun ClientMqttScreen() {
                         ) { page ->
                             when (features[page].name) {
                                 "files" -> FilesPage(targetRemoteRoot, service)
-                                "camera" -> CameraPage(service)
+                                "camera" -> CameraPage(service, selectedDeviceId)
                                 "wifi" -> WifiPage(service)
                                 else -> DynamicFeaturePage(features[page], service)
                             }
@@ -783,39 +812,60 @@ private fun FilesPage(initialRoot: String, service: PyObject) {
 }
 
 @Composable
-private fun CameraPage(service: PyObject) {
-    var facing by remember { mutableStateOf(0) }
-    var cameraMenuExpanded by remember { mutableStateOf(false) }
+private fun CameraPage(service: PyObject, deviceId: String) {
+    // 前后摄选择按 设备+feature 持久化（client_service.feature_settings），
+    // null 表示尚未从持久化加载完成。
+    var facing by remember(deviceId) { mutableStateOf<Int?>(null) }
     var status by remember { mutableStateOf("Ready") }
     var preview by remember { mutableStateOf<ImageBitmap?>(null) }
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(deviceId) {
+        facing = withContext(Dispatchers.IO) {
+            runCatching {
+                JSONObject(service.callAttr("feature_settings", "camera", deviceId).toString())
+                    .optInt("lens_facing", 0)
+            }.getOrDefault(0)
+        }
+    }
+
+    fun selectFacing(value: Int) {
+        facing = value
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                service.callAttr(
+                    "update_feature_settings",
+                    "camera",
+                    JSONObject().put("lens_facing", value).toString(),
+                    deviceId,
+                )
+            }
+        }
+    }
+
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Box {
-                Button(onClick = { cameraMenuExpanded = true }) {
-                    Text(if (facing == 0) "Back camera" else "Front camera")
-                }
-                DropdownMenu(
-                    expanded = cameraMenuExpanded,
-                    onDismissRequest = { cameraMenuExpanded = false }
-                ) {
-                    DropdownMenuItem(
-                        text = { Text("Back camera") },
-                        onClick = { facing = 0; cameraMenuExpanded = false }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Front camera") },
-                        onClick = { facing = 1; cameraMenuExpanded = false }
-                    )
-                }
-            }
-            Button(onClick = {
+            FilterChip(
+                selected = facing == 0,
+                onClick = { selectFacing(0) },
+                label = { Text("Back camera") },
+                enabled = facing != null,
+            )
+            FilterChip(
+                selected = facing == 1,
+                onClick = { selectFacing(1) },
+                label = { Text("Front camera") },
+                enabled = facing != null,
+            )
+            Button(
+                enabled = facing != null,
+                onClick = {
                 status = "Capturing..."
                 preview = null
                 scope.launch {
                     try {
                         val raw = withContext(Dispatchers.IO) {
-                            service.callAttr("call_feature", "camera", "capture", facing).toString()
+                            service.callAttr("call_feature", "camera", "capture", facing ?: 0).toString()
                         }
                         val result = JSONObject(raw)
                         if (!result.optBoolean("ok")) {

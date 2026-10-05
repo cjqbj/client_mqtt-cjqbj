@@ -552,6 +552,71 @@ class ClientServiceTests(unittest.TestCase):
                 client_service._STATE.clear()
                 client_service._STATE.update(previous_state)
 
+    def test_selected_feature_is_persisted_per_device(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                first_id = json.loads(client_service.device_settings())["id"]
+                second_id = json.loads(client_service.update_device_settings("sys/device/two", {
+                    "request_topic": "sys/device/two",
+                }))["id"]
+
+                client_service.select_feature("camera", first_id)
+                client_service.select_feature("wifi", second_id)
+                self.assertEqual(client_service.selected_feature(first_id), "camera")
+                self.assertEqual(client_service.selected_feature(second_id), "wifi")
+                # device_ref 缺省时跟随当前选中设备（update_device_settings 选中了 second）。
+                self.assertEqual(client_service.selected_feature(), "wifi")
+
+                # 模拟重启：重新 initialize 后按设备恢复各自的 tab。
+                client_service.initialize(files_dir)
+                self.assertEqual(client_service.selected_feature(first_id), "camera")
+                self.assertEqual(client_service.selected_feature(second_id), "wifi")
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_feature_settings_are_isolated_by_device_and_feature(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                first_id = json.loads(client_service.device_settings())["id"]
+                second_id = json.loads(client_service.update_device_settings("sys/device/two", {
+                    "request_topic": "sys/device/two",
+                }))["id"]
+
+                merged = json.loads(client_service.update_feature_settings("camera", {"lens_facing": 1}, first_id))
+                self.assertEqual(merged["lens_facing"], 1)
+                # 浅合并保留已有键。
+                merged = json.loads(client_service.update_feature_settings("camera", {"flash": "off"}, first_id))
+                self.assertEqual(merged, {"lens_facing": 1, "flash": "off"})
+                # 设备与 feature 双重隔离。
+                self.assertEqual(json.loads(client_service.feature_settings("camera", second_id)), {})
+                self.assertEqual(json.loads(client_service.feature_settings("wifi", first_id)), {})
+                # feature_ 前缀归一化为裸名。
+                self.assertEqual(json.loads(client_service.feature_settings("feature_camera", first_id))["lens_facing"], 1)
+
+                client_service.initialize(files_dir)
+                self.assertEqual(json.loads(client_service.feature_settings("camera", first_id))["lens_facing"], 1)
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_feature_settings_reject_invalid_input(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                with self.assertRaises(ValueError):
+                    client_service.update_feature_settings("camera", [1, 2])
+                with self.assertRaises(ValueError):
+                    client_service.select_feature("  ")
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
     def test_parse_json_result_passes_raw_stdout_and_stderr_through(self):
         response = {
             "ok": True,
