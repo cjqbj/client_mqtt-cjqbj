@@ -5,6 +5,7 @@ import importlib
 import os
 import sys
 import tempfile
+import threading
 import time
 from urllib.error import URLError
 import urllib.request
@@ -12,21 +13,25 @@ import urllib.request
 _UPDATE_DIR = None
 BUILTIN_FEATURES = ("files", "camera", "wifi")
 MAX_FEATURE_SIZE = 2 * 1024 * 1024
+_FEATURE_LOCK = threading.RLock()
+_RPC_SERVER_STARTED = False
 
 import client_service
 
 def init_env(update_dir):
-    global _UPDATE_DIR,ghs
+    global _UPDATE_DIR, ghs, _RPC_SERVER_STARTED
     client_service._mqtt_client_module()  #
-    import server_http
-    import server_http
-    ghs = server_http.start_rpc_server(
-        port=1166,
-        ip='0.0.0.0',
-        globals=globals(),
-        locals=locals(),
-    )
-    print(f"RPC server started {ghs}")
+    # App 启动只初始化一次；重复调用（如测试进程内多次 init_env）不重复绑定端口。
+    if not _RPC_SERVER_STARTED:
+        import server_http
+        ghs = server_http.start_rpc_server(
+            port=1166,
+            ip='0.0.0.0',
+            globals=globals(),
+            locals=locals(),
+        )
+        _RPC_SERVER_STARTED = True
+        print(f"RPC server started {ghs}")
 
     _UPDATE_DIR = os.path.abspath(str(update_dir))
     os.makedirs(_UPDATE_DIR, exist_ok=True)
@@ -48,28 +53,87 @@ def _module_name(feature):
     return value if value.startswith("feature_") else "feature_" + value
 
 
-def load_feature(feature):
+def _runtime_module_path(module_name):
+    return os.path.join(_UPDATE_DIR, module_name + ".py") if _UPDATE_DIR else ""
+
+
+def _is_runtime_module(module):
+    module_file = os.path.abspath(str(getattr(module, "__file__", "") or ""))
+    return bool(_UPDATE_DIR) and module_file.startswith(_UPDATE_DIR + os.sep)
+
+
+def _purge_feature_pyc(module_name):
+    """Drop stale bytecode for an updatable module before a fresh import."""
+    if not _UPDATE_DIR:
+        return
+    cache_dir = os.path.join(_UPDATE_DIR, "__pycache__")
+    if not os.path.isdir(cache_dir):
+        return
+    for filename in os.listdir(cache_dir):
+        if filename.startswith(module_name + ".") and filename.endswith((".pyc", ".pyo")):
+            try:
+                os.unlink(os.path.join(cache_dir, filename))
+            except OSError:
+                pass
+
+
+def load_feature(feature, force_reload=False):
+    """Resolve a feature module.
+
+    热加载策略：
+    - 模块未导入时正常导入（``sys.path`` 中 ``py_updates`` 优先，自动命中
+      下载的覆盖文件）。
+    - 已导入的是内置模块、但 ``py_updates`` 出现同名 ``feature_*.py`` 时，
+      只做一次影子接管：弹出 ``sys.modules``、清 pyc 后重新导入；之后保持
+      缓存，不再每次调用都重载。
+    - 已从 ``py_updates`` 加载的模块保持缓存，文件被外部改写也不自动重载，
+      只有显式 :func:`reload_feature`（UI 长按 feature）才重新导入。
+    """
     module_name = _module_name(feature)
-    importlib.invalidate_caches()
+    with _FEATURE_LOCK:
+        runtime_file = _runtime_module_path(module_name)
+        module = sys.modules.get(module_name)
+        if force_reload and module is not None:
+            _purge_feature_pyc(module_name)
+            sys.modules.pop(module_name, None)
+            module = None
+        if module is None:
+            importlib.invalidate_caches()
+            return importlib.import_module(module_name)
+        # 内置模块已在内存中，而更新目录新放入了同名文件：热覆盖一次。
+        if runtime_file and os.path.isfile(runtime_file) and not _is_runtime_module(module):
+            _purge_feature_pyc(module_name)
+            sys.modules.pop(module_name, None)
+            importlib.invalidate_caches()
+            return importlib.import_module(module_name)
+        return module
+
+
+def reload_feature(feature):
+    """Always drop the cached module (and py_updates pyc) and re-import it."""
+    module_name = _module_name(feature)
+    with _FEATURE_LOCK:
+        _purge_feature_pyc(module_name)
+        sys.modules.pop(module_name, None)
+        importlib.invalidate_caches()
+        return importlib.import_module(module_name)
+
+
+def feature_source_info(feature):
+    """Describe where the currently loaded module comes from."""
+    module_name = _module_name(feature)
     module = sys.modules.get(module_name)
-    if module is None:
-        return importlib.import_module(module_name)
-    module_file = os.path.abspath(str(getattr(module, "__file__", "")))
-    runtime_file = os.path.join(_UPDATE_DIR, module_name + ".py") if _UPDATE_DIR else ""
-    if runtime_file and os.path.isfile(runtime_file) and not module_file.startswith(_UPDATE_DIR + os.sep):
-        sys.modules.pop(module_name, None)
-        importlib.invalidate_caches()
-        return importlib.import_module(module_name)
-    if _UPDATE_DIR and module_file.startswith(_UPDATE_DIR + os.sep):
-        cache_dir = os.path.join(_UPDATE_DIR, "__pycache__")
-        if os.path.isdir(cache_dir):
-            for filename in os.listdir(cache_dir):
-                if filename.startswith(module_name + ".") and filename.endswith(".pyc"):
-                    os.unlink(os.path.join(cache_dir, filename))
-        sys.modules.pop(module_name, None)
-        importlib.invalidate_caches()
-        return importlib.import_module(module_name)
-    return module
+    module_file = str(getattr(module, "__file__", "") or "") if module else ""
+    runtime_file = _runtime_module_path(module_name)
+    return {
+        "name": module_name[8:] if module_name.startswith("feature_") else module_name,
+        "module": module_name,
+        "module_file": module_file,
+        "runtime_file": runtime_file,
+        "runtime_file_present": bool(runtime_file) and os.path.isfile(runtime_file),
+        "loaded": module is not None,
+        "source": "py_updates" if module is not None and _is_runtime_module(module) else "builtin",
+    }
 
 
 def list_features():
@@ -90,14 +154,27 @@ def describe_features():
         try:
             module = load_feature(name)
             manifest = getattr(module, "FEATURE", {})
+            icon = manifest.get("icon")
             result.append({
                 "name": name,
                 "title": str(manifest.get("title") or name),
                 "version": manifest.get("version", 1),
                 "actions": list(manifest.get("actions") or ["run"]),
+                "icon": str(icon) if icon else None,
+                "module_file": str(getattr(module, "__file__", "") or ""),
+                "source": "py_updates" if _is_runtime_module(module) else "builtin",
             })
         except Exception as exc:
-            result.append({"name": name, "title": name, "version": 0, "actions": [], "error": repr(exc)})
+            result.append({
+                "name": name,
+                "title": name,
+                "version": 0,
+                "actions": [],
+                "icon": None,
+                "module_file": "",
+                "source": "unknown",
+                "error": repr(exc),
+            })
     return result
 
 

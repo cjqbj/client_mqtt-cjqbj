@@ -93,6 +93,11 @@ class ClientServiceTests(unittest.TestCase):
                     "FEATURE = {'name': 'broken'}\ndef run():\n    raise SystemExit('plugin exit')\n",
                     encoding="utf-8",
                 )
+                # 缓存策略：文件改写后不自动重载，行为仍为旧模块的 RuntimeError。
+                result = json.loads(client_service.call_feature("broken", "run"))
+                self.assertEqual(result["error"], "RuntimeError: plugin failed")
+                # 显式 reload 后新代码才生效，SystemExit 同样被桥接成结构化错误。
+                self.assertTrue(json.loads(client_service.reload_feature("broken"))["ok"])
                 result = json.loads(client_service.call_feature("broken", "run"))
                 self.assertEqual(result["error"], "SystemExit: plugin exit")
             finally:
@@ -517,6 +522,110 @@ class ClientServiceTests(unittest.TestCase):
             finally:
                 client_service._STATE.clear()
                 client_service._STATE.update(previous_state)
+
+    def test_selected_device_persists_across_reinitialize(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                client_service.update_device_settings("sys/device/request", {
+                    "request_topic": "sys/device/one",
+                    "remote_root": "/data/one",
+                })
+                client_service.update_device_settings("sys/device/one", {
+                    "request_topic": "sys/device/two",
+                    "remote_root": "/data/two",
+                })
+                selected_two = json.loads(client_service.device_settings())
+                self.assertEqual(selected_two["request_topic"], "sys/device/two")
+
+                # 模拟应用被杀掉后重启：重新 initialize 必须恢复上次选择的 topic。
+                client_service.initialize(files_dir)
+                restored = json.loads(client_service.device_settings())
+                self.assertEqual(restored["request_topic"], "sys/device/two")
+                self.assertEqual(client_service._STATE["selected_topic"], "sys/device/two")
+
+                with open(client_service._STATE["config_path"], "r", encoding="utf-8") as handle:
+                    saved_config = json.load(handle)
+                self.assertEqual(saved_config["selected_device_id"], restored["id"])
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_parse_json_result_passes_raw_stdout_and_stderr_through(self):
+        response = {
+            "ok": True,
+            "r": json.dumps({"ok": True, "value": 1}),
+            "stdout": "printed line\n",
+            "stderr": "warning line\n",
+        }
+        result = client_service.parse_json_result(response)
+        self.assertEqual(result["_stdout"], "printed line\n")
+        self.assertEqual(result["_stderr"], "warning line\n")
+
+    def test_rpc_log_includes_raw_remote_stdout_section(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                client_service.update_device_settings("sys/device/request", {
+                    "request_topic": "sys/device/k12",
+                })
+                mqtt_module = mock.Mock()
+                mqtt_module.rpc.return_value = {
+                    "ok": True,
+                    "r": json.dumps({"ok": True}),
+                    "stdout": "RAW PYTHON PRINT\n",
+                    "req_id": "server-req-1",
+                }
+                with mock.patch.object(client_service, "_mqtt_client_module", return_value=mqtt_module):
+                    client_service.rpc("print('RAW PYTHON PRINT')")
+
+                logs = "\n".join(json.loads(client_service.rpc_logs()))
+                self.assertIn("REMOTE STDOUT", logs)
+                self.assertIn("--- begin remote stdout ---", logs)
+                self.assertIn("RAW PYTHON PRINT", logs)
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_builtin_feature_files_come_from_bootstrap_catalog(self):
+        import bootstrap
+
+        names = json.loads(client_service.builtin_feature_files())
+        self.assertEqual(names, [f"feature_{name}.py" for name in bootstrap.BUILTIN_FEATURES])
+
+    def test_reload_feature_bridge_returns_descriptor(self):
+        import bootstrap
+
+        previous_update_dir = bootstrap._UPDATE_DIR
+        previous_path = list(sys.path)
+        previous_module = sys.modules.get("feature_reloadable")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "feature_reloadable.py"
+            path.write_text(
+                "FEATURE = {'name': 'reloadable', 'title': 'Reload', 'actions': ['run']}\n"
+                "def run():\n    return 'v1'\n",
+                encoding="utf-8",
+            )
+            try:
+                bootstrap.init_env(directory)
+                self.assertEqual(client_service.call_feature("reloadable"), "v1")
+                path.write_text(
+                    "FEATURE = {'name': 'reloadable', 'title': 'Reload', 'actions': ['run']}\n"
+                    "def run():\n    return 'v2'\n",
+                    encoding="utf-8",
+                )
+                reloaded = json.loads(client_service.reload_feature("reloadable"))
+                self.assertTrue(reloaded["ok"])
+                self.assertEqual(reloaded["descriptor"]["name"], "reloadable")
+                self.assertEqual(client_service.call_feature("reloadable"), "v2")
+            finally:
+                bootstrap._UPDATE_DIR = previous_update_dir
+                sys.path[:] = previous_path
+                sys.modules.pop("feature_reloadable", None)
+                if previous_module is not None:
+                    sys.modules["feature_reloadable"] = previous_module
 
     def test_builtin_feature_installer_writes_scripts_and_logs_progress(self):
         previous_state = client_service._STATE.copy()

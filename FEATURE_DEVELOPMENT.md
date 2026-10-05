@@ -17,10 +17,11 @@ FEATURE = {
     "title": "Demo",
     "version": 1,
     "actions": ["run"],
+    "icon": "terminal",  # optional
 }
 ```
 
-The `title` appears in the script drawer and feature page. If omitted, the filename name is used. `actions` controls the buttons shown on the generic page.
+The `title` appears in the script drawer, the bottom navigation bar, and the feature page. If omitted, the filename name is used. `actions` controls the buttons shown on the generic page. Optional `icon` selects the navigation icon (`folder`/`files`, `camera`/`photo`, `wifi`/`network`, `terminal`/`shell`, `bug`/`debug`, `info`, `settings`); unknown values fall back to a generic extension icon.
 
 ## Action API
 
@@ -49,7 +50,9 @@ A feature must not import Compose or Android Activity classes. It owns its domai
 - `client_service.rpc(code, device=None)` sends short target control code through the selected target's request topic, or an explicitly supplied device.
 - `client_service.device_catalog()`, `device_settings(topic)`, `select_device(topic)`, and `update_device_settings(topic, values)` manage per-topic target configuration.
 - `client_service.aliyun_settings()` and `update_aliyun_settings(values)` read and write the single shared Aliyun configuration.
-- `client_service.install_builtin_features(script_root, retries, timeout)` installs the three built-in feature scripts into the selected root's `py_updates/` directory.
+- `client_service.install_builtin_features(script_root, retries, timeout)` installs the built-in feature scripts (filenames from `bootstrap.BUILTIN_FEATURES`) into the selected root's `py_updates/` directory.
+- `client_service.builtin_feature_files()` returns the built-in `feature_*.py` filenames; the settings page derives its missing-files list from it instead of hardcoding names.
+- `client_service.reload_feature(name)` force-reloads one cached feature module (long-press menu); returns the refreshed descriptor or structured JSON error.
 - `client_service.operation_logs()` returns the rolling downloader log for UI display.
 - `client_service.rpc_logs()` and `clear_rpc_logs()` expose and clear the redacted RPC diagnostic ring buffer.
 - `client_service.standardize_private_key(value)` normalizes key expressions and PEM/OpenSSH inputs through upstream `get_standard_pem_bytes`.
@@ -75,10 +78,10 @@ A downloaded module is installed atomically and optionally verified:
 client_service.install_feature(url, "feature_demo.py", sha256)
 ```
 
-Only `feature_*.py` filenames are accepted. The module is discovered on the next catalog refresh and loaded on its next action call. Do not execute untrusted scripts without verifying the SHA-256 digest and transport authentication.
+Only `feature_*.py` filenames are accepted. The module is discovered on the next catalog refresh (three seconds) and imported on its next action call. Loaded feature modules stay cached: rewriting a `py_updates/feature_*.py` does not take effect until the user long-presses the feature (drawer entry or bottom navigation icon) and confirms the reload dialog, which calls `client_service.reload_feature(name)` (pop `sys.modules`, purge pyc, re-import). The only automatic reload is the one-time takeover when a `py_updates` file newly shadows an already imported built-in module. Do not execute untrusted scripts without verifying the SHA-256 digest and transport authentication.
 
 ## UI communication
 
-The UI never imports feature modules directly. It polls `client_service.feature_catalog()`, creates a pager entry for each descriptor, and invokes actions through `client_service.call_feature`. This keeps the Android APK stable while allowing feature scripts to evolve independently.
+The UI never imports feature modules directly. It polls `client_service.feature_catalog()`, creates one bottom-navigation entry and pager page per descriptor (both rendered from the same state), and invokes actions through `client_service.call_feature`. This keeps the Android APK stable while allowing feature scripts to evolve independently.
 
-Successful MQTT envelopes are preserved under the feature result's `_rpc` key with request ID, server time, broker names, latency, and elapsed time. The RPC diagnostics page shows and copies the full submitted code and response envelope/raw `r`, after redacting configured key and Aliyun values. Use this metadata and the diagnostics page to inspect target traceback/error details and transport behavior. The periodic online probe is shared-configurable and is deferred after any successful RPC for that target.
+Successful MQTT envelopes are preserved under the feature result's `_rpc` key with request ID, server time, broker names, latency, and elapsed time. Raw target output is preserved verbatim under `_stdout` and `_stderr` when present, and raw envelope errors under `_remote_error`; the UI renders these strings as-is (monospace, selectable) instead of reformatting them in Kotlin. The RPC diagnostics page shows and copies the full submitted code, the response envelope/raw `r`, dedicated raw stdout/stderr/error sections, after redacting configured key and Aliyun values. Use this metadata and the diagnostics page to inspect target traceback/error details and transport behavior. The periodic online probe is shared-configurable and is deferred after any successful RPC for that target.

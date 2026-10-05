@@ -23,6 +23,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -40,13 +41,19 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.CameraAlt
+import androidx.compose.material.icons.outlined.Extension
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Menu
 import androidx.compose.material.icons.outlined.NetworkWifi
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.twotone.Security
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.DropdownMenu
@@ -56,12 +63,14 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.ScrollableTabRow
-import androidx.compose.material3.Tab
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -78,6 +87,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.chaquo.python.Python
@@ -98,8 +108,27 @@ private data class RemoteFile(
 private data class FeatureDescriptor(
     val name: String,
     val title: String,
-    val actions: List<String>
+    val actions: List<String>,
+    val icon: String? = null,
+    val moduleFile: String = "",
+    val source: String = ""
 )
+
+private fun featureIcon(feature: FeatureDescriptor) = when (feature.icon?.lowercase()) {
+    "folder", "files", "file", "directory" -> Icons.Outlined.Folder
+    "camera", "photo", "image" -> Icons.Outlined.CameraAlt
+    "wifi", "network", "wireless" -> Icons.Outlined.NetworkWifi
+    "terminal", "shell", "console" -> Icons.Outlined.Terminal
+    "bug", "debug" -> Icons.Outlined.BugReport
+    "info", "about" -> Icons.Outlined.Info
+    "settings", "config", "tune" -> Icons.Outlined.Settings
+    else -> when (feature.name) {
+        "files" -> Icons.Outlined.Folder
+        "camera" -> Icons.Outlined.CameraAlt
+        "wifi" -> Icons.Outlined.NetworkWifi
+        else -> Icons.Outlined.Extension
+    }
+}
 
 private data class TargetDescriptor(
     val id: String,
@@ -138,6 +167,7 @@ private fun ClientMqttScreen() {
     var diagnostics by remember { mutableStateOf(false) }
     var editingDeviceId by remember { mutableStateOf<String?>(null) }
     var permissions by remember { mutableStateOf(false) }
+    var reloadTarget by remember { mutableStateOf<FeatureDescriptor?>(null) }
     var selectedDevice by remember { mutableStateOf("Target") }
     var selectedDeviceId by remember { mutableStateOf("") }
     var selectedTopic by remember { mutableStateOf("sys/device/request") }
@@ -145,57 +175,76 @@ private fun ClientMqttScreen() {
     var onlineStatus by remember { mutableStateOf("checking") }
     var onlineProbeEnabled by remember { mutableStateOf(true) }
     var onlineProbeInterval by remember { mutableStateOf(30) }
+    val snackbarHostState = remember { SnackbarHostState() }
     val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
 
+    fun parseTargets(raw: String) = buildList {
+        val array = org.json.JSONArray(raw)
+        for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+            val topic = item.optString("request_topic")
+            if (topic.isNotBlank()) add(TargetDescriptor(
+                item.optString("id", topic),
+                item.optString("name", topic),
+                topic,
+                item.optString("remote_root", "/data/data")
+            ))
+        }
+    }
+
     suspend fun refreshTargets() {
         val raw = withContext(Dispatchers.IO) { service.callAttr("device_catalog").toString() }
+        targets = parseTargets(raw)
+    }
+
+    suspend fun refreshFeatures() {
+        val raw = withContext(Dispatchers.IO) { service.callAttr("feature_catalog").toString() }
         val array = org.json.JSONArray(raw)
-        targets = buildList {
+        features = buildList {
             for (index in 0 until array.length()) {
                 val item = array.optJSONObject(index) ?: continue
-                val topic = item.optString("request_topic")
-                if (topic.isNotBlank()) add(TargetDescriptor(
-                    item.optString("id", topic),
-                    item.optString("name", topic),
-                    topic,
-                    item.optString("remote_root", "/data/data")
+                add(FeatureDescriptor(
+                    name = item.optString("name"),
+                    title = item.optString("title", item.optString("name")),
+                    actions = buildList {
+                        val actions = item.optJSONArray("actions") ?: org.json.JSONArray()
+                        for (actionIndex in 0 until actions.length()) add(actions.optString(actionIndex))
+                    },
+                    icon = if (item.isNull("icon")) null else item.optString("icon").ifBlank { null },
+                    moduleFile = item.optString("module_file"),
+                    source = item.optString("source"),
                 ))
             }
         }
     }
 
+    // 首次进入：以 Python 端持久化的 selected_device_id 为准恢复上次目标，
+    // 不再每次重启都跳回列表第一个 topic。
     LaunchedEffect(Unit) {
         runCatching {
-            refreshTargets()
-            val target = targets.firstOrNull()
+            val activeConfig = withContext(Dispatchers.IO) {
+                JSONObject(service.callAttr("device_settings").toString())
+            }
+            targets = parseTargets(withContext(Dispatchers.IO) {
+                service.callAttr("device_catalog").toString()
+            })
+            val activeId = activeConfig.optString("id")
+            val activeTopic = activeConfig.optString("request_topic")
+            val target = targets.firstOrNull { it.id == activeId }
+                ?: targets.firstOrNull { it.requestTopic == activeTopic }
             if (target != null) {
                 selectedDeviceId = target.id
                 selectedTopic = target.requestTopic
                 selectedDevice = target.name
                 targetRemoteRoot = target.remoteRoot
-                service.callAttr("select_device", target.id)
+                if (target.id != activeId) {
+                    withContext(Dispatchers.IO) { service.callAttr("select_device", target.id) }
+                }
             }
         }
         while (true) {
-            runCatching {
-                val raw = withContext(Dispatchers.IO) { service.callAttr("feature_catalog").toString() }
-                val array = org.json.JSONArray(raw)
-                val updated = buildList {
-                    for (index in 0 until array.length()) {
-                        val item = array.optJSONObject(index) ?: continue
-                        add(FeatureDescriptor(
-                            item.optString("name"),
-                            item.optString("title", item.optString("name")),
-                            buildList {
-                                val actions = item.optJSONArray("actions") ?: org.json.JSONArray()
-                                for (actionIndex in 0 until actions.length()) add(actions.optString(actionIndex))
-                            }
-                        ))
-                    }
-                }
-                features = updated
-            }
+            runCatching { refreshFeatures() }
             delay(3_000)
         }
     }
@@ -204,25 +253,13 @@ private fun ClientMqttScreen() {
         while (true) {
             runCatching {
                 val raw = withContext(Dispatchers.IO) { service.callAttr("device_catalog").toString() }
-                val array = org.json.JSONArray(raw)
-                val updated = buildList {
-                    for (index in 0 until array.length()) {
-                        val item = array.optJSONObject(index) ?: continue
-                        val topic = item.optString("request_topic")
-                        if (topic.isNotBlank()) add(TargetDescriptor(
-                            item.optString("id", topic),
-                            item.optString("name", topic),
-                            topic,
-                            item.optString("remote_root", "/data/data")
-                        ))
-                    }
-                }
+                val updated = parseTargets(raw)
                 targets = updated
+                // 保持用户当前选择；选中项消失时不擅自跳到第一个目标。
                 val active = updated.firstOrNull { it.id == selectedDeviceId }
-                    ?: updated.firstOrNull { it.requestTopic == selectedTopic }
-                    ?: updated.firstOrNull()
+                    ?: updated.firstOrNull { selectedTopic.isNotBlank() && it.requestTopic == selectedTopic }
                 if (active != null) {
-                    if (active.id != selectedDeviceId || active.requestTopic != selectedTopic) {
+                    if (active.id != selectedDeviceId) {
                         withContext(Dispatchers.IO) { service.callAttr("select_device", active.id) }
                     }
                     selectedDeviceId = active.id
@@ -306,10 +343,21 @@ private fun ClientMqttScreen() {
         gesturesEnabled = !settings && !targetSettings && !permissions,
         drawerContent = {
             ModalDrawerSheet {
-                Text("Scripts", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(16.dp))
+                Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+                    Text("Scripts", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                    Text("Long-press to reload", style = MaterialTheme.typography.labelSmall)
+                }
                 features.forEachIndexed { index, feature ->
                     NavigationDrawerItem(
-                        label = { Text(feature.title) },
+                        label = {
+                            Text(
+                                feature.title,
+                                modifier = Modifier.combinedClickable(
+                                    onClick = {},
+                                    onLongClick = { reloadTarget = feature }
+                                )
+                            )
+                        },
                         selected = pagerState.currentPage == index && !settings && !targetSettings,
                         onClick = {
                             pagerScope.launch {
@@ -318,15 +366,14 @@ private fun ClientMqttScreen() {
                             }
                         },
                         icon = {
-                            Icon(
-                                when (feature.name) {
-                                    "files" -> Icons.Outlined.Folder
-                                    "camera" -> Icons.Outlined.CameraAlt
-                                    "wifi" -> Icons.Outlined.NetworkWifi
-                                    else -> Icons.Outlined.Settings
-                                },
-                                contentDescription = feature.title
-                            )
+                            Box(
+                                modifier = Modifier.combinedClickable(
+                                    onClick = {},
+                                    onLongClick = { reloadTarget = feature }
+                                )
+                            ) {
+                                Icon(featureIcon(feature), contentDescription = feature.title)
+                            }
                         },
                         modifier = Modifier.padding(horizontal = 12.dp)
                     )
@@ -392,6 +439,31 @@ private fun ClientMqttScreen() {
                         }
                     }
                 )
+            },
+            snackbarHost = { SnackbarHost(snackbarHostState) },
+            bottomBar = {
+                if (!settings && !targetSettings && !permissions && !diagnostics && features.isNotEmpty()) {
+                    val selectedPage = pagerState.currentPage.coerceIn(0, features.lastIndex)
+                    NavigationBar {
+                        features.forEachIndexed { index, feature ->
+                            NavigationBarItem(
+                                selected = selectedPage == index,
+                                onClick = { pagerScope.launch { pagerState.animateScrollToPage(index) } },
+                                icon = {
+                                    Box(
+                                        modifier = Modifier.combinedClickable(
+                                            onClick = {},
+                                            onLongClick = { reloadTarget = feature }
+                                        )
+                                    ) {
+                                        Icon(featureIcon(feature), contentDescription = feature.title)
+                                    }
+                                },
+                                label = { Text(feature.title, maxLines = 1, style = MaterialTheme.typography.labelSmall) }
+                            )
+                        }
+                    }
+                }
             }
         ) { padding ->
             if (diagnostics) {
@@ -423,28 +495,10 @@ private fun ClientMqttScreen() {
                     if (features.isEmpty()) {
                         Text("No feature scripts found", modifier = Modifier.padding(16.dp))
                     } else {
-                        val selectedPage = pagerState.currentPage.coerceIn(0, features.lastIndex)
-                        ScrollableTabRow(selectedTabIndex = selectedPage) {
-                            features.forEachIndexed { index, feature ->
-                                Tab(
-                                    selected = selectedPage == index,
-                                    onClick = { pagerScope.launch { pagerState.animateScrollToPage(index) } },
-                                    text = { Text(feature.title) },
-                                    icon = {
-                                        Icon(
-                                            imageVector = when (feature.name) {
-                                                "files" -> Icons.Outlined.Folder
-                                                "camera" -> Icons.Outlined.CameraAlt
-                                                "wifi" -> Icons.Outlined.NetworkWifi
-                                                else -> Icons.Outlined.Settings
-                                            },
-                                            contentDescription = feature.title
-                                        )
-                                    }
-                                )
-                            }
-                        }
-                        HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
+                        HorizontalPager(
+                            state = pagerState,
+                            modifier = Modifier.fillMaxSize().weight(1f)
+                        ) { page ->
                             when (features[page].name) {
                                 "files" -> FilesPage(targetRemoteRoot)
                                 "camera" -> CameraPage()
@@ -456,6 +510,51 @@ private fun ClientMqttScreen() {
                 }
             }
         }
+    }
+
+    reloadTarget?.let { feature ->
+        AlertDialog(
+            onDismissRequest = { reloadTarget = null },
+            icon = { Icon(Icons.Outlined.Refresh, contentDescription = null) },
+            title = { Text("Reload feature module") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("${feature.title} (feature_${feature.name}.py)")
+                    Text(
+                        "Loaded from: " + (feature.moduleFile.ifBlank { "not loaded yet" }),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        "Drops sys.modules cache and pyc, then re-imports from py_updates.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val target = feature
+                    reloadTarget = null
+                    scope.launch {
+                        val message = runCatching {
+                            val raw = withContext(Dispatchers.IO) {
+                                service.callAttr("reload_feature", target.name).toString()
+                            }
+                            refreshFeatures()
+                            val result = JSONObject(raw)
+                            if (result.optBoolean("ok")) {
+                                "Reloaded ${target.title}"
+                            } else {
+                                "Reload failed: ${result.optString("error", "unknown error")}"
+                            }
+                        }.getOrElse { "Reload failed: ${it.message}" }
+                        snackbarHostState.showSnackbar(message)
+                    }
+                }) { Text("Reload") }
+            },
+            dismissButton = {
+                TextButton(onClick = { reloadTarget = null }) { Text("Cancel") }
+            }
+        )
     }
 }
 
@@ -659,7 +758,7 @@ private fun CameraPage() {
                         }
                         val result = JSONObject(raw)
                         if (!result.optBoolean("ok")) {
-                            status = result.toString(2)
+                            status = raw
                             return@launch
                         }
                         val url = result.optString("url")
@@ -670,16 +769,20 @@ private fun CameraPage() {
                             val bytes = Base64.decode(encoded, Base64.DEFAULT)
                             preview = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
                         }
-                        status = result.toString(2)
+                        status = raw
                     } catch (error: Exception) {
                         status = "Capture failed: ${error.message}"
                     }
                 }
             }) { Text("Capture") }
         }
-        Text(status)
         preview?.let { bitmap ->
             Image(bitmap = bitmap, contentDescription = "Captured photo", modifier = Modifier.fillMaxWidth())
+        }
+        if (status.trimStart().startsWith("{")) {
+            FeatureOutput(status, modifier = Modifier.fillMaxWidth().weight(1f))
+        } else {
+            Text(status)
         }
         Text("JPEG stays in memory on the target and is transferred outside MQTT.", style = MaterialTheme.typography.bodySmall)
     }
@@ -714,7 +817,11 @@ private fun WifiPage() {
                 copyStatus = "Copied"
             }) { Text("Copy") }
         }
-        SelectionContainer { Text(status, style = MaterialTheme.typography.bodyMedium) }
+        if (status.trimStart().startsWith("{")) {
+            FeatureOutput(status, modifier = Modifier.fillMaxWidth().weight(1f))
+        } else {
+            SelectionContainer { Text(status, style = MaterialTheme.typography.bodyMedium) }
+        }
         if (copyStatus.isNotBlank()) Text(copyStatus, style = MaterialTheme.typography.labelSmall)
     }
 }
@@ -798,6 +905,47 @@ private fun DiagnosticsPage(
 }
 
 @Composable
+private fun FeatureOutput(raw: String, modifier: Modifier = Modifier) {
+    // raw 是 Python 端 json.dumps 出来的原始字符串；这里只按字段取出
+    // stdout/stderr/error 单独原样显示，不再用 Java 重排/美化 print 内容。
+    val parsed = remember(raw) { runCatching { JSONObject(raw) }.getOrNull() }
+    fun fieldText(key: String): String? = parsed
+        ?.takeIf { it.has(key) && !it.isNull(key) }
+        ?.optString(key)
+        ?.takeIf { it.isNotEmpty() }
+    val stdout = fieldText("_stdout")
+    val stderr = fieldText("_stderr")
+    val remoteError = fieldText("_remote_error") ?: fieldText("error")
+    Column(
+        modifier.verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (stdout != null) {
+            Text("Python stdout", style = MaterialTheme.typography.labelLarge)
+            SelectionContainer {
+                Text(stdout, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        if (stderr != null) {
+            Text("Python stderr", style = MaterialTheme.typography.labelLarge)
+            SelectionContainer {
+                Text(stderr, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        if (remoteError != null) {
+            Text("Target error", style = MaterialTheme.typography.labelLarge)
+            SelectionContainer {
+                Text(remoteError, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        Text("Raw response (Python)", style = MaterialTheme.typography.labelLarge)
+        SelectionContainer {
+            Text(raw, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
 private fun DynamicFeaturePage(feature: FeatureDescriptor) {
     var result by remember(feature.name) { mutableStateOf("Ready") }
     val service = remember { Python.getInstance().getModule("client_service") }
@@ -818,7 +966,7 @@ private fun DynamicFeaturePage(feature: FeatureDescriptor) {
                 }) { Text(action) }
             }
         }
-        Text(result, style = MaterialTheme.typography.bodySmall)
+        FeatureOutput(result, modifier = Modifier.fillMaxWidth().weight(1f))
     }
 }
 
@@ -1002,15 +1150,25 @@ private fun SettingsPage(
     var downloadLogs by remember { mutableStateOf(listOf<String>()) }
     var downloading by remember { mutableStateOf(false) }
     var scriptRevision by remember { mutableStateOf(0) }
+    var builtinFeatureFiles by remember { mutableStateOf(listOf<String>()) }
     val externalAllowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
     val scriptRoot = if (useExternal && externalAllowed) "/sdcard/apm/client_mqtt" else "${context.filesDir}/client_mqtt"
     val featureDirectory = File(scriptRoot, "py_updates")
-    val missingFeatures = remember(scriptRoot, scriptRevision) {
-        listOf("feature_files.py", "feature_camera.py", "feature_wifi.py")
-            .filterNot { File(featureDirectory, it).isFile }
+    val missingFeatures = remember(scriptRoot, scriptRevision, builtinFeatureFiles) {
+        builtinFeatureFiles.filterNot { File(featureDirectory, it).isFile }
     }
     val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        runCatching {
+            val raw = withContext(Dispatchers.IO) { service.callAttr("builtin_feature_files").toString() }
+            val array = org.json.JSONArray(raw)
+            builtinFeatureFiles = buildList {
+                for (index in 0 until array.length()) add(array.optString(index))
+            }
+        }
+    }
 
     suspend fun refreshDownloadLogs() {
         val raw = withContext(Dispatchers.IO) { service.callAttr("operation_logs").toString() }
@@ -1163,8 +1321,11 @@ private fun SettingsPage(
             HorizontalDivider()
             Text("External feature scripts", style = MaterialTheme.typography.titleMedium)
             Text(
-                if (missingFeatures.isEmpty()) "All three feature files are present"
-                else "${missingFeatures.size} feature files are missing",
+                when {
+                    builtinFeatureFiles.isEmpty() -> "Checking built-in feature files..."
+                    missingFeatures.isEmpty() -> "All ${builtinFeatureFiles.size} built-in feature files are present"
+                    else -> "${missingFeatures.size} of ${builtinFeatureFiles.size} feature files are missing: ${missingFeatures.joinToString()}"
+                },
                 style = MaterialTheme.typography.bodySmall
             )
             Button(enabled = !downloading, onClick = {

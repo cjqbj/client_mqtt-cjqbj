@@ -236,13 +236,28 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             if not code_str:
                 self.send_error(400, "No code")
                 return
-            code = urllib.parse.unquote(code_str)
+            # 独立 HTTP 服务器下 self.path 仍是原始 percent-encoded 请求行，
+            # 需要 unquote；WSGI 下 PATH_INFO 已被网关解码（shim 会设置
+            # path_already_decoded），不能再解（否则中文变 Latin-1 乱码）。
+            if getattr(self, "path_already_decoded", False):
+                code = code_str
+            else:
+                code = urllib.parse.unquote(code_str)
 
             class ResponseWrapper:
-                def __init__(self):
+                """RPC 代码里的 response/p 对象。
+
+                set_data：一次性返回（执行结束后再写 body，原行为）。
+                write：流式返回——首次调用立即提交状态头，之后每个分块
+                直接写到 wfile，客户端可以边收边播放，大文本无需等待。
+                """
+
+                def __init__(self, handler):
+                    self.handler = handler
                     self.status = 200
                     self.headers = {}
                     self.data = None
+                    self._streamed = False
 
                 def set_data(self, data):
                     self.data = data
@@ -253,7 +268,23 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 def set_header(self, key, value):
                     self.headers[key] = value
 
-            response = ResponseWrapper()
+                def write(self, data):
+                    if not self._streamed:
+                        self.handler.send_response(self.status)
+                        for key, value in self.headers.items():
+                            self.handler.send_header(key, value)
+                        if 'Content-Type' not in self.headers:
+                            self.handler.send_header(
+                                'Content-Type', 'application/octet-stream')
+                        # 告知浏览器本资源支持 Range：播放中可直接拖动跳转。
+                        self.handler.send_header('Accept-Ranges', 'bytes')
+                        # 流式响应长度未知，不发送 Content-Length
+                        self.handler.end_headers()
+                        self._streamed = True
+                    if data:
+                        self.handler.wfile.write(data)
+
+            response = ResponseWrapper(self)
 
             # 请求级上下文变量：执行期间临时注入，执行完自动还原，
             # 不会污染执行器的持久命名空间。
@@ -277,6 +308,10 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                     finally:
                         sys.stdout = old_stdout
 
+                # 流式响应：状态头与分块都已直接写出，跳过收尾逻辑。
+                if getattr(response, '_streamed', False):
+                    return
+
                 namespace = executor.globals_dict
                 if response.data is not None:
                     result_obj = response.data
@@ -292,6 +327,13 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 for key, value in response.headers.items():
                     self.send_header(key, value)
             except Exception:
+                if getattr(response, '_streamed', False):
+                    # 头已发出，无法改状态码；记录后结束分块流。
+                    logging.getLogger("error").exception(
+                        "RPC stream failed mid-flight client=%s path=%s",
+                        self.client_address, self.path,
+                    )
+                    return
                 result_str = traceback.format_exc()
                 logging.getLogger("error").exception(
                     "RPC execution failed client=%s path=%s code=%s",

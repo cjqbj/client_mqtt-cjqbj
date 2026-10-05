@@ -99,6 +99,33 @@ def feature_catalog():
     return json.dumps(bootstrap.describe_features(), ensure_ascii=False)
 
 
+def builtin_feature_files():
+    """Filenames of the statically registered built-in feature modules."""
+    import bootstrap
+    return json.dumps(
+        [f"feature_{name}.py" for name in bootstrap.BUILTIN_FEATURES],
+        ensure_ascii=False,
+    )
+
+
+def reload_feature(feature):
+    """Drop the cached feature module and re-import it (long-press action)."""
+    import bootstrap
+    try:
+        bootstrap.reload_feature(feature)
+        descriptor = next(
+            (item for item in bootstrap.describe_features() if item.get("name") == str(feature)),
+            None,
+        )
+        return json.dumps({"ok": True, "feature": str(feature), "descriptor": descriptor}, ensure_ascii=False)
+    except BaseException as error:
+        return json.dumps({
+            "ok": False,
+            "feature": str(feature),
+            "error": f"{type(error).__name__}: {error}",
+        }, ensure_ascii=False)
+
+
 def install_feature(url, filename, sha256=""):
     import bootstrap
     return bootstrap.install_feature(url, filename, sha256)
@@ -237,9 +264,17 @@ def initialize(files_dir):
         if aliyun_draft is not None:
             config["aliyun_json_draft"] = aliyun_draft
         config.pop("remote_root", None)
+        saved_selected_id = config.get("selected_device_id")
+        selected_device = next(
+            (device for device in devices if device.get("id") == saved_selected_id),
+            None,
+        )
+        if selected_device is None:
+            selected_device = devices[0]
+            config["selected_device_id"] = selected_device["id"]
         save_config(config)
-        _STATE["selected_device_id"] = devices[0]["id"]
-        _STATE["selected_topic"] = devices[0].get("request_topic", _DEFAULT_DEVICE["request_topic"])
+        _STATE["selected_device_id"] = selected_device["id"]
+        _STATE["selected_topic"] = selected_device.get("request_topic", _DEFAULT_DEVICE["request_topic"])
     return {"ok": True, "files_dir": _STATE["files_dir"]}
 
 
@@ -330,8 +365,13 @@ def device_settings(device_ref=None):
 
 def select_device(device_ref):
     selected = _device_config(device_ref)
-    _STATE["selected_device_id"] = selected["id"]
-    _STATE["selected_topic"] = selected["request_topic"]
+    with _STATE["lock"]:
+        _STATE["selected_device_id"] = selected["id"]
+        _STATE["selected_topic"] = selected["request_topic"]
+        config = load_config()
+        if config.get("selected_device_id") != selected["id"]:
+            config["selected_device_id"] = selected["id"]
+            save_config(config)
     return json.dumps({"ok": True, "device": selected}, ensure_ascii=False)
 
 
@@ -484,6 +524,7 @@ def update_device_settings(existing_device, values):
         else:
             selected["timeout_draft"] = timeout_draft
         config["devices"] = devices
+        config["selected_device_id"] = selected["id"]
         save_config(config)
         _STATE["selected_device_id"] = selected["id"]
         _STATE["selected_topic"] = request_topic
@@ -638,6 +679,28 @@ def rpc(code, device=None):
         selected,
     )
     _append_rpc_log(f"MQTT RESPONSE ENVELOPE id={request_id}\n{response_detail}")
+    # 目标 Python 的 stdout/stderr 原始打印值，单独成段原样展示，
+    # 只做密钥/Aliyun 脱敏，不做任何重排或 repr 加工。
+    remote_stdout = response.get("stdout")
+    if isinstance(remote_stdout, str) and remote_stdout:
+        _append_rpc_log(
+            f"REMOTE STDOUT id={request_id} topic={topic} chars={len(remote_stdout)}"
+            f"\n--- begin remote stdout ---\n{_redact_rpc_content(remote_stdout, selected)}"
+            f"\n--- end remote stdout ---"
+        )
+    remote_stderr = response.get("stderr")
+    if isinstance(remote_stderr, str) and remote_stderr:
+        _append_rpc_log(
+            f"REMOTE STDERR id={request_id} topic={topic} chars={len(remote_stderr)}"
+            f"\n--- begin remote stderr ---\n{_redact_rpc_content(remote_stderr, selected)}"
+            f"\n--- end remote stderr ---"
+        )
+    if isinstance(response, dict) and not response.get("ok", True) and response.get("error"):
+        _append_rpc_log(
+            f"REMOTE ERROR RAW id={request_id} topic={topic}"
+            f"\n--- begin remote error ---\n{_redact_rpc_content(response.get('error'), selected)}"
+            f"\n--- end remote error ---"
+        )
     remote_error = _remote_rpc_error(response, selected)
     if remote_error:
         _append_rpc_log(
@@ -729,6 +792,17 @@ def parse_json_result(response):
         metadata = {key: response[key] for key in metadata_fields if key in response}
         if metadata and isinstance(result, dict):
             result["_rpc"] = metadata
+        if isinstance(result, dict):
+            # 原始 Python 输出透传给 UI 单独原样渲染，UI 不要用 Java 再加工 print。
+            stdout = response.get("stdout")
+            if isinstance(stdout, str) and stdout:
+                result.setdefault("_stdout", stdout)
+            stderr = response.get("stderr")
+            if isinstance(stderr, str) and stderr:
+                result.setdefault("_stderr", stderr)
+            envelope_error = response.get("error")
+            if isinstance(envelope_error, str) and envelope_error and not result.get("error"):
+                result["_remote_error"] = envelope_error
         return result
     except (TypeError, ValueError) as exc:
         return {"ok": False, "error": f"invalid RPC JSON: {exc}", "raw": str(value)[:500]}

@@ -230,9 +230,11 @@ def format_result(value):
         pretty = importlib.import_module("IPython.lib.pretty").pretty
         return pretty(value, max_width=120)
     except ImportError:
-        from pprint import pformat
-        return pformat(value, width=120)
-#
+        try:
+            from pprint import pformat
+            return pformat(value, width=120)
+        except ImportError:
+            return repr(value)
 
 def http_import(url, save_to=''): # 定义核心导入函数
     import urllib.request, zipfile, io, sys, importlib, importlib.abc, importlib.machinery, os # 导入必要标准库

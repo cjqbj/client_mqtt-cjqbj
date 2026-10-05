@@ -25,11 +25,16 @@
 - Completed: RPC metadata is attached to feature results; shared online probe enable/interval settings track health per topic and successful RPCs defer the next probe.
 - Completed: Wi-Fi RPC through `feature_wifi.info()` with the user's `233` key, `sys/device/k12`, and 5-second timeout returned `192.168.1.106`; a prior probe used a different test key and timed out.
 - Completed: Python tests pass (`33/33`); `./debug_build_secexp.sh` generated and verified `out/com.qgb.client-1-arm64-v8a.apk` with hierarchical file browsing and target-error reporting.
-- Pending: install and exercise the app UI on Android; validate two responders, pagination, file/Aliyun transfer, both cameras, permissions, external storage, and runtime feature installation.
+- Completed: selected target is persisted as `selected_device_id` in `client_mqtt.json` and restored on cold start; the UI no longer jumps to the first catalog topic after restart.
+- Completed: feature switching moved from the top tab row to a WeChat-style bottom navigation bar; drawer and bottom bar render from the same catalog state, icons resolve from the manifest `icon` hint, and the settings missing-files list comes from `client_service.builtin_feature_files()` instead of a hardcoded Kotlin list.
+- Completed: feature module caching policy reworked — built-in shadowed by a new `py_updates` file is taken over once, loaded modules stay cached, and long-pressing a feature (drawer/bottom bar) shows a reload dialog backed by `client_service.reload_feature(name)`.
+- Completed: feature result pages and the RPC diagnostics page show raw Python stdout/stderr/error text verbatim (Python-side sections, no Kotlin reformatting).
+- Pending: install and exercise the app UI on Android; validate persisted topic restore, bottom navigation, long-press reload, two responders, pagination, file/Aliyun transfer, both cameras, permissions, external storage, and runtime feature installation.
 
 ## Last validation
 - `bash -n debug_build_secexp.sh`: passed.
-- `python3 -m unittest discover -s tests`: passed (`33/33`), including folder pagination, server traceback/raw response, key status, broker diagnostics, copy-safe redaction, and null handling.
+- `python3 -m unittest discover -s tests`: passed (`39/39` locally and on the remote build host), including the new selected-device persistence, raw stdout/stderr passthrough and RPC log sections, built-in catalog bridge, manual reload bridge, cache-stability/shadow-takeover, folder pagination, server traceback/raw response, key status, broker diagnostics, copy-safe redaction, and null handling. `init_env` starts its RPC server once per process so repeated inits no longer collide on port 1166 under Linux.
+- `./debug_build_secexp.sh`: passed after the selected-device/bottom-nav/reload/raw-output changes; `out/com.qgb.client-1-arm64-v8a.apk` regenerated, signed (apksigner V3 verify passed), aapt badging reports version code `1`.
 - Upstream and xime MQTT fixture suites: eight tests pass; one pre-existing test fails because it passes unsupported `server_public_key_bytes` to `MQTTClientNode`.
 - Wi-Fi feature RPC with the exact `233` sample parameters: passed; returned `192.168.1.106` and MAC metadata.
 - `./debug_build_secexp.sh`: passed; APK metadata reports version code `1` and signature verification passed.
