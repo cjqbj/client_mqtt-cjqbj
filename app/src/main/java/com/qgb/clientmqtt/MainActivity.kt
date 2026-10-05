@@ -24,13 +24,19 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -64,7 +70,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -87,10 +92,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.chaquo.python.Python
+import com.chaquo.python.PyObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -171,6 +180,9 @@ private fun ClientMqttScreen() {
     var selectedDevice by remember { mutableStateOf("Target") }
     var selectedDeviceId by remember { mutableStateOf("") }
     var selectedTopic by remember { mutableStateOf("sys/device/request") }
+    // 冷启动恢复闸门：Python 端 selected_device_id 恢复完成前，
+    // 轮询协程不得用 Kotlin 占位 topic 匹配并覆盖持久化选择。
+    var restoreDone by remember { mutableStateOf(false) }
     var targetRemoteRoot by remember { mutableStateOf("/data/data") }
     var onlineStatus by remember { mutableStateOf("checking") }
     var onlineProbeEnabled by remember { mutableStateOf(true) }
@@ -243,6 +255,7 @@ private fun ClientMqttScreen() {
                 }
             }
         }
+        restoreDone = true
         while (true) {
             runCatching { refreshFeatures() }
             delay(3_000)
@@ -251,18 +264,20 @@ private fun ClientMqttScreen() {
 
     LaunchedEffect(Unit) {
         while (true) {
+            // 恢复完成前只等待，避免占位 topic 抢占并写掉 Python 端持久化选择。
+            if (!restoreDone) {
+                delay(100)
+                continue
+            }
             runCatching {
                 val raw = withContext(Dispatchers.IO) { service.callAttr("device_catalog").toString() }
                 val updated = parseTargets(raw)
                 targets = updated
-                // 保持用户当前选择；选中项消失时不擅自跳到第一个目标。
-                val active = updated.firstOrNull { it.id == selectedDeviceId }
-                    ?: updated.firstOrNull { selectedTopic.isNotBlank() && it.requestTopic == selectedTopic }
+                // 仅按已恢复的稳定 id 保持当前选择；选中项消失时不擅自跳到别的目标。
+                val active = selectedDeviceId
+                    .takeIf { it.isNotBlank() }
+                    ?.let { id -> updated.firstOrNull { it.id == id } }
                 if (active != null) {
-                    if (active.id != selectedDeviceId) {
-                        withContext(Dispatchers.IO) { service.callAttr("select_device", active.id) }
-                    }
-                    selectedDeviceId = active.id
                     selectedTopic = active.requestTopic
                     selectedDevice = active.name
                     targetRemoteRoot = active.remoteRoot
@@ -348,35 +363,47 @@ private fun ClientMqttScreen() {
                     Text("Long-press to reload", style = MaterialTheme.typography.labelSmall)
                 }
                 features.forEachIndexed { index, feature ->
-                    NavigationDrawerItem(
-                        label = {
-                            Text(
-                                feature.title,
-                                modifier = Modifier.combinedClickable(
-                                    onClick = {},
-                                    onLongClick = { reloadTarget = feature }
-                                )
+                    val featureSelected = pagerState.currentPage == index && !settings && !targetSettings
+                    // 自绘条目：combinedClickable 同一处理器内确定地分发短按/长按，
+                    // 不要在带内部 clickable 的 NavigationDrawerItem 上叠加 pointerInput，
+                    // 实测内部手势竞争会导致长按不回调。
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(56.dp)
+                            .padding(horizontal = 12.dp)
+                            .clip(RoundedCornerShape(28.dp))
+                            .background(
+                                if (featureSelected) MaterialTheme.colorScheme.secondaryContainer
+                                else Color.Transparent
                             )
-                        },
-                        selected = pagerState.currentPage == index && !settings && !targetSettings,
-                        onClick = {
-                            pagerScope.launch {
-                                pagerState.animateScrollToPage(index)
-                                drawerState.close()
-                            }
-                        },
-                        icon = {
-                            Box(
-                                modifier = Modifier.combinedClickable(
-                                    onClick = {},
-                                    onLongClick = { reloadTarget = feature }
-                                )
-                            ) {
-                                Icon(featureIcon(feature), contentDescription = feature.title)
-                            }
-                        },
-                        modifier = Modifier.padding(horizontal = 12.dp)
-                    )
+                            .combinedClickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = LocalIndication.current,
+                                onClick = {
+                                    pagerScope.launch {
+                                        pagerState.animateScrollToPage(index)
+                                        drawerState.close()
+                                    }
+                                },
+                                onLongClick = { reloadTarget = feature }
+                            )
+                            .padding(horizontal = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Icon(
+                            featureIcon(feature),
+                            contentDescription = feature.title,
+                            tint = if (featureSelected) MaterialTheme.colorScheme.onSecondaryContainer
+                            else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            feature.title,
+                            color = if (featureSelected) MaterialTheme.colorScheme.onSecondaryContainer
+                            else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
                 HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
                 Text("Targets", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(16.dp))
@@ -385,12 +412,18 @@ private fun ClientMqttScreen() {
                         label = { Text(target.requestTopic) },
                         selected = selectedTopic == target.requestTopic,
                         onClick = {
-                            service.callAttr("select_device", target.id)
+                            // 先乐观更新 UI，Python 选择/落盘放到 IO，避免 Chaquopy 调用卡主线程。
                             selectedDeviceId = target.id
                             selectedTopic = target.requestTopic
                             selectedDevice = target.name
                             targetRemoteRoot = target.remoteRoot
-                            scope.launch { drawerState.close() }
+                            val chosenId = target.id
+                            scope.launch {
+                                withContext(Dispatchers.IO) {
+                                    runCatching { service.callAttr("select_device", chosenId) }
+                                }
+                                drawerState.close()
+                            }
                         },
                         modifier = Modifier.padding(horizontal = 12.dp)
                     )
@@ -446,21 +479,51 @@ private fun ClientMqttScreen() {
                     val selectedPage = pagerState.currentPage.coerceIn(0, features.lastIndex)
                     NavigationBar {
                         features.forEachIndexed { index, feature ->
-                            NavigationBarItem(
-                                selected = selectedPage == index,
-                                onClick = { pagerScope.launch { pagerState.animateScrollToPage(index) } },
-                                icon = {
+                            val itemSelected = selectedPage == index
+                            // 自绘底部条目：短按切页、长按重载由同一个 combinedClickable
+                            // 确定分发；NavigationBarItem 内部 clickable 会吞掉叠加的长按手势。
+                            Row(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(80.dp)
+                                    .combinedClickable(
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = LocalIndication.current,
+                                        onClick = {
+                                            pagerScope.launch { pagerState.animateScrollToPage(index) }
+                                        },
+                                        onLongClick = { reloadTarget = feature }
+                                    ),
+                                horizontalArrangement = Arrangement.Center,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                     Box(
-                                        modifier = Modifier.combinedClickable(
-                                            onClick = {},
-                                            onLongClick = { reloadTarget = feature }
-                                        )
+                                        modifier = Modifier
+                                            .size(width = 64.dp, height = 32.dp)
+                                            .clip(CircleShape)
+                                            .background(
+                                                if (itemSelected) MaterialTheme.colorScheme.secondaryContainer
+                                                else Color.Transparent
+                                            ),
+                                        contentAlignment = Alignment.Center
                                     ) {
-                                        Icon(featureIcon(feature), contentDescription = feature.title)
+                                        Icon(
+                                            featureIcon(feature),
+                                            contentDescription = feature.title,
+                                            tint = if (itemSelected) MaterialTheme.colorScheme.onSecondaryContainer
+                                            else MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
                                     }
-                                },
-                                label = { Text(feature.title, maxLines = 1, style = MaterialTheme.typography.labelSmall) }
-                            )
+                                    Text(
+                                        feature.title,
+                                        maxLines = 1,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (itemSelected) MaterialTheme.colorScheme.onSecondaryContainer
+                                        else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -500,10 +563,10 @@ private fun ClientMqttScreen() {
                             modifier = Modifier.fillMaxSize().weight(1f)
                         ) { page ->
                             when (features[page].name) {
-                                "files" -> FilesPage(targetRemoteRoot)
-                                "camera" -> CameraPage()
-                                "wifi" -> WifiPage()
-                                else -> DynamicFeaturePage(features[page])
+                                "files" -> FilesPage(targetRemoteRoot, service)
+                                "camera" -> CameraPage(service)
+                                "wifi" -> WifiPage(service)
+                                else -> DynamicFeaturePage(features[page], service)
                             }
                         }
                     }
@@ -559,7 +622,7 @@ private fun ClientMqttScreen() {
 }
 
 @Composable
-private fun FilesPage(initialRoot: String) {
+private fun FilesPage(initialRoot: String, service: PyObject) {
     var root by remember(initialRoot) { mutableStateOf(initialRoot) }
     var limit by remember { mutableStateOf("100") }
     var status by remember { mutableStateOf("Ready") }
@@ -568,7 +631,6 @@ private fun FilesPage(initialRoot: String) {
     var hasMore by remember { mutableStateOf(false) }
     var loading by remember { mutableStateOf(false) }
     var preview by remember { mutableStateOf<ImageBitmap?>(null) }
-    val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     val rootBoundary = initialRoot.trimEnd('/').ifEmpty { "/" }
@@ -721,12 +783,11 @@ private fun FilesPage(initialRoot: String) {
 }
 
 @Composable
-private fun CameraPage() {
+private fun CameraPage(service: PyObject) {
     var facing by remember { mutableStateOf(0) }
     var cameraMenuExpanded by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Ready") }
     var preview by remember { mutableStateOf<ImageBitmap?>(null) }
-    val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -789,10 +850,9 @@ private fun CameraPage() {
 }
 
 @Composable
-private fun WifiPage() {
+private fun WifiPage(service: PyObject) {
     var status by remember { mutableStateOf("Waiting for target RPC") }
     var copyStatus by remember { mutableStateOf("") }
-    val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
     val context = androidx.compose.ui.platform.LocalContext.current
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as AndroidClipboardManager
@@ -946,9 +1006,8 @@ private fun FeatureOutput(raw: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun DynamicFeaturePage(feature: FeatureDescriptor) {
+private fun DynamicFeaturePage(feature: FeatureDescriptor, service: PyObject) {
     var result by remember(feature.name) { mutableStateOf("Ready") }
-    val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(feature.title, style = MaterialTheme.typography.headlineSmall)
@@ -1160,6 +1219,11 @@ private fun SettingsPage(
     val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
 
+    // Aliyun JSON 统一解析入口：容忍首尾空白与粘贴文件时常见的 BOM。
+    // 所有解析点必须走这里，保证"解析失败"语义在轮询回填、自动保存、错误提示三处一致。
+    fun parseAliyunJson(text: String): Result<JSONObject> =
+        runCatching { JSONObject(text.trim().removePrefix("\uFEFF")) }
+
     LaunchedEffect(Unit) {
         runCatching {
             val raw = withContext(Dispatchers.IO) { service.callAttr("builtin_feature_files").toString() }
@@ -1192,12 +1256,28 @@ private fun SettingsPage(
                     JSONObject(service.callAttr("aliyun_settings").toString())
                 }
                 if (System.currentTimeMillis() - aliyunLastEdit >= 1_200L) {
-                    aliyunJson = if (config.has("aliyun_json_draft")) {
-                        config.optString("aliyun_json_draft")
+                    // 远端始终下发 aliyun_json_draft 键，无草稿时为 null。
+                    // 不能用 has()+optString：旧版 Android 上 null 会被塌缩成字面量
+                    // "null"（新版塌缩成 ""），在停顿 1.2s 后冲掉输入框内容。
+                    val rawDraft = if (config.isNull("aliyun_json_draft")) null
+                        else config.optString("aliyun_json_draft")
+                    // 历史 Bug 落盘过 ""/"null" 脏草稿，按无草稿处理；随后有效的 aliyun
+                    // 回填会触发一次正常保存，Python 端顺手把脏草稿 pop 掉。
+                    val draft = rawDraft?.takeIf { it.isNotBlank() && it.trim() != "null" }
+                    if (!draft.isNullOrEmpty()) {
+                        if (aliyunJson != draft) aliyunJson = draft
                     } else {
                         val incoming = config.optJSONObject("aliyun") ?: JSONObject()
-                        val current = runCatching { JSONObject(aliyunJson).toString() }.getOrNull()
-                        if (current == incoming.toString()) aliyunJson else incoming.toString(2)
+                        val current = parseAliyunJson(aliyunJson).getOrNull()
+                        val localIsGarbage = aliyunJson.isBlank() || aliyunJson.trim() == "null"
+                        // 用户真正编辑中的非法文本绝不能被远端覆盖（只有空/"null"
+                        // 这类本 Bug 产物才允许回填有效配置）。
+                        when {
+                            current != null && current.toString() != incoming.toString() ->
+                                aliyunJson = incoming.toString(2)
+                            current == null && localIsGarbage ->
+                                aliyunJson = incoming.toString(2)
+                        }
                     }
                     aliyunLoaded = true
                 }
@@ -1209,7 +1289,8 @@ private fun SettingsPage(
     LaunchedEffect(aliyunJson, aliyunLoaded) {
         if (!aliyunLoaded) return@LaunchedEffect
         delay(300)
-        val parsed = runCatching { JSONObject(aliyunJson) }.getOrNull()
+        val parseResult = parseAliyunJson(aliyunJson)
+        val parsed = parseResult.getOrNull()
         val values = JSONObject()
         if (parsed == null) values.put("aliyun_json_draft", aliyunJson)
         else values.put("aliyun", parsed)
@@ -1217,8 +1298,9 @@ private fun SettingsPage(
             withContext(Dispatchers.IO) {
                 service.callAttr("update_aliyun_settings", values.toString())
             }
+            // 解析失败只是提示：文本原样保留为草稿，上次有效配置继续生效，绝不清空输入框。
             aliyunStatus = if (parsed == null) {
-                "Saved draft; invalid JSON keeps the last valid settings active"
+                "Invalid JSON (${parseResult.exceptionOrNull()?.message}); text kept as draft, last valid settings stay active"
             } else {
                 "Shared Aliyun settings saved"
             }
@@ -1281,11 +1363,23 @@ private fun SettingsPage(
         }
         HorizontalDivider()
         Text("Shared Aliyun configuration", style = MaterialTheme.typography.titleMedium)
+        val aliyunParseError = remember(aliyunJson) {
+            parseAliyunJson(aliyunJson).exceptionOrNull()?.message
+        }
         OutlinedTextField(
-            aliyunJson,
-            { aliyunJson = it; aliyunLastEdit = System.currentTimeMillis() },
-            Modifier.fillMaxWidth(),
+            value = aliyunJson,
+            onValueChange = { aliyunJson = it; aliyunLastEdit = System.currentTimeMillis() },
+            modifier = Modifier.fillMaxWidth(),
             minLines = 6,
+            isError = aliyunParseError != null,
+            supportingText = if (aliyunParseError != null) {
+                {
+                    Text(
+                        "Invalid JSON: $aliyunParseError — text kept editable, last valid settings stay active",
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            } else null,
             label = { Text("Aliyun configuration JSON") }
         )
         Text(aliyunStatus, style = MaterialTheme.typography.bodySmall)
