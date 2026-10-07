@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 #import rpc
-import server_http as rpc
+import server_http
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +252,7 @@ def main():
     global editor
     editor = Editor(args.file)
     threading.Thread(target=editor.watch, name='RealtimeEditorWatcher', daemon=True).start()
-    server= rpc.start_rpc_server(
+    server= server_http.start_rpc_server(
         port=args.port,
         ip=args.host,
         globals=globals(),

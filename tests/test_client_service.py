@@ -69,6 +69,44 @@ class ClientServiceTests(unittest.TestCase):
                         sys.modules.pop(name, None)
                 sys.modules.update(previous_modules)
 
+    def test_mqtt_loader_supports_migrated_client_subdirectory(self):
+        previous_file = client_service.__file__
+        previous_path = list(sys.path)
+        previous_modules = {
+            name: module for name, module in sys.modules.items()
+            if name == "multi_mqtt" or name.startswith("multi_mqtt.") or name == "client_mqtt"
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            module_dir = Path(directory) / "multi_mqtt"
+            client_dir = module_dir / "client"
+            client_dir.mkdir(parents=True)
+            (module_dir / "multi_mqtt.py").write_text(
+                "class MultiMQTTManager: pass\n",
+                encoding="utf-8",
+            )
+            (client_dir / "client_mqtt.py").write_text(
+                "from multi_mqtt import MultiMQTTManager\n"
+                "def rpc(*args, **kwargs): return {'ok': True}\n",
+                encoding="utf-8",
+            )
+            try:
+                client_service.__file__ = str(Path(directory) / "client_service.py")
+                for name in tuple(sys.modules):
+                    if name == "multi_mqtt" or name.startswith("multi_mqtt.") or name == "client_mqtt":
+                        sys.modules.pop(name, None)
+
+                module = client_service._mqtt_client_module()
+
+                self.assertEqual(Path(module.__file__), client_dir / "client_mqtt.py")
+                self.assertTrue(module.rpc()["ok"])
+            finally:
+                client_service.__file__ = previous_file
+                sys.path[:] = previous_path
+                for name in tuple(sys.modules):
+                    if name == "multi_mqtt" or name.startswith("multi_mqtt.") or name == "client_mqtt":
+                        sys.modules.pop(name, None)
+                sys.modules.update(previous_modules)
+
     def test_broken_runtime_feature_returns_json_instead_of_raising(self):
         import bootstrap
 
@@ -709,14 +747,28 @@ class ClientServiceTests(unittest.TestCase):
                 with mock.patch.object(bootstrap, "install_feature", side_effect=install) as download:
                     result = json.loads(client_service.install_builtin_features(script_root))
                     self.assertTrue(result["ok"])
-                    self.assertEqual(len(result["results"]), 3)
+                    self.assertEqual(len(result["results"]), 4)
                     self.assertTrue(all(item["ok"] for item in result["results"]))
                     self.assertTrue(any("installed for test" in item for item in result["logs"]))
-                    self.assertEqual(download.call_count, 3)
+                    self.assertEqual(download.call_count, 4)
 
                     second = json.loads(client_service.install_builtin_features(script_root))
                     self.assertTrue(all(item.get("skipped") for item in second["results"]))
-                    self.assertEqual(download.call_count, 3)
+                    self.assertEqual(download.call_count, 4)
+
+                    single = json.loads(
+                        client_service.install_builtin_feature(script_root, "feature_audio.py")
+                    )
+                    self.assertTrue(single["ok"])
+                    self.assertEqual(single["result"]["filename"], "feature_audio.py")
+                    self.assertEqual(download.call_count, 5)
+
+                    invalid = json.loads(
+                        client_service.install_builtin_feature(script_root, "feature_unknown.py")
+                    )
+                    self.assertFalse(invalid["ok"])
+                    self.assertIn("unknown built-in feature file", invalid["result"]["error"])
+                    self.assertEqual(download.call_count, 5)
             finally:
                 client_service._STATE.clear()
                 client_service._STATE.update(previous_state)

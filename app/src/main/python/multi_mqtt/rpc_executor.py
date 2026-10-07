@@ -27,17 +27,29 @@ class PythonExecutor:
     参数；``locals_dict`` 在内部作为别名存在，以便两个名字都可被内省 /
     兼容使用。
 
+    命名空间拷贝策略（``copy_globals``）
+    ----------------------------------
+    默认 ``copy_globals=False``：执行器**直接持有**调用方传入的字典引用，
+    不做任何拷贝。调用方在外部对该字典新增 / 修改的名字（例如启动后才
+    赋值的服务端实例）在后续 RPC 中实时可见。MQTT 通道依赖这一语义。
+
+    仅当显式传 ``copy_globals=True`` 时，才对传入字典做一次**浅拷贝**
+    （``dict(globals)``），执行器此后与调用方字典彻底脱钩，等价于服务
+    启动时拍一张快照。HTTP 通道若需要请求间与调用方 globals 隔离，可
+    显式开启；注意浅拷贝只复制顶层键，可变对象仍是共享引用。
+
     ipy 中可以验证 globals() == locals()
     Out[11]: True
 
     如果要在函数内部 调用 PythonExecutor 执行时绕过共享命名空间，可以直接赋值 ``self.locals_dict``。
     """
 
-    def __init__(self, globals=None, main_loop=None):
-        # 若调用方提供了字典，则直接使用它，这样外部对它的修改依然可见；
-        # 否则新建一个空字典。
+    def __init__(self, globals=None, main_loop=None, copy_globals=False):
+        # 默认零拷贝：直接持有调用方字典，外部对它的修改实时可见
+        # （server_mqtt 通道依赖此行为，启动后才创建的 gms 等名字必须可见）。
+        # 仅在 copy_globals=True 时浅拷贝一次，与调用方字典脱钩形成快照。
         if globals is not None:
-            self.globals_dict = globals
+            self.globals_dict = dict(globals) if copy_globals else globals
         else:
             self.globals_dict = {}
 

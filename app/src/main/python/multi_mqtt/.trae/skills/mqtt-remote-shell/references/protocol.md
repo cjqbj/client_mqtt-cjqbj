@@ -1,12 +1,12 @@
 # PTY over MQTT 协议参考（排错 / 二次开发用）
 
 主文档见上级 `SKILL.md`。本文件描述握手、帧格式、去重与线程模型，常量与代码均以
-`remote_cmd.py`（`_PTY_START_TEMPLATE`、`RemotePty`）和 `multi_mqtt.py` 为准。
+`client/remote_cmd.py`（`_PTY_START_TEMPLATE`、`RemotePty`）和 `multi_mqtt.py` 为准。
 
 ## 1. 拓扑
 
 ```
-本地 pty_client_mqtt / RemotePty                远端 server_mqtt.py（通用，无 PTY 专用代码）
+本地 client/pty_client_mqtt / RemotePty          远端 server_mqtt.py（通用，无 PTY 专用代码）
         |  ① 签名 RPC：整段 PTY 启动代码            |
         |  ---- sys/device/request (broadcast) -->  gms.handle_message -> exec 代码
         |  <-- sys/device/response --------------  返回 {ok, sid, topics, shell, pid}
@@ -105,13 +105,21 @@ login shell 的 argv0 带 `-` 前缀；子进程 `setsid()` + `TIOCSCTTY` 拿控
 | `DEFAULT_PTY_TTL` / `MAX_PTY_TTL` | 12h / 24h | 孤儿会话寿命 |
 | `WIRE_BUDGET` | 128KiB | 文件分块单报文目标在线尺寸 |
 | `MAX_TRANSFER` | 1MiB | 文件经报文通道传输硬上限 |
+| `MAX_DIR_ARCHIVE` / `DEFAULT_DIR_ARCHIVE_MAX` | 1MiB / 700KiB | `pull_dir` 压缩包硬顶（客户端+远端双侧强制）/默认阈值（base64×4/3 后仍 <1000KiB） |
 | broker 实测 | 1000KiB 可过 / 1200KiB 丢 | 大文件必须远端就地处理 |
+
+`pull_dir`（普通签名 RPC op，非 PTY）：payload `{op:"pull_dir", path, excludes[],
+max_bytes, top_n}`；远端纯标准库 `os.walk`（exclude 按路径组件+相对路径 fnmatch，
+命中目录即剪枝）→ `tarfile+gzip(mtime=0)` 边压边计数、超限即停 → 成功回
+`{ok,b64,md5,arc_bytes,raw_bytes,files,dirs,excluded,skipped_links,skipped_special,
+excludes}`，超限回 `{ok:false,reason:"too_large",largest:[{path,size}]...}`，
+客户端映射为 `DirArchiveTooLarge`。符号链接/特殊文件不入包。
 
 ## 7. 二次开发要点
 
-- 新增传输层（HTTP/TCP/WS）只需实现 `remote_cmd.Transport`：`request(code,
+- 新增传输层（HTTP/TCP/WS）只需实现 `client.remote_cmd.Transport`：`request(code,
   timeout)` 为必需；PTY 另需 `publish`、`stream_subscribe`、`stream_unsubscribe`
-  （参考 `cmd_client_mqtt.MqttTransport`）。
+  （参考 `client.cmd_client_mqtt.MqttTransport`）。
 - 改动 PTY 服务端行为时改 `_PTY_START_TEMPLATE` 字符串本身——它是逐字下发
   执行的代码，改名/改缩进前确认模板内 `_o/_t/_th/...` 等短别名一致；
   `__PAYLOAD__` 占位符替换为 `json.dumps(json.dumps(payload))` 的双编码字面量。

@@ -44,6 +44,10 @@ _BUILTIN_FEATURE_SOURCES = {
         "https://github.com/cjqbj/client_mqtt-cjqbj/raw/refs/heads/main/app/src/main/python/feature_wifi.py",
         "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/main/app/src/main/python/feature_wifi.py",
     ),
+    "feature_audio.py": (
+        "https://github.com/cjqbj/build_xime_home/raw/refs/heads/main/client/app/src/main/python/feature_audio.py",
+        "https://raw.githubusercontent.com/cjqbj/build_xime_home/main/client/app/src/main/python/feature_audio.py",
+    ),
 }
 
 
@@ -70,7 +74,13 @@ def call_feature(feature, action="run", *args):
 def _mqtt_client_module():
     module_dir = os.path.join(os.path.dirname(__file__), "multi_mqtt")
     package_source = os.path.join(module_dir, "multi_mqtt.py")
-    client_source = os.path.join(module_dir, "client_mqtt.py")
+    client_sources = (
+        os.path.join(module_dir, "client_mqtt.py"),
+        os.path.join(module_dir, "client", "client_mqtt.py"),
+    )
+    client_source = next((path for path in client_sources if os.path.isfile(path)), None)
+    if client_source is None:
+        raise ImportError(f"Unable to find client_mqtt.py in {module_dir}")
     if module_dir not in sys.path:
         sys.path.insert(0, module_dir)
     mqtt_module = sys.modules.get("multi_mqtt")
@@ -90,6 +100,9 @@ def _mqtt_client_module():
     client_file = os.path.abspath(str(getattr(client_module, "__file__", "")))
     if client_file != os.path.abspath(client_source) or not callable(getattr(client_module, "rpc", None)):
         sys.modules.pop("client_mqtt", None)
+        client_source_dir = os.path.dirname(client_source)
+        if client_source_dir not in sys.path:
+            sys.path.insert(0, client_source_dir)
         return importlib.import_module("client_mqtt")
     return client_module
 
@@ -204,14 +217,8 @@ def install_builtin_features(script_root, retries=4, timeout=15):
                 _append_operation_log(f"{filename}: existing file is invalid; downloading replacement")
 
         try:
-            result = bootstrap.install_feature(
-                urls[0],
-                filename,
-                update_dir=update_dir,
-                retries=retries,
-                timeout=timeout,
-                fallback_urls=urls[1:],
-                progress=_append_operation_log,
+            result = _install_builtin_feature_file(
+                bootstrap, filename, update_dir, retries, timeout
             )
             results.append(result)
         except Exception as error:
@@ -225,6 +232,49 @@ def install_builtin_features(script_root, retries=4, timeout=15):
         "ok": installed == len(results),
         "update_dir": update_dir,
         "results": results,
+        "logs": json.loads(operation_logs()),
+    }, ensure_ascii=False)
+
+
+def _install_builtin_feature_file(bootstrap, filename, update_dir, retries, timeout):
+    urls = _BUILTIN_FEATURE_SOURCES.get(str(filename))
+    if urls is None:
+        raise ValueError(f"unknown built-in feature file: {filename}")
+    return bootstrap.install_feature(
+        urls[0],
+        filename,
+        update_dir=update_dir,
+        retries=retries,
+        timeout=timeout,
+        fallback_urls=urls[1:],
+        progress=_append_operation_log,
+    )
+
+
+def install_builtin_feature(script_root, filename, retries=4, timeout=15):
+    """Download or refresh one selected built-in feature script."""
+    import bootstrap
+
+    update_dir = os.path.join(os.path.abspath(str(script_root)), "py_updates")
+    os.makedirs(update_dir, exist_ok=True)
+    with _STATE["lock"]:
+        _STATE.setdefault("operation_logs", []).clear()
+    _append_operation_log(f"Installing {filename} into {update_dir}")
+    try:
+        result = _install_builtin_feature_file(
+            bootstrap, filename, update_dir, retries, timeout
+        )
+    except Exception as error:
+        detail = f"{type(error).__name__}: {error}"[:300]
+        _append_operation_log(f"{filename}: failed: {detail}")
+        result = {"filename": str(filename), "ok": False, "error": detail}
+    _append_operation_log(
+        f"Finished: {filename} {'ready' if result.get('ok') else 'failed'}"
+    )
+    return json.dumps({
+        "ok": bool(result.get("ok")),
+        "update_dir": update_dir,
+        "result": result,
         "logs": json.loads(operation_logs()),
     }, ensure_ascii=False)
 

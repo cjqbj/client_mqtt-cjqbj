@@ -146,9 +146,21 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
     websocket_path = '/ws'
     redirect_root = None
     main_loop = None
+    # 可选非阻塞日志出口 callable(str)；pty_client_mqtt 把它接到异步写
+    # 线程上，避免控制台堵塞时 BaseHTTPRequestHandler 的 print 拖死请求线程
+    log_sink = None
 
     def log_message(self, format, *args):
-        print(f"[RPC] {stime()[12:]}  {self.client_address[0]}:{self.client_address[1]} {format % args}")
+        line = (f"[RPC] {stime()[12:]}  {self.client_address[0]}:"
+                f"{self.client_address[1]} {format % args}\n")
+        sink = self.log_sink
+        if sink is not None:
+            try:
+                sink(line)
+                return
+            except Exception:
+                pass  # sink 挂了退回 print，不能让日志本身打挂请求
+        print(line)
 
     def do_GET(self):
         websocket_path = self.path.split('?', 1)[0]
@@ -196,6 +208,17 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             traceback.print_exc()
         finally:
             websocket.close()
+            # 升级后连接已脱离 HTTP keep-alive 循环：主动关底层 socket，
+            # 否则要等下一轮解析失败才回收（浏览器日志台频繁开关时堆积 fd）。
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self.connection.close()
+            except OSError:
+                pass
 
     def do_POST(self):
         self.handle_rpc()
@@ -365,26 +388,39 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
 def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None, daemon=True,
                      favicon_rgb=None, favicon_size=16, websocket_handler=None,
                      websocket_path='/ws', redirect_root=None, websocket_handlers=None,
-                     main_loop=None, listen=True):
+                     main_loop=None, listen=True, log_sink=None):
     if not key:
         key = ''
     RPCRequestHandler.key = key
+    # 普通函数直接挂类属性会触发描述符协议：self.log_sink 取到的是
+    # bound method func(handler, line)，log_message 里 sink(line) 必抛
+    # TypeError（被 except 吞掉），于是每笔请求都静默退回 print(line)
+    # 直写终端——pty_client_mqtt 场景下就是插进远端 shell 画面。包一层
+    # staticmethod 后 self.log_sink 取回原函数；bound method/实例级赋值不受影响。
+    RPCRequestHandler.log_sink = (staticmethod(log_sink)
+                                  if callable(log_sink) else log_sink)
     RPCRequestHandler.websocket_handler = websocket_handler
     RPCRequestHandler.websocket_path = websocket_path
     RPCRequestHandler.websocket_handlers = websocket_handlers or {}
     RPCRequestHandler.redirect_root = redirect_root
     RPCRequestHandler.main_loop = main_loop
 
-    # 构造持久命名空间：合并调用方传入的 globals / locals。
-    # 该命名空间只在服务器启动时构造一次，之后所有请求共享。
-    persistent_ns = {}
-    if globals:
-        persistent_ns.update(globals)
-    if locals:
-        persistent_ns.update(locals)
-    persistent_ns['__name__'] = '__rpc_exec__'
+    # 持久命名空间：默认零拷贝，直接持有调用方传入的 globals 字典引用，
+    # 不做任何浅拷贝。这样服务器启动之后调用方才赋值的名字（例如 MQTT
+    # 服务端实例 gms）在后续 HTTP RPC 中实时可见，与 MQTT 通道行为一致。
+    # 模块级调用时 globals() 与 locals() 本就是同一个 dict；只有二者都
+    # 未提供时才让执行器自建空字典。若确实需要与调用方字典隔离的快照，
+    # 直接改用 PythonExecutor(..., copy_globals=True)。
+    if isinstance(globals, dict):
+        persistent_ns = globals
+    elif isinstance(locals, dict):
+        persistent_ns = locals
+    else:
+        persistent_ns = None
 
     # 只创建一个 PythonExecutor，请求级上下文通过 execute(globals=...) 注入。
+    # 不在这里强写 __name__：执行器内部用 setdefault，模块字典自带 __name__
+    # 不会被覆盖；自建空字典时由执行器补成 __rpc_exec__。
     RPCRequestHandler.executor = rpc_executor.PythonExecutor(
         globals=persistent_ns,
         main_loop=main_loop,
@@ -403,7 +439,14 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
     thread = threading.Thread(target=server.serve_forever, name='RPC_Server', daemon=daemon)
     thread.start()
     server.thread = thread
-    print(f"[RPC] {stime()} server at http://{ip}:{port}/{key}")
+    boot_line = f"[RPC] {stime()} server at http://{ip}:{port}/{key}\n"
+    if log_sink is not None:
+        try:
+            log_sink(boot_line)
+        except Exception:
+            print(boot_line)
+    else:
+        print(boot_line)
     return server
 
 

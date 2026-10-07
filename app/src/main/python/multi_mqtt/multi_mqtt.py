@@ -32,13 +32,22 @@ def ensure_dependencies():
         sys.exit(1)
 ensure_dependencies()
 
-import ast,json,time,os,uuid,hashlib,logging,base64,struct,threading,queue
+import ast,json,time,os,uuid,hashlib,logging,base64,struct,threading,queue,socket
+import concurrent.futures
 import ecdsa  # [新增]
 from collections import OrderedDict
 from paho.mqtt import client as mqtt_client
 from paho.mqtt.enums import CallbackAPIVersion
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# 组合方（如 pty_client_mqtt）需要把全部日志导去自己的环形缓冲/Web 控制台，
+# 而不是让本模块在 import 时往 root 挂一个写 stderr 的 StreamHandler（会插进
+# PTY 远端画面）。约定：import 本模块前设置环境变量 CMQ_NO_STDERR_LOG=1，
+# 这里只挂 NullHandler 占位，root level 仍由组合方按需配置（日志记录照常
+# 向 root 传播，组合方挂自己的 handler 即可收到）。
+if os.environ.get("CMQ_NO_STDERR_LOG"):
+    logging.basicConfig(level=logging.INFO, handlers=[logging.NullHandler()])
+else:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("MultiMQTT")
 
 # =========================================================================
@@ -851,10 +860,26 @@ class MultiMQTTManager:
     # [修复-N3] stop() 中等待分发线程退出的超时（秒）。
     DISPATCH_JOIN_TIMEOUT = 5.0
 
-    def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60*5, max_reconnect_delay=3600):
+    def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60*5, max_reconnect_delay=3600, recovery_enabled=True, recovery_interval=15.0, recovery_probe_timeout=3.0, recovery_force_gap=30.0, recovery_start_grace=90.0):
         self.brokers = brokers
         self.keepalive = keepalive
         self.max_reconnect_delay = max_reconnect_delay
+        # ---- [网络恢复看门狗] ----
+        # 背景：手机进入 Doze（尤其华为等 ROM 的 light-idle）后全部 socket 被
+        # 切断，paho 指数退避很快顶到 max_reconnect_delay（默认 3600s）；网络
+        # 恢复后旧网络线程仍在最长 1 小时的 sleep 中，导致所有 broker 红灯数
+        # 小时。看门狗只在【全部节点都掉线】时介入：周期裸 TCP 探测，网络一
+        # 恢复就重建所有卡在长退避睡眠里的 client。只要还有任一节点在线，单个
+        # 坏节点（TCP 通但 MQTT 不可用）一律不碰，交还 paho 常规退避，避免对
+        # 坏节点产生周期性重连与日志刷屏。
+        self.recovery_enabled = recovery_enabled
+        self.recovery_interval = recovery_interval
+        self.recovery_probe_timeout = recovery_probe_timeout
+        self.recovery_force_gap = recovery_force_gap
+        self.recovery_start_grace = recovery_start_grace
+        self._recovery_last_force = {}
+        self._recovery_thread = None
+        self._started_at = 0.0
         self.clients = {}
         self.log_messages = log_messages
         self.enable_crypto = enable_crypto  # 默认关闭加密
@@ -966,30 +991,19 @@ class MultiMQTTManager:
             target=self._dispatch_loop, daemon=True, name="MQTTMsgDispatch"
         )
         self._dispatch_thread.start()
+        self._started_at = time.time()
         for broker_entry in self.brokers:
-            unpacked = self._unpack_broker(broker_entry)
-            if unpacked is None:
+            host, port, client = self._build_client(broker_entry)
+            if client is None:
                 continue
-            host, port, username, password = unpacked
-            client_id = f"multi_client_{int(time.time()*1000)}_{uuid.uuid4().hex[:4]}"
-            client = mqtt_client.Client(CallbackAPIVersion.VERSION2, client_id=client_id, protocol=mqtt_client.MQTTv311)
-            client.user_data_set(host)
-            if username is not None:
-                try:
-                    client.username_pw_set(username, password)
-                except Exception:
-                    logger.exception("设置 Broker [%s] 用户名密码失败，仍尝试匿名连接", host)
-            client.reconnect_delay_set(min_delay=1, max_delay=self.max_reconnect_delay)
-            client.on_connect = self._on_connect
-            client.on_disconnect = self._on_disconnect
-            client.on_message = self._on_message
-            client.on_publish = self._on_publish
             try:
                 client.connect_async(host, port, keepalive=self.keepalive)
                 client.loop_start()
                 with self.lock:
                     self.clients[host] = client
                 if self.log_connection:
+                    unpacked = self._unpack_broker(broker_entry)
+                    username = unpacked[2] if unpacked else None
                     auth_tag = f" user={username!r}" if username is not None else " (anonymous)"
                     logger.info(f"开启后台连接任务 -> {host}:{port}{auth_tag}")
             except Exception as e:
@@ -1000,6 +1014,225 @@ class MultiMQTTManager:
                 logger.error(f"连接初始化失败 [{host}]: {e}")
         if self.enable_stats:
             self.stats.start(self.clients)
+        if self.recovery_enabled:
+            self._recovery_thread = threading.Thread(
+                target=self._recovery_loop, daemon=True, name="MQTTRecovery"
+            )
+            self._recovery_thread.start()
+
+    def _build_client(self, broker_entry):
+        """创建一个 paho client（不连接、不启动 loop）。
+
+        :return: (host, port, client)；非法配置返回 (None, None, None)。
+        """
+        unpacked = self._unpack_broker(broker_entry)
+        if unpacked is None:
+            return None, None, None
+        host, port, username, password = unpacked
+        client_id = f"multi_client_{int(time.time()*1000)}_{uuid.uuid4().hex[:4]}"
+        client = mqtt_client.Client(CallbackAPIVersion.VERSION2, client_id=client_id, protocol=mqtt_client.MQTTv311)
+        client.user_data_set(host)
+        if username is not None:
+            try:
+                client.username_pw_set(username, password)
+            except Exception:
+                logger.exception("设置 Broker [%s] 用户名密码失败，仍尝试匿名连接", host)
+        client.reconnect_delay_set(min_delay=1, max_delay=self.max_reconnect_delay)
+        client.on_connect = self._on_connect
+        client.on_disconnect = self._on_disconnect
+        client.on_message = self._on_message
+        client.on_publish = self._on_publish
+        return host, port, client
+
+    def _host_port_map(self):
+        """返回当前 broker 配置的 {host: port}（用于恢复时的裸 TCP 探测与重建）。"""
+        result = {}
+        for broker_entry in self.brokers:
+            unpacked = self._unpack_broker(broker_entry)
+            if unpacked is not None:
+                result[unpacked[0]] = unpacked[1]
+        return result
+
+    def _probe_reachable(self, host, port):
+        """裸 TCP 探测：网络/对端是否可达。不可达时绝不打扰 paho，避免无谓重建。"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self.recovery_probe_timeout)
+        try:
+            sock.connect((host, port))
+            return True
+        except OSError:
+            return False
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _recover_client(self, host):
+        """重建一个彻底卡死的 paho client。
+
+        paho 的重连线程陷在最长 3600s 的 ``time.sleep`` 里，外部没有 API 可以
+        提前唤醒；直接对其调用 reconnect() 也没人跑 loop 服务新 socket。唯一
+        可靠的做法是 terminate 旧线程，用原配置重建一个全新 client。
+        """
+        with self.lock:
+            old = self.clients.get(host)
+        if old is not None:
+            try:
+                old._thread_terminate = True
+                try:
+                    # 唤醒可能阻塞在 select 上的网络线程
+                    try:
+                        old._sockpairW.send(b"x")
+                    except Exception:
+                        pass
+                    old.loop_stop()
+                finally:
+                    try:
+                        old._sock_close()
+                    except Exception:
+                        pass
+            except Exception:
+                logger.debug("终止旧 client 线程 [%s] 时出现异常", host, exc_info=True)
+        entry = None
+        for broker_entry in self.brokers:
+            unpacked = self._unpack_broker(broker_entry)
+            if unpacked is not None and unpacked[0] == host:
+                entry = broker_entry
+                break
+        if entry is None:
+            logger.warning("恢复重建时找不到 broker 配置，已跳过: %s", host)
+            return False
+        new_host, port, client = self._build_client(entry)
+        client.connect_async(new_host, port, keepalive=self.keepalive)
+        client.loop_start()
+        with self.lock:
+            # 极端情况下 stop() 已清空 dict：放弃这个新 client
+            if self._stop_event.is_set():
+                try:
+                    client.loop_stop()
+                except Exception:
+                    pass
+                return False
+            self.clients[new_host] = client
+        logger.info("♻️ [网络恢复] Broker %s:%s 已重建 client（网络可达但旧连接未自愈）", new_host, port)
+        return True
+
+    def _recovery_loop(self):
+        """网络恢复看门狗主循环（仅在“全集群掉线”时介入）。
+
+        核心策略（真机结论）：
+        - 集群里**只要还有任意一个 broker 在线**，个别掉线节点（典型：TCP
+          能连但 MQTT 服务不可用的坏节点）一律交给 paho 自身的指数退避
+          （封顶 max_reconnect_delay），看门狗**绝不**强制重建——否则会对
+          这种坏节点产生周期性重连与日志刷屏，也没有任何收益。
+        - 只有**全部节点都掉线**（整机断网 / Doze 冻结后 socket 全断）时，
+          才判定为全局网络事件：裸 TCP 并行探活，一旦有 broker 可达即认为
+          网络恢复，一次性重建所有“可达但仍掉线”的 client，绕开它们陷在
+          paho 长退避睡眠里的旧网络线程。一个都不可达则安静等待下一轮。
+        """
+        ev = self._stop_event
+        # 启动宽限期：让首轮正常连接完成，避免把"还没连上"误判成"全灭"
+        if ev.wait(self.recovery_start_grace):
+            return
+        while not ev.is_set():
+            try:
+                with self.lock:
+                    snapshot = dict(self.clients)
+                if snapshot:
+                    online, dead_hosts = 0, []
+                    for host, client in snapshot.items():
+                        try:
+                            if client.is_connected():
+                                online += 1
+                            else:
+                                dead_hosts.append(host)
+                        except Exception:
+                            dead_hosts.append(host)
+                    if online == 0 and dead_hosts:
+                        self._global_recovery_scan(dead_hosts)
+            except Exception:
+                logger.exception("网络恢复看门狗一轮扫描异常")
+            ev.wait(self.recovery_interval)
+
+    def _global_recovery_scan(self, dead_hosts):
+        """全集群掉线时的快速恢复扫描。
+
+        只在所有节点都不在线时调用：TCP 探活确认网络是否回来，回来就一次性
+        重建所有可达节点；网络仍断则完全静默（不重建、不刷日志）。
+        """
+        ev = self._stop_event
+        now = time.time()
+        due = [
+            h for h in dead_hosts
+            if now - self._recovery_last_force.get(h, 0.0) >= self.recovery_force_gap
+        ]
+        if not due:
+            return
+        host_port = self._host_port_map()
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, len(due))
+        ) as pool:
+            reachable = dict(zip(
+                due,
+                pool.map(
+                    lambda h: self._probe_reachable(h, host_port.get(h, 1883)),
+                    due,
+                ),
+            ))
+        good = [h for h, ok in reachable.items() if ok]
+        if not good:
+            # 全部 broker 都不可达 = 网络仍未恢复，安静等待，绝不重建
+            return
+        built = 0
+        for host in good:
+            if ev.is_set():
+                break
+            # 重建前再次确认仍未连接（paho 可能恰好在此刻自愈了）
+            with self.lock:
+                current = self.clients.get(host)
+            try:
+                if current is not None and current.is_connected():
+                    continue
+            except Exception:
+                pass
+            self._recovery_last_force[host] = time.time()
+            try:
+                if self._recover_client(host):
+                    built += 1
+            except Exception:
+                logger.exception("恢复重建 client 失败 [%s]", host)
+        if built:
+            logger.warning(
+                "🌐 [全局恢复] 检测到全部 %d 个 broker 掉线后网络恢复，"
+                "已快速重建 %d 个可达节点（其余单点掉线仍走 paho 常规退避）",
+                len(dead_hosts), built,
+            )
+
+
+    def wait_connected(self, min_count=1, timeout=10.0, poll_interval=0.05):
+        """阻塞等待，直到至少 ``min_count`` 个 broker 建立连接或 ``timeout`` 到期。
+
+        替代早期调用方写死的 ``time.sleep(2)``：最快的 broker（实测约
+        110ms）一连上就立即放行后续订阅/握手，不再无意义干等；全部 broker
+        都连不上时最多等到超时，随后台自动重连继续，调用方仍可往下走。
+
+        :return: 放行/超时时刻的在线连接数（超时也不抛异常，由调用方决定）。
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self.lock:
+                snapshot = list(self.clients.values())
+            online = 0
+            for c in snapshot:
+                try:
+                    if c.is_connected():
+                        online += 1
+                except Exception:
+                    pass
+            if online >= min_count or time.monotonic() >= deadline:
+                return online
+            time.sleep(max(0.005, float(poll_interval)))
 
     # ================= [基于 Userdata 的统一回调] =================
     def _on_connect(self, client, userdata, flags, rc, properties=None):
@@ -1234,6 +1467,13 @@ class MultiMQTTManager:
 
         if self.enable_stats:
             self.stats.stop()
+        rt = self._recovery_thread
+        if rt is not None and rt.is_alive():
+            # 看门狗检查 _stop_event 退出；一轮扫描最坏受探测超时限制，稍作等待
+            rt.join(timeout=self.recovery_probe_timeout * 2 + self.recovery_interval + 2.0)
+            if rt.is_alive():
+                logger.warning("网络恢复看门狗线程未在预期时间内退出")
+        self._recovery_thread = None
         with self.lock:
             clients_snapshot = list(self.clients.values())
             self.clients.clear()

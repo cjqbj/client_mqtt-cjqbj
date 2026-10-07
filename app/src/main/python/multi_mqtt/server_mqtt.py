@@ -37,6 +37,8 @@ class MQTTServer:
         brokers=BROKER_LIST,
         request_topic=REQUEST_TOPIC,
         reply_topic=DEFAULT_REPLY_TOPIC,
+        keepalive=None,
+        max_reconnect_delay=None,
     ):
         # 实例化网络层管理器（enable_crypto 默认为 False）
         self.request_topic = request_topic
@@ -44,11 +46,17 @@ class MQTTServer:
 
         # 公钥解析统一由 MultiMQTTManager 内部完成（含 OpenSSH -> PEM 转换）。
         # 这里只把原始输入透传进去，不再重复解析，避免结果不一致。
+        net_kwargs = {}
+        if keepalive is not None:
+            net_kwargs["keepalive"] = keepalive
+        if max_reconnect_delay is not None:
+            net_kwargs["max_reconnect_delay"] = max_reconnect_delay
         self.mqtt_net = MultiMQTTManager(
             brokers=brokers,
             log_messages=False,  # 每个 broker 不打印原始消息
             server_public_key_bytes=server_public_key_bytes,
             enable_stats=True,
+            **net_kwargs,
         )
         
         self.mqtt_net.set_on_message(self.handle_message)
@@ -186,19 +194,21 @@ class MQTTServer:
             return None
 
         self.mqtt_net.subscribe(self.request_topic)
-        #time.sleep(1)
+        # 不写死 sleep：首个 broker 一连上就宣布就绪；迟到的 broker 会在
+        # on_connect 时按 subscribed_topics 自动补订阅，不会漏消息。
+        online = self.mqtt_net.wait_connected(min_count=1, timeout=5.0)
 
         verify_enabled, verify_reason = _is_verify_enabled(self.mqtt_net)
         logger.info(
-            "🚀 [%s] 服务端已就绪，正在监听: %s , reply_topic=%s , mqtt_pub_key=%s , 验签=%s",
+            "🚀 [%s] 服务端已就绪（在线 broker %d/%d），正在监听: %s , reply_topic=%s , mqtt_pub_key=%s , 验签=%s",
             stime(),
+            online, len(getattr(self.mqtt_net, "clients", {}) or {}),
             self.request_topic,
             self.reply_topic,
             _describe_public_key(self.mqtt_net.server_public_key_bytes),
             verify_reason if verify_enabled else f"{verify_reason}",
         )
 
-        time.sleep(2)
         logger.info("[连接质量统计报告]%s", self.mqtt_net.stats.get_report(is_windows_cmd=(sys.platform=="win32")))
         if not block:
             return self
@@ -253,6 +263,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="mqtt http rpc")
     parser.add_argument("--port", "-port", "-p", type=int, default=1177)
     parser.add_argument("--host", "-host", default="0.0.0.0")
+    parser.add_argument("--request_topic", "--topic", "-t", default=REQUEST_TOPIC) # 这里不使用 alias_request_topic 是不想引入client依赖
 
     _PUB = b"ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBER9c5vu215n+5gv1YjGdm78Nf99wpfqw1fIT8nXib2FLUglq4NBMe7hLp2VOkqv9z00m5Wn+uUADH4zyXLiWzI="
     # _PUB = b''
@@ -263,7 +274,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args.pub = _PUB if args.pub is None else " ".join(args.pub).encode("utf-8")
 
-    gms = MQTTServer(globals=globals(),server_public_key_bytes=args.pub,)# 为什么放到 ghs后面定义 dir找不到变量？
+    gms = MQTTServer(
+        globals=globals(),
+        server_public_key_bytes=args.pub,
+        request_topic=args.request_topic,
+    )# 为什么放到 ghs后面定义 dir找不到变量？
     gms.mqtt_net.is_windows_cmd=(sys.platform=="win32")
     import server_http
     ghs = server_http.start_rpc_server(

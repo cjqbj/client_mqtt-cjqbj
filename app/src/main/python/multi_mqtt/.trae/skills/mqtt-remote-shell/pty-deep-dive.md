@@ -1,15 +1,15 @@
-# pty_client_mqtt.py 深入解析 —— PTY over 公共 MQTT 的完整手册
+# client/pty_client_mqtt.py 深入解析 —— PTY over 公共 MQTT 的完整手册
 
-> 本文只围绕 **pty_client_mqtt.py** 一个文件展开，但为了讲清它做了什么，
-> 必须连带说明它调用的两个邻居：`remote_cmd.RemotePty`（协议核心）和
-> `cmd_client_mqtt.MqttTransport` / `multi_mqtt.MultiMQTTManager`（网络层）。
+> 本文只围绕 **client/pty_client_mqtt.py** 一个文件展开，但为了讲清它做了什么，
+> 必须连带说明它调用的两个邻居：`client.remote_cmd.RemotePty`（协议核心）和
+> `client.cmd_client_mqtt.MqttTransport` / `multi_mqtt.MultiMQTTManager`（网络层）。
 > 阅读对象：想理解、维护或二次开发这条链路的人（或 AI）。
 
 ---
 
 ## 1. 这个文件是什么
 
-`pty_client_mqtt.py` 是一个**交互式远程终端客户端**，体验和 `ssh user@host` 几乎一样：
+`client/pty_client_mqtt.py` 是一个**交互式远程终端客户端**，体验和 `ssh user@host` 几乎一样：
 
 - 本地终端进入 raw 模式，每个按键实时发到远端；
 - 远端常驻一个真实 shell（bash/sh，跑在 `forkpty` 出来的伪终端里）；
@@ -19,7 +19,7 @@
 关键架构决策：**服务端零改动**。远端只需要跑着通用的 `server_mqtt.py`
 （一个"执行客户端下发的 Python 代码并回包"的 RPC 服务）。PTY 所需的全部服务端逻辑
 （openpty、fork shell、读写线程、心跳）是一段自包含 Python 模板
-（`remote_cmd._PTY_START_TEMPLATE`），在握手时由本客户端作为一次普通 RPC 下发执行。
+（`client.remote_cmd._PTY_START_TEMPLATE`），在握手时由本客户端作为一次普通 RPC 下发执行。
 
 文件自身只有约 370 行，做四件事：
 
@@ -68,7 +68,7 @@
 
 ### 2.3 阶段二：PTY 握手（`run_session` → `RemotePty.open`）
 
-这是整个协议最精巧的一步（`remote_cmd.py` L1664-1745）：
+这是整个协议最精巧的一步（`client/remote_cmd.py` L1664-1745）：
 
 ```
 client                                     server
@@ -100,7 +100,7 @@ client                                     server
   │ ═══════ 之后数据面走 in/out 两个专属 topic ═══════ │
 ```
 
-模板在服务端做的关键动作（`_PTY_START_TEMPLATE`，remote_cmd.py L669-949）：
+模板在服务端做的关键动作（`_PTY_START_TEMPLATE`，client/remote_cmd.py L669-949）：
 
 - **仅限 POSIX**（`os.name != "posix"` 直接报错）；
 - `pty.openpty()` 拿到 master/slave fd，`TIOCSWINSZ` 设置初始窗口；
@@ -158,7 +158,7 @@ shell 输出 → master fd → _out_loop 线程 (poll)
 公共 broker 模型下有个致命盲区：**服务端进程被杀时，broker 还活着**，
 `end` 帧永远发不出来，客户端会无限干等（按键全进黑洞）。
 
-解决方案（pty_client_mqtt.py L195-204 + 模板 L920-932）：
+解决方案（client/pty_client_mqtt.py L195-204 + 模板 L920-932）：
 
 - 服务端 `_hb_loop` 按 `--heartbeat`（默认 5s）周期发心跳帧；
 - 客户端 `signal_state["last"]` 记录**最近一次收到任何远端帧**（输出或心跳）的时间；
@@ -221,7 +221,7 @@ shell 输出 → master fd → _out_loop 线程 (poll)
 | 层 | 保护对象 | 机制 | 位置 |
 |---|---|---|---|
 | ① 网络层 | 带 `req_id` 的 RPC 帧（含 PTY 握手） | `TTLCache`（30s TTL，5 万条 FIFO 上限）按 req_id 首帧放行 | `multi_mqtt._on_message` |
-| ② PTY 下行 | 输出/心跳帧 | 客户端 `RemotePty.handler` 里 `deque(maxlen=256)` 按 `seq` 去重 | remote_cmd.py L1697-1701 |
+| ② PTY 下行 | 输出/心跳帧 | 客户端 `RemotePty.handler` 里 `deque(maxlen=256)` 按 `seq` 去重 | client/remote_cmd.py L1697-1701 |
 | ③ PTY 上行 | 按键/控制帧 | 服务端 `_in_loop` 里 `deque(maxlen=256)` 按 `iseq` 去重 | 模板 L794-807 |
 
 **③ 是后补的关键修复**：PTY 帧没有 `req_id`，天然绕过 ①；最初上行没有序号，
@@ -253,7 +253,7 @@ shell 输出 → master fd → _out_loop 线程 (poll)
 
 服务端若没配公钥，会把带 `|` 的签名 req_id 原样回显。客户端 `_on_message`
 据此识别"服务端根本没验签"：默认 `allow_no_pub=True` 放行（兼容模式），
-关掉则丢弃这类响应并打安全拦截日志（client_mqtt.py L59-75）。
+关掉则丢弃这类响应并打安全拦截日志（client/client_mqtt.py L59-75）。
 
 **③ 资源与滥用防护**
 
@@ -307,7 +307,7 @@ PTY 专属 topic 的帧在 `_router` 层就被截走，永远不会进入 `handl
 ## 7. CLI 参数速查
 
 ```
-python pty_client_mqtt.py [选项]
+python client/pty_client_mqtt.py [选项]
 
 连接（与 cmd_client_mqtt 一致）：
   -t/--request-topic   请求 topic（默认 sys/device/request）
@@ -337,8 +337,8 @@ PTY：
 
 | 现象 | 最可能原因 | 处理 |
 |---|---|---|
-| 启动报 "PTY 需要一个交互式本地终端" | stdin 被管道/重定向（含 AI agent、CI） | 换用 `cmd_client_mqtt.py` 的一次性命令 |
-| 按一个键执行了十几次 | 旧版本无 iseq 去重 | 升级 remote_cmd.py 后**重连客户端**即生效（模板握手时下发，服务端不用动） |
+| 启动报 "PTY 需要一个交互式本地终端" | stdin 被管道/重定向（含 AI agent、CI） | 换用 `client/cmd_client_mqtt.py` 的一次性命令 |
+| 按一个键执行了十几次 | 旧版本无 iseq 去重 | 升级 client/remote_cmd.py 后**重连客户端**即生效（模板握手时下发，服务端不用动） |
 | 连上后无任何输出也不退 | 心跳关了且 shell 静默 | 保持 `--heartbeat>0` |
 | 服务器重启后客户端干等 | 旧版无心跳检测 | 新版 15s 内自动退出（码 3） |
 | 握手报 "missing code/payload" 满屏 | 旧模板没装路由，按键帧进了 RPC 处理器 | 新版模板 `_router` 已解决 |

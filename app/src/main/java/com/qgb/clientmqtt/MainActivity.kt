@@ -1499,6 +1499,58 @@ private fun SettingsPage(
             }) {
                 Text(if (downloading) "Downloading scripts..." else "Download missing feature scripts")
             }
+            Text("Download or refresh one feature script", style = MaterialTheme.typography.labelLarge)
+            builtinFeatureFiles.forEach { filename ->
+                val installed = File(featureDirectory, filename).isFile
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(filename)
+                        Text(
+                            if (installed) "Present in py_updates" else "Not downloaded",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Button(
+                        enabled = !downloading,
+                        onClick = {
+                            downloading = true
+                            downloadStatus = "Downloading $filename..."
+                            downloadLogs = emptyList()
+                            scope.launch {
+                                try {
+                                    val response = withContext(Dispatchers.IO) {
+                                        service.callAttr(
+                                            "install_builtin_feature",
+                                            scriptRoot,
+                                            filename,
+                                            4,
+                                            15
+                                        ).toString()
+                                    }
+                                    val result = JSONObject(response)
+                                    downloadStatus = if (result.optBoolean("ok")) {
+                                        "$filename downloaded. Restart or reload the feature to use it."
+                                    } else {
+                                        "$filename download failed. Check the download log and retry."
+                                    }
+                                } catch (error: Exception) {
+                                    downloadStatus = "$filename download failed: ${error.message}"
+                                } finally {
+                                    runCatching { refreshDownloadLogs() }
+                                    downloading = false
+                                    scriptRevision++
+                                }
+                            }
+                        }
+                    ) {
+                        Text(if (installed) "Download again" else "Download")
+                    }
+                }
+            }
             if (downloadStatus.isNotBlank()) Text(downloadStatus, style = MaterialTheme.typography.bodySmall)
             Text("Download log", style = MaterialTheme.typography.labelLarge)
             Column(

@@ -51,6 +51,7 @@ A feature must not import Compose or Android Activity classes. It owns its domai
 - `client_service.device_catalog()`, `device_settings(topic)`, `select_device(topic)`, and `update_device_settings(topic, values)` manage per-topic target configuration.
 - `client_service.aliyun_settings()` and `update_aliyun_settings(values)` read and write the single shared Aliyun configuration.
 - `client_service.install_builtin_features(script_root, retries, timeout)` installs the built-in feature scripts (filenames from `bootstrap.BUILTIN_FEATURES`) into the selected root's `py_updates/` directory.
+- `client_service.install_builtin_feature(script_root, filename, retries, timeout)` downloads or refreshes one selected built-in feature script; the Settings page exposes this per-file alongside the download-missing action.
 - `client_service.builtin_feature_files()` returns the built-in `feature_*.py` filenames; the settings page derives its missing-files list from it instead of hardcoding names.
 - `client_service.reload_feature(name)` force-reloads one cached feature module (long-press menu); returns the refreshed descriptor or structured JSON error.
 - `client_service.operation_logs()` returns the rolling downloader log for UI display.
@@ -65,6 +66,7 @@ A feature must not import Compose or Android Activity classes. It owns its domai
 - `feature_files.upload(path)` generates and sends target-side Aliyun upload code.
 - `feature_wifi.info()` builds the Wi-Fi query code in `feature_wifi.py` and sends it through the generic RPC bridge.
 - `feature_camera.capture(facing)` builds capture code in `feature_camera.py`; Compose downloads and displays the returned photo URL.
+- `feature_audio.play(path)` builds playback code in `feature_audio.py` and starts target-side playback through `MediaPlayer`.
 - `client_service.download_transfer(url, config, save_to)` downloads outside MQTT.
 - `client_service.update_settings(...)` persists app-level configuration beside the active script root; use `update_device_settings(...)` for target-specific values.
 

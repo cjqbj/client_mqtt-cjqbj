@@ -22,7 +22,10 @@ class BootstrapTests(unittest.TestCase):
             try:
                 bootstrap.__file__ = str(Path(directory) / "bootstrap.py")
                 bootstrap.init_env(str(Path(directory) / "updates"))
-                self.assertEqual(set(bootstrap.list_features()), {"files", "camera", "wifi"})
+                self.assertEqual(
+                    set(bootstrap.list_features()),
+                    {"files", "camera", "wifi", "audio"},
+                )
             finally:
                 bootstrap.__file__ = previous_file
                 bootstrap._UPDATE_DIR = previous_update_dir
