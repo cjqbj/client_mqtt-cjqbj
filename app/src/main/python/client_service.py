@@ -72,38 +72,40 @@ def call_feature(feature, action="run", *args):
 
 
 def _mqtt_client_module():
-    module_dir = os.path.join(os.path.dirname(__file__), "multi_mqtt")
+    module_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "multi_mqtt")
+    client_dir = os.path.join(module_dir, "client")
     package_source = os.path.join(module_dir, "multi_mqtt.py")
-    client_sources = (
-        os.path.join(module_dir, "client_mqtt.py"),
-        os.path.join(module_dir, "client", "client_mqtt.py"),
-    )
-    client_source = next((path for path in client_sources if os.path.isfile(path)), None)
-    if client_source is None:
-        raise ImportError(f"Unable to find client_mqtt.py in {module_dir}")
-    if module_dir not in sys.path:
-        sys.path.insert(0, module_dir)
+    # 同时支持两种打包布局：
+    #   旧（扁平）: <module_dir>/client_mqtt.py
+    #   新（子包）: <module_dir>/client/client_mqtt.py
+    # 关键：不能用 os.path.isfile 探测源码路径。Chaquopy 打包/运行时，Python
+    # 模块只以 .pyc 形式存放在 APK 内的 app.imy 中、由 AssetFinder 的导入钩子
+    # 按需加载，files/chaquopy/AssetFinder 物理目录里只有 .md/.txt 等数据文件，
+    # 既无 .py 也无已解压的 .pyc，isfile 恒为 False，会在 Application.onCreate
+    # 阶段直接 ImportError 闪退。这里统一把目录挂上 sys.path 后交给 import 系统：
+    # 桌面运行命中真实 .py，APK 内命中 AssetFinder 加载的 .pyc。client/ 置前以
+    # 优先匹配新子包布局，不存在时自然回退到扁平布局。
+    for path in (client_dir, module_dir):
+        if path not in sys.path:
+            sys.path.insert(0, path)
     mqtt_module = sys.modules.get("multi_mqtt")
     mqtt_file = os.path.abspath(str(getattr(mqtt_module, "__file__", "")))
     if mqtt_file != os.path.abspath(package_source) or not hasattr(mqtt_module, "MultiMQTTManager"):
         for name in tuple(sys.modules):
             if name == "multi_mqtt" or name.startswith("multi_mqtt."):
                 sys.modules.pop(name, None)
-        spec = importlib.util.spec_from_file_location("multi_mqtt", package_source)
-        if spec is None or spec.loader is None:
+        importlib.invalidate_caches()
+        mqtt_module = importlib.import_module("multi_mqtt")
+        if not hasattr(mqtt_module, "MultiMQTTManager"):
             raise ImportError(f"Unable to load MQTT module from {package_source}")
-        mqtt_module = importlib.util.module_from_spec(spec)
-        sys.modules["multi_mqtt"] = mqtt_module
-        spec.loader.exec_module(mqtt_module)
 
     client_module = sys.modules.get("client_mqtt")
-    client_file = os.path.abspath(str(getattr(client_module, "__file__", "")))
-    if client_file != os.path.abspath(client_source) or not callable(getattr(client_module, "rpc", None)):
+    if client_module is None or not callable(getattr(client_module, "rpc", None)):
         sys.modules.pop("client_mqtt", None)
-        client_source_dir = os.path.dirname(client_source)
-        if client_source_dir not in sys.path:
-            sys.path.insert(0, client_source_dir)
-        return importlib.import_module("client_mqtt")
+        importlib.invalidate_caches()
+        client_module = importlib.import_module("client_mqtt")
+        if not callable(getattr(client_module, "rpc", None)):
+            raise ImportError(f"Unable to find client_mqtt.rpc in {module_dir}")
     return client_module
 
 
