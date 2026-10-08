@@ -45,8 +45,8 @@ _BUILTIN_FEATURE_SOURCES = {
         "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/main/app/src/main/python/feature_wifi.py",
     ),
     "feature_audio.py": (
-        "https://github.com/cjqbj/build_xime_home/raw/refs/heads/main/client/app/src/main/python/feature_audio.py",
-        "https://raw.githubusercontent.com/cjqbj/build_xime_home/main/client/app/src/main/python/feature_audio.py",
+        "https://github.com/cjqbj/client_mqtt-cjqbj/raw/refs/heads/main/app/src/main/python/feature_audio.py",
+        "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/main/app/src/main/python/feature_audio.py",
     ),
 }
 

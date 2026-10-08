@@ -108,7 +108,10 @@ else:
 order = ["ok", "path", "file_exists", "file_size", "stream",
          "vol_before", "vol_after", "vol_max", "duration_ms", "playing",
          "stopped_previous", "steps", "errors"]
-r = {{key: r[key] for key in order if key in r}}
+# 关键：r 必须是 JSON 字符串，不能直接放 dict。RPC 执行器对非字符串结果会走
+# pformat/repr（单引号 Python 字面量），客户端 json.loads 会报
+# "Expecting property name enclosed in double quotes"。与 feature_camera 一致。
+r = json.dumps({{key: r[key] for key in order if key in r}}, ensure_ascii=False)
 '''
 
 
