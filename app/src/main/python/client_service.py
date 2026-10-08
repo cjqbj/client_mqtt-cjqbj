@@ -48,6 +48,14 @@ _BUILTIN_FEATURE_SOURCES = {
         "https://github.com/cjqbj/client_mqtt-cjqbj/raw/refs/heads/main/app/src/main/python/feature_audio.py",
         "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/main/app/src/main/python/feature_audio.py",
     ),
+    "feature_probe.py": (
+        "https://github.com/cjqbj/client_mqtt-cjqbj/raw/refs/heads/main/app/src/main/python/feature_probe.py",
+        "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/main/app/src/main/python/feature_probe.py",
+    ),
+    "feature_pyui.py": (
+        "https://github.com/cjqbj/client_mqtt-cjqbj/raw/refs/heads/main/app/src/main/python/feature_pyui.py",
+        "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/main/app/src/main/python/feature_pyui.py",
+    ),
 }
 
 
@@ -69,6 +77,41 @@ def call_feature(feature, action="run", *args):
         return json.dumps(result, ensure_ascii=False)
     except (TypeError, ValueError):
         return json.dumps({"ok": True, "result": str(result)}, ensure_ascii=False)
+
+
+def build_feature_view(feature, context):
+    """宿主桥：让 feature 脚本自己用 Chaquopy 构建原生 View。
+
+    Kotlin 通用宿主（PythonViewPage）拿到 Context 后调用本函数：加载
+    feature_<name> 模块并执行其 build_view(context)，返回 View 树。
+    任何失败都降级成一个显示错误文本的 TextView，保证 UI 永不白屏/闪退。
+    必须在 Android 主线程调用（View 构造约束）。
+    """
+    import logging
+    import traceback
+    import bootstrap
+    try:
+        module = bootstrap.load_feature(feature)
+        builder = getattr(module, "build_view", None)
+        if not callable(builder):
+            raise AttributeError(
+                f"feature {feature!r} has no callable build_view(context)"
+            )
+        view = builder(context)
+        if view is None:
+            raise RuntimeError("build_view(context) returned None")
+        return view
+    except Exception:
+        logging.getLogger("error").exception(
+            "build_feature_view failed feature=%s", feature
+        )
+        from android.widget import TextView
+        error_view = TextView(context)
+        error_view.setText(
+            "Python UI failed for feature_%s.py:\n\n%s"
+            % (feature, traceback.format_exc()[-1500:])
+        )
+        return error_view
 
 
 def _mqtt_client_module():

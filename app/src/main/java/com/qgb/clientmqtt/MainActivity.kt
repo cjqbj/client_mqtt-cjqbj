@@ -83,6 +83,8 @@ import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -94,6 +96,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -113,13 +116,31 @@ private data class RemoteFile(
     val modified: Double
 )
 
+/**
+ * 相机页按设备托管的界面状态。
+ *
+ * 提到页面外（ClientMqttScreen 持有、按设备 id 索引）后：
+ * - 切换 feature tab、打开设置/日志页（页面仍在组合中）状态不丢；
+ * - 切换到其他 topic 再切回来（deviceId 变走又变回），照片/输出仍在；
+ * - 状态字段都是 snapshot state，相机页直接读写即可触发重组。
+ */
+private class CameraPageState {
+    var facing: Int? by mutableStateOf(null)
+    var facingLoaded by mutableStateOf(false)
+    var status: String by mutableStateOf("Ready")
+    var preview: ImageBitmap? by mutableStateOf(null)
+}
+
 private data class FeatureDescriptor(
     val name: String,
     val title: String,
     val actions: List<String>,
     val icon: String? = null,
     val moduleFile: String = "",
-    val source: String = ""
+    val source: String = "",
+    // ui=python 时界面由 feature 脚本经 Chaquopy 自绘（PythonViewPage 宿主），
+    // 其余走 Compose 通用动作页。
+    val ui: String = "compose"
 )
 
 private fun featureIcon(feature: FeatureDescriptor) = when (feature.icon?.lowercase()) {
@@ -192,6 +213,8 @@ private fun ClientMqttScreen() {
     val snackbarHostState = remember { SnackbarHostState() }
     val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
+    // 相机页状态按设备 id 托管在屏幕级：切 tab / 覆盖页 / 切 topic 都不丢。
+    val cameraStates = remember { mutableStateMapOf<String, CameraPageState>() }
 
     fun parseTargets(raw: String) = buildList {
         val array = org.json.JSONArray(raw)
@@ -228,6 +251,7 @@ private fun ClientMqttScreen() {
                     icon = if (item.isNull("icon")) null else item.optString("icon").ifBlank { null },
                     moduleFile = item.optString("module_file"),
                     source = item.optString("source"),
+                    ui = item.optString("ui", "compose").ifBlank { "compose" },
                 ))
             }
         }
@@ -558,46 +582,65 @@ private fun ClientMqttScreen() {
                 }
             }
         ) { padding ->
-            if (diagnostics) {
-                DiagnosticsPage(
-                    modifier = Modifier.padding(padding),
-                    selectedTopic = selectedTopic,
-                    onlineStatus = onlineStatus,
-                    onBack = { diagnostics = false }
-                )
-            } else if (permissions) {
-                PermissionPage(onBack = { permissions = false })
-            } else if (targetSettings) {
-                TargetSettingsPage(
-                    modifier = Modifier.padding(padding),
-                    existingDeviceId = editingDeviceId,
-                    onBack = { targetSettings = false },
-                    onTargetCreated = { id ->
-                        selectedDeviceId = id
-                    }
-                )
-            } else if (settings) {
-                SettingsPage(
-                    modifier = Modifier.padding(padding),
-                    onBack = { settings = false },
-                    onPermissions = { permissions = true }
-                )
-            } else {
+            // feature pager 常驻组合：RPC 日志/权限/目标设置/应用设置都只是盖在
+            // 上面的全屏覆盖页。切到它们时 pager 不离开组合，页面协程不会取消，
+            // 进行中的网络请求继续跑，照片/输出等状态也都保留，返回时原样还在。
+            Box(Modifier.fillMaxSize()) {
                 Column(modifier = Modifier.fillMaxSize().padding(padding)) {
                     if (features.isEmpty()) {
                         Text("No feature scripts found", modifier = Modifier.padding(16.dp))
                     } else {
+                        // 所有页常驻组合（不只是相邻页）：横向切 feature 时不丢任何
+                        // 页面状态；page 内容按 feature 名 key 住，目录刷新后身份不变。
                         HorizontalPager(
                             state = pagerState,
-                            modifier = Modifier.fillMaxSize().weight(1f)
+                            modifier = Modifier.fillMaxSize().weight(1f),
+                            beyondViewportPageCount = features.size
                         ) { page ->
-                            when (features[page].name) {
-                                "files" -> FilesPage(targetRemoteRoot, service)
-                                "camera" -> CameraPage(service, selectedDeviceId)
-                                "wifi" -> WifiPage(service)
-                                else -> DynamicFeaturePage(features[page], service)
+                            key(features[page].name) {
+                                when (features[page].name) {
+                                    "files" -> FilesPage(targetRemoteRoot, service)
+                                    "camera" -> CameraPage(service, selectedDeviceId, cameraStates)
+                                    "wifi" -> WifiPage(service)
+                                    else -> if (features[page].ui == "python") {
+                                        PythonViewPage(features[page], service)
+                                    } else {
+                                        DynamicFeaturePage(features[page], service)
+                                    }
+                                }
                             }
                         }
+                    }
+                }
+                // 覆盖页：不透明背景全盖住底层 pager，但不销毁它。
+                when {
+                    diagnostics -> Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+                        DiagnosticsPage(
+                            modifier = Modifier.padding(padding),
+                            selectedTopic = selectedTopic,
+                            onlineStatus = onlineStatus,
+                            onBack = { diagnostics = false }
+                        )
+                    }
+                    permissions -> Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+                        PermissionPage(onBack = { permissions = false })
+                    }
+                    targetSettings -> Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+                        TargetSettingsPage(
+                            modifier = Modifier.padding(padding),
+                            existingDeviceId = editingDeviceId,
+                            onBack = { targetSettings = false },
+                            onTargetCreated = { id ->
+                                selectedDeviceId = id
+                            }
+                        )
+                    }
+                    settings -> Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+                        SettingsPage(
+                            modifier = Modifier.padding(padding),
+                            onBack = { settings = false },
+                            onPermissions = { permissions = true }
+                        )
                     }
                 }
             }
@@ -717,38 +760,13 @@ private fun FilesPage(initialRoot: String, service: PyObject) {
         modifier = Modifier.fillMaxSize().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            Button(enabled = root != rootBoundary, onClick = {
-                val parent = root.trimEnd('/').substringBeforeLast('/', rootBoundary).ifEmpty { "/" }
-                val parentRoot = if (parent.length < rootBoundary.length || !parent.startsWith(rootBoundary)) {
-                    rootBoundary
-                } else {
-                    parent
-                }
-                root = parentRoot
-                entries = emptyList()
-                nextOffset = 0
-                hasMore = false
-                scope.launch { listState.scrollToItem(0) }
-                loadPage(0, parentRoot)
-            }) { Text("Up") }
-            Text(root, modifier = Modifier.weight(1f).align(androidx.compose.ui.Alignment.CenterVertically), maxLines = 2)
-            Button(onClick = {
-                entries = emptyList()
-                nextOffset = 0
-                hasMore = false
-                loadPage(0, root)
-            }) { Text("Refresh") }
-        }
-        OutlinedTextField(
-            limit,
-            { limit = it.filter(Char::isDigit) },
-            Modifier.fillMaxWidth(),
-            singleLine = true,
-            label = { Text("Page size") }
-        )
+        // 文件列表在上占满剩余空间；页码输入与 Up/Refresh 固定屏幕下部。
         Text(status, style = MaterialTheme.typography.labelMedium)
-        LazyColumn(state = listState, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
             items(entries) { entry ->
                 Row(
                     Modifier.fillMaxWidth().clickable {
@@ -806,31 +824,69 @@ private fun FilesPage(initialRoot: String, service: PyObject) {
             if (loading) item { Text("Loading...") }
         }
         preview?.let { bitmap ->
-            Image(bitmap = bitmap, contentDescription = "Remote image", modifier = Modifier.fillMaxWidth())
+            Image(
+                bitmap = bitmap,
+                contentDescription = "Remote image",
+                modifier = Modifier.fillMaxWidth().heightIn(max = 200.dp)
+            )
+        }
+        OutlinedTextField(
+            limit,
+            { limit = it.filter(Char::isDigit) },
+            Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Page size") }
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Button(enabled = root != rootBoundary, onClick = {
+                val parent = root.trimEnd('/').substringBeforeLast('/', rootBoundary).ifEmpty { "/" }
+                val parentRoot = if (parent.length < rootBoundary.length || !parent.startsWith(rootBoundary)) {
+                    rootBoundary
+                } else {
+                    parent
+                }
+                root = parentRoot
+                entries = emptyList()
+                nextOffset = 0
+                hasMore = false
+                scope.launch { listState.scrollToItem(0) }
+                loadPage(0, parentRoot)
+            }) { Text("Up") }
+            Text(root, modifier = Modifier.weight(1f).align(androidx.compose.ui.Alignment.CenterVertically), maxLines = 2)
+            Button(onClick = {
+                entries = emptyList()
+                nextOffset = 0
+                hasMore = false
+                loadPage(0, root)
+            }) { Text("Refresh") }
         }
     }
 }
 
 @Composable
-private fun CameraPage(service: PyObject, deviceId: String) {
-    // 前后摄选择按 设备+feature 持久化（client_service.feature_settings），
-    // null 表示尚未从持久化加载完成。
-    var facing by remember(deviceId) { mutableStateOf<Int?>(null) }
-    var status by remember { mutableStateOf("Ready") }
-    var preview by remember { mutableStateOf<ImageBitmap?>(null) }
+private fun CameraPage(
+    service: PyObject,
+    deviceId: String,
+    // 屏幕级、按设备 id 托管：切 tab / 覆盖页 / 切 topic 再回来照片和状态都还在。
+    states: MutableMap<String, CameraPageState>,
+) {
+    val state = states.getOrPut(deviceId) { CameraPageState() }
     val scope = rememberCoroutineScope()
 
+    // 每个设备只从持久化加载一次前后摄选择（facingLoaded 闸门，避免反复覆盖）。
     LaunchedEffect(deviceId) {
-        facing = withContext(Dispatchers.IO) {
+        if (state.facingLoaded) return@LaunchedEffect
+        state.facing = withContext(Dispatchers.IO) {
             runCatching {
                 JSONObject(service.callAttr("feature_settings", "camera", deviceId).toString())
                     .optInt("lens_facing", 0)
             }.getOrDefault(0)
         }
+        state.facingLoaded = true
     }
 
     fun selectFacing(value: Int) {
-        facing = value
+        state.facing = value
         scope.launch(Dispatchers.IO) {
             runCatching {
                 service.callAttr(
@@ -844,32 +900,49 @@ private fun CameraPage(service: PyObject, deviceId: String) {
     }
 
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        // 结果区在上占满；预览图限高；底部固定芯片+快门，不被列表顶出屏幕。
+        if (state.status.trimStart().startsWith("{")) {
+            FeatureOutput(state.status, modifier = Modifier.fillMaxWidth().weight(1f))
+        } else {
+            Box(Modifier.fillMaxWidth().weight(1f)) {
+                Text(state.status)
+            }
+        }
+        state.preview?.let { bitmap ->
+            Image(
+                bitmap = bitmap,
+                contentDescription = "Captured photo",
+                modifier = Modifier.fillMaxWidth().heightIn(max = 240.dp)
+            )
+        }
+        Text("JPEG stays in memory on the target and is transferred outside MQTT.", style = MaterialTheme.typography.bodySmall)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             FilterChip(
-                selected = facing == 0,
+                selected = state.facing == 0,
                 onClick = { selectFacing(0) },
                 label = { Text("Back camera") },
-                enabled = facing != null,
+                enabled = state.facing != null,
             )
             FilterChip(
-                selected = facing == 1,
+                selected = state.facing == 1,
                 onClick = { selectFacing(1) },
                 label = { Text("Front camera") },
-                enabled = facing != null,
+                enabled = state.facing != null,
             )
             Button(
-                enabled = facing != null,
+                enabled = state.facing != null,
+                modifier = Modifier.weight(1f),
                 onClick = {
-                status = "Capturing..."
-                preview = null
+                state.status = "Capturing..."
+                state.preview = null
                 scope.launch {
                     try {
                         val raw = withContext(Dispatchers.IO) {
-                            service.callAttr("call_feature", "camera", "capture", facing ?: 0).toString()
+                            service.callAttr("call_feature", "camera", "capture", state.facing ?: 0).toString()
                         }
                         val result = JSONObject(raw)
                         if (!result.optBoolean("ok")) {
-                            status = raw
+                            state.status = raw
                             return@launch
                         }
                         val url = result.optString("url")
@@ -878,25 +951,39 @@ private fun CameraPage(service: PyObject, deviceId: String) {
                                 service.callAttr("download_transfer_base64", url).toString()
                             }
                             val bytes = Base64.decode(encoded, Base64.DEFAULT)
-                            preview = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                            state.preview = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
                         }
-                        status = raw
+                        state.status = raw
                     } catch (error: Exception) {
-                        status = "Capture failed: ${error.message}"
+                        state.status = "Capture failed: ${error.message}"
                     }
                 }
             }) { Text("Capture") }
         }
-        preview?.let { bitmap ->
-            Image(bitmap = bitmap, contentDescription = "Captured photo", modifier = Modifier.fillMaxWidth())
-        }
-        if (status.trimStart().startsWith("{")) {
-            FeatureOutput(status, modifier = Modifier.fillMaxWidth().weight(1f))
-        } else {
-            Text(status)
-        }
-        Text("JPEG stays in memory on the target and is transferred outside MQTT.", style = MaterialTheme.typography.bodySmall)
     }
+}
+
+/**
+ * Python 自绘 feature 的通用宿主：feature 脚本提供 build_view(context) 返回
+ * android.view.View，APK 只负责把它挂进 Compose。新增自绘 feature 无需改 APK，
+ * 脚本经 py_updates / 内置目录热更即可（配合目录页长按 Reload 重载）。
+ */
+@Composable
+private fun PythonViewPage(feature: FeatureDescriptor, service: PyObject) {
+    AndroidView(
+        modifier = Modifier.fillMaxSize(),
+        factory = { context ->
+            runCatching {
+                service.callAttr("build_feature_view", feature.name, context)
+                    .toJava(android.view.View::class.java)
+            }.getOrElse { error ->
+                android.widget.TextView(context).apply {
+                    text = "Python UI failed to build:\n${error.javaClass.simpleName}: ${error.message}"
+                    setPadding(48, 48, 48, 48)
+                }
+            }
+        }
+    )
 }
 
 @Composable
@@ -907,7 +994,19 @@ private fun WifiPage(service: PyObject) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as AndroidClipboardManager
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        // 结果区在上占满；Refresh/Copy 固定屏幕下部。
+        if (status.trimStart().startsWith("{")) {
+            FeatureOutput(status, modifier = Modifier.fillMaxWidth().weight(1f))
+        } else {
+            Box(Modifier.fillMaxWidth().weight(1f)) {
+                SelectionContainer { Text(status, style = MaterialTheme.typography.bodyMedium) }
+            }
+        }
+        if (copyStatus.isNotBlank()) Text(copyStatus, style = MaterialTheme.typography.labelSmall)
+        Row(
+            horizontalArrangement = Arrangement.SpaceBetween,
+            modifier = Modifier.fillMaxWidth()
+        ) {
             Button(onClick = {
                 status = "Querying..."
                 scope.launch {
@@ -927,12 +1026,6 @@ private fun WifiPage(service: PyObject) {
                 copyStatus = "Copied"
             }) { Text("Copy") }
         }
-        if (status.trimStart().startsWith("{")) {
-            FeatureOutput(status, modifier = Modifier.fillMaxWidth().weight(1f))
-        } else {
-            SelectionContainer { Text(status, style = MaterialTheme.typography.bodyMedium) }
-        }
-        if (copyStatus.isNotBlank()) Text(copyStatus, style = MaterialTheme.typography.labelSmall)
     }
 }
 
@@ -1062,7 +1155,12 @@ private fun DynamicFeaturePage(feature: FeatureDescriptor, service: PyObject) {
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(feature.title, style = MaterialTheme.typography.headlineSmall)
         Text("feature_${feature.name}.py · actions=${feature.actions.joinToString()}", style = MaterialTheme.typography.bodySmall)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        // 结果区在上占满；动作按钮固定屏幕下部。
+        FeatureOutput(result, modifier = Modifier.fillMaxWidth().weight(1f))
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
             feature.actions.forEach { action ->
                 Button(onClick = {
                     result = "Running $action..."
@@ -1075,7 +1173,6 @@ private fun DynamicFeaturePage(feature: FeatureDescriptor, service: PyObject) {
                 }) { Text(action) }
             }
         }
-        FeatureOutput(result, modifier = Modifier.fillMaxWidth().weight(1f))
     }
 }
 
@@ -1552,20 +1649,23 @@ private fun SettingsPage(
                 }
             }
             if (downloadStatus.isNotBlank()) Text(downloadStatus, style = MaterialTheme.typography.bodySmall)
-            Text("Download log", style = MaterialTheme.typography.labelLarge)
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 48.dp, max = 180.dp)
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                    .verticalScroll(rememberScrollState())
-                    .padding(8.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                if (downloadLogs.isEmpty()) {
-                    Text("No download activity", style = MaterialTheme.typography.bodySmall)
-                } else {
-                    downloadLogs.forEach { line -> Text(line, style = MaterialTheme.typography.bodySmall) }
+            Text("Download log (long-press text to select/copy)", style = MaterialTheme.typography.labelLarge)
+            // 下载日志可能含排查 URL/错误，长按可选择复制。
+            SelectionContainer {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp, max = 180.dp)
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .verticalScroll(rememberScrollState())
+                        .padding(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    if (downloadLogs.isEmpty()) {
+                        Text("No download activity", style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        downloadLogs.forEach { line -> Text(line, style = MaterialTheme.typography.bodySmall) }
+                    }
                 }
             }
         }

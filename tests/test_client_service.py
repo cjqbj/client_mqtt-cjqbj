@@ -747,28 +747,28 @@ class ClientServiceTests(unittest.TestCase):
                 with mock.patch.object(bootstrap, "install_feature", side_effect=install) as download:
                     result = json.loads(client_service.install_builtin_features(script_root))
                     self.assertTrue(result["ok"])
-                    self.assertEqual(len(result["results"]), 4)
+                    self.assertEqual(len(result["results"]), 6)
                     self.assertTrue(all(item["ok"] for item in result["results"]))
                     self.assertTrue(any("installed for test" in item for item in result["logs"]))
-                    self.assertEqual(download.call_count, 4)
+                    self.assertEqual(download.call_count, 6)
 
                     second = json.loads(client_service.install_builtin_features(script_root))
                     self.assertTrue(all(item.get("skipped") for item in second["results"]))
-                    self.assertEqual(download.call_count, 4)
+                    self.assertEqual(download.call_count, 6)
 
                     single = json.loads(
                         client_service.install_builtin_feature(script_root, "feature_audio.py")
                     )
                     self.assertTrue(single["ok"])
                     self.assertEqual(single["result"]["filename"], "feature_audio.py")
-                    self.assertEqual(download.call_count, 5)
+                    self.assertEqual(download.call_count, 7)
 
                     invalid = json.loads(
                         client_service.install_builtin_feature(script_root, "feature_unknown.py")
                     )
                     self.assertFalse(invalid["ok"])
                     self.assertIn("unknown built-in feature file", invalid["result"]["error"])
-                    self.assertEqual(download.call_count, 5)
+                    self.assertEqual(download.call_count, 7)
             finally:
                 client_service._STATE.clear()
                 client_service._STATE.update(previous_state)

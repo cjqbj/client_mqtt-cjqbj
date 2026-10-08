@@ -11,7 +11,7 @@ from urllib.error import URLError
 import urllib.request
 
 _UPDATE_DIR = None
-BUILTIN_FEATURES = ("files", "camera", "wifi", "audio")
+BUILTIN_FEATURES = ("files", "camera", "wifi", "audio", "probe", "pyui")
 MAX_FEATURE_SIZE = 2 * 1024 * 1024
 _FEATURE_LOCK = threading.RLock()
 _RPC_SERVER_STARTED = False
@@ -160,6 +160,9 @@ def describe_features():
                 "title": str(manifest.get("title") or name),
                 "version": manifest.get("version", 1),
                 "actions": list(manifest.get("actions") or ["run"]),
+                # ui=python 表示界面由 feature 脚本用 Chaquopy 自绘，
+                # APK 端走通用宿主，其余走 Compose 通用动作页。
+                "ui": str(manifest.get("ui") or "compose"),
                 "icon": str(icon) if icon else None,
                 "module_file": str(getattr(module, "__file__", "") or ""),
                 "source": "py_updates" if _is_runtime_module(module) else "builtin",
@@ -170,6 +173,7 @@ def describe_features():
                 "title": name,
                 "version": 0,
                 "actions": [],
+                "ui": "compose",
                 "icon": None,
                 "module_file": "",
                 "source": "unknown",
