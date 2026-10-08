@@ -11,3 +11,6 @@ mqtt_topics_dump.db-wal
 *.db
 *.db-shm
 *.db-wal
+
+_*.sh
+_*.py

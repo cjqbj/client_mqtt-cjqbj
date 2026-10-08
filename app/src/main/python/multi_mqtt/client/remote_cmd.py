@@ -931,15 +931,20 @@ def _cmq_pty_start():
         _envv["TERM"] = _term
         _argv0 = ("-" + _o.path.basename(_shell)) if _login else _shell
 
-        def _become():
-            # 子进程：新会话 + 把 slave 设为控制终端（ssh 同款）。
-            _o.setsid()
-            _fc.ioctl(_sfd, _te.TIOCSCTTY, 0)
-
+        # 子进程开新会话（setsid，成为会话/进程组首进程）。刻意不用
+        # preexec_fn：它会强制 subprocess 走 fork+exec 老路——在大 Python
+        # 进程 + CPU 限流容器上实测裸 fork ~0.4s、整次 spawn ~0.9s，是 PTY
+        # 握手首包最大的一笔固定开销；start_new_session 走 posix_spawn 快
+        # 路径只要 ~1ms（glibc>=2.26 由 POSIX_SPAWN_SETSID 在 exec 前完成
+        # setsid；旧系统自动回退 fork+exec，语义不变只是慢些）。控制终端
+        # 不再显式 TIOCSCTTY：会话首进程以 tty 为 0/1/2 启动后，交互 shell
+        # （bash/dash，登录/非登录均实测）会自行抢占 slave 为控制终端，
+        # tty 与 Ctrl-C 作业控制（SIGINT->cat->130）和旧路径完全一致。
         _proc = _sp.Popen(
             [_argv0], executable=_shell,
             stdin=_sfd, stdout=_sfd, stderr=_sfd,
-            cwd=_cwd, env=_envv, close_fds=True, preexec_fn=_become)
+            cwd=_cwd, env=_envv, close_fds=True,
+            start_new_session=True)
         try:
             _o.close(_sfd)
         except OSError:
@@ -2249,7 +2254,7 @@ class RemotePty:
              frame_max=PTY_FRAME_MAX, sid=None, in_topic=None,
              out_topic=None, on_data=None, heartbeat=0.0,
              on_heartbeat=None, req_timeout=None,
-             owner_gather=0.8) -> dict:
+             owner_gather=0.8, on_responders=None) -> dict:
         """协商并启动远端 PTY，返回服务端确认信息（含实际 topic/shell/pid）。
 
         heartbeat>0 时要求服务端按该间隔（秒）周期发心跳帧，每收到一帧
@@ -2258,6 +2263,11 @@ class RemotePty:
         owner_gather：首包回收后再多等几秒收集其他持相同 key 的服务端的
         迟到握手回包（多应答者检测/告警）；transport 不支持 request_many
         时自动退化为只收首包。
+
+        on_responders：给定回调时启用**后台收集**——首包一定主就立即返回
+        （不阻塞 owner_gather 秒，首屏零延迟），迟到应答者到齐后回调
+        ``on_responders(responders)``（仅当应答者多于 1 个）；为 None 时
+        维持同步 gather 的旧行为。
         """
         self._check_caps()
         sid = sid or ("pty-%d-%s" % (int(time.time() * 1000),
@@ -2336,7 +2346,39 @@ class RemotePty:
         code = build_pty_start_code(payload)
         try:
             request_many = getattr(self.tr, "request_many", None)
-            if callable(request_many) and owner_gather > 0:
+            bg_on_extras = None
+            if callable(request_many) and owner_gather > 0 \
+                    and on_responders is not None:
+                import inspect as _inspect
+                try:
+                    _supports_bg = len(_inspect.signature(
+                        request_many).parameters) >= 4
+                except (TypeError, ValueError):
+                    _supports_bg = False
+                if _supports_bg:
+                    # holder 让后台 gather 线程读到首包；收集窗 >=0.8s，
+                    # 首包返回后立即写入，竞态可忽略。
+                    holder = {"resp": None}
+
+                    def bg_on_extras(extras):
+                        # 迟到应答者到齐：多于 1 个才回调（影子进程告警）。
+                        full = _parse_pty_responders(holder["resp"], extras)
+                        self.responders = full
+                        if len(full) > 1:
+                            try:
+                                on_responders(full)
+                            except Exception:
+                                pass
+
+                    resp, extras = request_many(
+                        code, req_timeout, owner_gather,
+                        on_extras=bg_on_extras)
+                    if not resp:
+                        raise RemoteTimeout("PTY 启动请求超时无回包")
+                    holder["resp"] = resp
+                else:
+                    resp, extras = request_many(code, req_timeout, owner_gather)
+            elif callable(request_many) and owner_gather > 0:
                 resp, extras = request_many(code, req_timeout, owner_gather)
             else:
                 resp, extras = self.tr.request(code, req_timeout), []

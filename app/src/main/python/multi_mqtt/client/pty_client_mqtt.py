@@ -1761,6 +1761,23 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     def on_heartbeat(_ts):
         signal_state["last"] = time.monotonic()
 
+    def _responders_warning(responders) -> str:
+        # 多应答者（持相同 key 的多个服务端进程同时应答）告警文本；
+        # 后台 gather 到齐后走本地日志，不阻塞首屏。
+        winner = next((r for r in responders if r.get("winner")),
+                      responders[0])
+        lines = [
+            f"[pty][WARN] 检测到 {len(responders)} 个持相同 key 的服务端同时应答！"
+            f"仅保留 {winner.get('host')} pid={winner.get('pid')}，"
+            f"其余影子 PTY 已被通知立即关闭。"]
+        for r in responders:
+            if not r.get("winner"):
+                lines.append("           影子: %s pid=%s owner=%s"
+                             % (r.get("host"), r.get("pid"), r.get("owner")))
+        lines.append("           请停掉多余机器/容器上的旧 server_mqtt 进程，"
+                     "否则每次连接都会重复拉起并短暂干扰首屏。")
+        return "\n".join(lines) + "\n"
+
     # 协商：订阅 out topic + 下发 PTY 启动代码（shell 在服务端只启动这一次）
     _info("正在远端启动 PTY：shell=%s cwd=%s 窗口=%dx%d，等待握手回包（超时 %.0fs）..."
           % (args.shell or "服务端登录 shell", args.cwd or "远端 HOME",
@@ -1769,7 +1786,9 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                    cwd=args.cwd, login=not args.no_login,
                    flush_interval=args.interval, ttl=args.ttl,
                    heartbeat=heartbeat, on_heartbeat=on_heartbeat,
-                   on_data=on_data)
+                   on_data=on_data,
+                   on_responders=lambda rs: _emit_local(
+                       _responders_warning(rs)))
 
     banner = (
         f"[{stime()}] connected shell={env['shell']} pid={env['pid']} "
@@ -1782,22 +1801,11 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
         # 服务端对不存在的 cwd 已自行回退（HOME→/），会话照常用；只提示不退出
         banner += (f"[pty] 注意: {env['cwd_warning']}，"
                    f"已回退到 {env['cwd']}\n")
+    # 多应答者告警由 on_responders 后台回调输出（首包不阻塞 gather 窗）。
+    # 同步 gather 回退路径（transport 不支持后台收集）下这里仍兜底拼一次。
     responders = getattr(pty, "responders", None) or []
     if len(responders) > 1:
-        # 多个持相同 key 的服务端同时应答了握手：每个都开了 PTY 往同一
-        # topic 推流（界面重影/重复提示符的根源）。已按首个应答者定主，
-        # 影子端会在收到 claim/首个按键帧后自杀；但根因要人工清理。
-        winner = next((r for r in responders if r.get("winner")), responders[0])
-        banner += (
-            f"[pty][WARN] 检测到 {len(responders)} 个持相同 key 的服务端同时应答！"
-            f"仅保留 {winner.get('host')} pid={winner.get('pid')}，"
-            f"其余影子 PTY 已被通知立即关闭。\n")
-        for r in responders:
-            if not r.get("winner"):
-                banner += (f"           影子: {r.get('host')} pid={r.get('pid')} "
-                           f"owner={r.get('owner')}\n")
-        banner += ("           请停掉多余机器/容器上的旧 server_mqtt 进程，"
-                   "否则每次连接都会重复拉起并短暂干扰首屏。\n")
+        banner += _responders_warning(responders)
     if dead_timeout > 0:
         banner += (f"[pty] 心跳 {heartbeat:g}s：服务器关闭/断连后最多 "
                    f"{dead_timeout:g}s 自动退出\n")

@@ -6,6 +6,9 @@ import json
 FEATURE = {"name": "files", "title": "Files", "version": 1, "actions": ["scan", "upload"],
            "ui": "python", "icon": "files"}
 
+# 可交给 audio feature 在目标端播放的扩展名（feature 互操作白名单）。
+AUDIO_EXTENSIONS = (".mp3", ".wav", ".aac", ".m4a", ".ogg", ".oga", ".flac", ".opus", ".amr")
+
 
 def run():
     return FEATURE
@@ -95,25 +98,25 @@ def build_view(context):
     OpenAPI 通道下载到控制机 downloads/（图片直接显示预览）。
     """
     import base64
+    import time
     import bootstrap
     import pyui_kit
     from android.graphics import BitmapFactory
     from android.view import View
-    from android.widget import ImageView, LinearLayout, TextView
+    from android.widget import LinearLayout, TextView
 
     page = pyui_kit.Page(context, "Files", "Browse and download files on the target")
     state = {"root": "/data/data", "boundary": "/data/data", "limit": 100,
              "entries": [], "has_more": False, "next_offset": 0, "topic": None,
              "loading": False}
 
-    status = pyui_kit.make_text(context, "Ready", size=13)
-    page.add(status)
+    # 状态/进度不再放进可滚动的列表区：借用页面固定副标题行
+    # （"Browse and download files on the target"），列表上下滚也不会把速度滚没。
+    def set_status(text):
+        page.set_subtitle(text)
 
-    preview = ImageView(context)
-    preview.setAdjustViewBounds(True)
-    preview.setScaleType(ImageView.ScaleType.FIT_CENTER)
-    preview.setMaxHeight(pyui_kit.dp(context, 220))
-    preview.setVisibility(View.GONE)
+    # 图片预览同样走原生缩放控件（与相机页一致），失败自动回退静态图。
+    preview = pyui_kit.make_zoom_image(context, height_dp=240)
     page.add(preview, top=6)
 
     root_line = pyui_kit.make_text(context, "", size=12, color=pyui_kit.MUTED)
@@ -127,19 +130,27 @@ def build_view(context):
     load_more.setVisibility(View.GONE)
     page.add(load_more, top=6)
 
-    def set_status(text):
-        status.setText(text)
-
     def page_size():
         try:
             return max(1, min(int(str(limit_edit.getText()) or "100"), 10000))
         except ValueError:
             return 100
 
+    def make_tag(label, handler):
+        tag = TextView(context)
+        tag.setText(label)
+        tag.setTextSize(12)
+        tag.setTextColor(pyui_kit.parse_color(pyui_kit.SUB))
+        tag.setPadding(pyui_kit.dp(context, 10), pyui_kit.dp(context, 6),
+                       pyui_kit.dp(context, 10), pyui_kit.dp(context, 6))
+        pyui_kit.click(tag, handler)
+        return tag
+
     def render_rows():
         rows_box.removeAllViews()
         for entry in state["entries"]:
             is_dir = entry.get("kind") == "directory"
+            is_audio = str(entry.get("path", "")).lower().endswith(AUDIO_EXTENSIONS)
             row = pyui_kit.make_hrow(context)
             row.setPadding(0, pyui_kit.dp(context, 7), 0, pyui_kit.dp(context, 7))
             column = LinearLayout(context)
@@ -157,10 +168,17 @@ def build_view(context):
             column.addView(name_view, LinearLayout.LayoutParams(pyui_kit.match(), pyui_kit.wrap()))
             column.addView(meta, LinearLayout.LayoutParams(pyui_kit.match(), pyui_kit.wrap()))
             row.addView(column, LinearLayout.LayoutParams(0, pyui_kit.wrap(), 1.0))
-            tag = TextView(context)
-            tag.setText("Open" if is_dir else "Download")
-            tag.setTextSize(12)
-            row.addView(tag, LinearLayout.LayoutParams(pyui_kit.wrap(), pyui_kit.wrap()))
+            if is_dir:
+                row.addView(make_tag("Open", lambda e=entry: on_entry_click(e)),
+                            LinearLayout.LayoutParams(pyui_kit.wrap(), pyui_kit.wrap()))
+            else:
+                # feature 互操作：音频文件先给 Play（调 audio feature 在目标端播放），
+                # 再给 Download；两个标签各自消费点击，不互相干扰。
+                if is_audio:
+                    row.addView(make_tag("\u25b6 Play", lambda e=entry: on_play_entry(e)),
+                                LinearLayout.LayoutParams(pyui_kit.wrap(), pyui_kit.wrap()))
+                row.addView(make_tag("Download", lambda e=entry: on_entry_click(e)),
+                            LinearLayout.LayoutParams(pyui_kit.wrap(), pyui_kit.wrap()))
             pyui_kit.click(row, (lambda e=entry: on_entry_click(e)))
             params = LinearLayout.LayoutParams(pyui_kit.match(), pyui_kit.wrap())
             params.bottomMargin = pyui_kit.dp(context, 2)
@@ -219,6 +237,40 @@ def build_view(context):
         render_rows()
         load_page(0)
 
+    def on_play_entry(entry):
+        """feature 互操作：Files -> Audio，在目标端扬声器播放该音频文件。
+
+        唯一允许的跨 feature 调用方式是 client_service.call_feature
+        （JSON 入参/JSON 结果，异常已被结构化为 ok:false，不穿透）。
+        """
+        remote_path = state["root"].rstrip("/") + "/" + str(entry.get("path"))
+        name = str(entry.get("path")).rsplit("/", 1)[-1]
+        set_status("\u25b6 Playing %s on target ..." % name)
+
+        def work():
+            return client_service.call_feature("audio", "play", remote_path)
+
+        def apply_ok(raw):
+            try:
+                result = json.loads(raw)
+            except (TypeError, ValueError):
+                set_status(str(raw)[:200])
+                return
+            if result.get("ok"):
+                duration = result.get("duration_ms")
+                set_status(
+                    "\u25b6 Playing on target: %s%s"
+                    % (name, (" \u00b7 %s ms" % duration) if duration else "")
+                )
+            else:
+                errors = result.get("errors") or [result.get("error") or "play failed"]
+                set_status("Play failed: %s" % "; ".join(str(e) for e in errors)[:200])
+
+        def apply_error(error):
+            set_status("Play failed: %s" % error)
+
+        pyui_kit.run_async(work, apply_ok, apply_error)
+
     def on_entry_click(entry):
         if entry.get("kind") == "directory":
             child = state["root"].rstrip("/") + "/" + str(entry.get("path"))
@@ -231,29 +283,77 @@ def build_view(context):
         remote_path = state["root"].rstrip("/") + "/" + str(entry.get("path"))
         name = str(entry.get("path")).rsplit("/", 1)[-1]
         is_image = name.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
-        set_status("Downloading %s ..." % name)
+        set_status("\u2191 Uploading %s from target ..." % name)
         preview.setVisibility(View.GONE)
 
         def work():
-            transfer = json.loads(bootstrap.call_feature("files", "upload", remote_path))
-            if not transfer.get("ok"):
-                raise RuntimeError(transfer.get("error", "upload failed"))
-            url = transfer.get("url")
-            if not url:
-                raise RuntimeError("upload returned no URL")
-            client_service.download_remote_to_file(url, name)
+            # 阶段一：目标端上传到中转服务。RPC 是阻塞调用，拿不到真实字节进度，
+            # 用 3s 心跳汇报已等待时长（不静默即可，不要求实时）。
+            started = time.time()
+
+            def upload_beat():
+                set_status("\u2191 Uploading %s from target ... %.0fs"
+                           % (name, time.time() - started))
+
+            stop_beat = pyui_kit.repeat_every(3, upload_beat)
+            try:
+                transfer = json.loads(bootstrap.call_feature("files", "upload", remote_path))
+                if not transfer.get("ok"):
+                    raise RuntimeError(transfer.get("error", "upload failed"))
+                url = transfer.get("url")
+                if not url:
+                    raise RuntimeError("upload returned no URL")
+                upload_elapsed = time.time() - started
+            finally:
+                stop_beat()
+
+            # 阶段二：本机从中转服务下载，按真实字节数隔几秒汇报大小/速度。
+            def make_download_cb(prefix, clock):
+                def on_progress(got, total):
+                    el = max(0.1, time.time() - clock)
+                    speed_kb = got / 1024 / el
+                    if total:
+                        message = (
+                            "%s %s: %.2f/%.2fMB \u00b7 %.0f%% \u00b7 %.0f KB/s \u00b7 %.0fs"
+                            % (prefix, name, got / 1048576, total / 1048576,
+                               got * 100 // total, speed_kb, el)
+                        )
+                    else:
+                        message = (
+                            "%s %s: %.2fMB \u00b7 %.0f KB/s \u00b7 %.0fs"
+                            % (prefix, name, got / 1048576, speed_kb, el)
+                        )
+                    pyui_kit.on_main(lambda m=message: set_status(m))
+                return on_progress
+
+            dl_started = time.time()
+            client_service.download_remote_to_file(
+                url, name, progress=make_download_cb("\u2193 Downloading", dl_started)
+            )
+            dl_elapsed = time.time() - dl_started
             bitmap = None
             if is_image:
-                encoded = client_service.download_transfer_base64(url)
+                preview_started = time.time()
+                encoded = client_service.download_transfer_base64(
+                    url, progress=make_download_cb("Loading preview", preview_started)
+                )
                 data = base64.b64decode(encoded)
                 bitmap = BitmapFactory.decodeByteArray(data, 0, len(data))
-            return bitmap
+            return {
+                "bitmap": bitmap,
+                "upload_elapsed": upload_elapsed,
+                "dl_elapsed": dl_elapsed,
+                "total_elapsed": time.time() - started,
+            }
 
-        def apply_ok(bitmap):
-            if bitmap is not None:
-                preview.setImageBitmap(bitmap)
+        def apply_ok(payload):
+            if payload.get("bitmap") is not None:
+                preview.setImageBitmap(payload["bitmap"])
                 preview.setVisibility(View.VISIBLE)
-            set_status("Saved to app script directory downloads/")
+            set_status(
+                "Saved to downloads/  (\u2191%.0fs  \u2193%.0fs  total %.0fs)"
+                % (payload["upload_elapsed"], payload["dl_elapsed"], payload["total_elapsed"])
+            )
 
         def apply_error(error):
             set_status("Download failed: %s" % error)
@@ -274,6 +374,18 @@ def build_view(context):
         state["has_more"] = False
         render_rows()
         load_page(0)
+
+    def on_back():
+        # Android 全局返回键：仍在浏览根子目录里就回上一层（不退出应用）；
+        # 已在浏览根则返回 False，交给宿主走"连按两次退出"。
+        current = state["root"].rstrip("/") or "/"
+        boundary = state["boundary"].rstrip("/") or "/"
+        if state["loading"] or current == boundary or current == "/":
+            return False
+        on_up()
+        return True
+
+    client_service.set_feature_back_handler("files", on_back)
 
     def on_refresh():
         state["entries"] = []

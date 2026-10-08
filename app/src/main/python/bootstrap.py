@@ -167,7 +167,8 @@ def describe_features():
                 "module_file": str(getattr(module, "__file__", "") or ""),
                 "source": "py_updates" if _is_runtime_module(module) else "builtin",
             })
-        except Exception as exc:
+        except BaseException as exc:  # noqa: BLE001 - 含 SystemExit：脚本里 sys.exit/导入期
+            # FATAL 属于常见死法，单个 feature 绝不能拖垮整个 feature 目录的枚举。
             result.append({
                 "name": name,
                 "title": name,

@@ -87,7 +87,6 @@ def build_view(context):
     import pyui_kit
     from android.graphics import BitmapFactory
     from android.view import View
-    from android.widget import ImageView
 
     page = pyui_kit.Page(
         context, "Camera", "JPEG stays in memory on the target, transferred outside MQTT."
@@ -97,15 +96,13 @@ def build_view(context):
     states = {}
     current = {"key": None, "topic": None}
 
-    status = pyui_kit.make_text(context, "Ready")
-    page.add(status)
-
-    image = ImageView(context)
-    image.setAdjustViewBounds(True)
-    image.setScaleType(ImageView.ScaleType.FIT_CENTER)
-    image.setMaxHeight(pyui_kit.dp(context, 240))
-    image.setVisibility(View.GONE)
+    # 照片放最前面（标题之下第一屏就是图）：原生双指缩放/拖动控件，
+    # 拿不到原生控件时 pyui_kit 自动回退成不能动的静态图（页面仍完整）。
+    image = pyui_kit.make_zoom_image(context, height_dp=300)
     page.add(image, top=8)
+
+    status = pyui_kit.make_text(context, "Ready")
+    page.add(status, top=8)
 
     def new_state():
         return {"facing": 0, "facing_loaded": False, "status": "Ready", "bitmap": None}

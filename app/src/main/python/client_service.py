@@ -182,6 +182,37 @@ def build_feature_view(feature, context):
         return error_view
 
 
+# feature 自绘页的返回键拦截登记表：feature 名 -> 无参回调。
+# 回调返回 True 表示已消费（例如 Files 回上一层目录）；False/未注册表示
+# 交给宿主做"连按两次退出"。回调在 Android 主线程执行，必须轻量、不阻塞。
+_BACK_HANDLERS = {}
+
+
+def set_feature_back_handler(feature, handler):
+    """注册/注销某 feature 的全局返回键处理（handler 传 None 注销）。"""
+    name = str(feature)
+    if handler is None:
+        _BACK_HANDLERS.pop(name, None)
+    elif callable(handler):
+        _BACK_HANDLERS[name] = handler
+    return json.dumps({"ok": True, "feature": name}, ensure_ascii=False)
+
+
+def handle_feature_back(feature):
+    """宿主返回键入口：feature 消费返回 True；否则 False（宿主执行两次退出）。"""
+    handler = _BACK_HANDLERS.get(str(feature))
+    if handler is None:
+        return False
+    try:
+        return bool(handler())
+    except BaseException as error:  # noqa: BLE001 - 返回键绝不能因 feature 异常卡死
+        import logging
+        logging.getLogger("error").exception(
+            "feature back handler failed feature=%s: %s", feature, error
+        )
+        return False
+
+
 def _mqtt_client_module():
     module_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "multi_mqtt")
     client_dir = os.path.join(module_dir, "client")
@@ -1105,29 +1136,86 @@ def _set_aliyun_config(config):
     return safe_config
 
 
-def download_transfer(url, config=None, save_to=None):
+def make_progress(callback, interval=2.5):
+    """把高频下载字节回调节流成"隔几秒一次"的进度汇报，返回 (got, total) 回调。
+
+    第一次和最后一次（got >= total）必发，中间至少间隔 interval 秒；
+    callback 自身抛错不影响下载。callback 由工作线程调用，更新 UI 请用
+    pyui_kit.on_main(...) 投递到主线程。
+    """
+    if callback is None:
+        return None
+    state = {"last": 0.0}
+
+    def report(got, total):
+        try:
+            got = int(got or 0)
+            total = int(total or 0)
+            now = time.time()
+            if now - state["last"] >= interval or (total and got >= total) or got and not total:
+                state["last"] = now
+                callback(got, total)
+        except BaseException:  # noqa: BLE001 - 进度汇报绝不能炸下载
+            pass
+    return report
+
+
+# 其他 topic（旧 APK）里可能跑着老版本 aliyun_git，download() 没有 progress 形参，
+# 直接传 progress= 会 TypeError 让下载整个失败。按模块缓存能力探测结果：
+# 有钩子才传，没有就静默降级（功能正常，只是看不到速度）。
+_DOWNLOAD_PROGRESS_CAPABLE = set()
+
+
+def _download_supports_progress(aliyun_git):
+    module_key = getattr(aliyun_git, "__file__", None) or id(aliyun_git)
+    if module_key in _DOWNLOAD_PROGRESS_CAPABLE:
+        return True
+    try:
+        import inspect
+        params = inspect.signature(aliyun_git.download).parameters
+    except (TypeError, ValueError, RuntimeError, OSError):
+        # 部分运行时/代理对象取签名会失败：用一次假参试调代价太高，保守按不支持处理。
+        return False
+    if "progress" in params:
+        _DOWNLOAD_PROGRESS_CAPABLE.add(module_key)
+        return True
+    return False
+
+
+def _aliyun_download(aliyun_git, url, report, **kwargs):
+    """统一下载入口：仅当目标 aliyun_git 版本支持 progress 钩子时才传。"""
+    if report is not None and _download_supports_progress(aliyun_git):
+        kwargs["progress"] = report
+    return aliyun_git.download(url, **kwargs)
+
+
+def download_transfer(url, config=None, save_to=None, progress=None):
     """Download a short transfer URL outside MQTT, returning bytes or a local path."""
     _set_aliyun_config(config if config is not None else load_config().get("aliyun", {}))
     aliyun_git = importlib.import_module("aliyun_git")
-    data = aliyun_git.download(url, save_to=save_to, max_show_bytes_size=0)
+    report = make_progress(progress)
+    data = _aliyun_download(
+        aliyun_git, url, report, save_to=save_to, max_show_bytes_size=0
+    )
     return {"ok": True, "path": data if save_to else None, "size": os.path.getsize(data) if save_to else len(data)}
 
 
-def download_transfer_base64(url, config=None):
+def download_transfer_base64(url, config=None, progress=None):
     """Download an image/file into memory for the Android bridge, never MQTT."""
     _set_aliyun_config(config if config is not None else load_config().get("aliyun", {}))
     aliyun_git = importlib.import_module("aliyun_git")
-    data = aliyun_git.download(url, max_show_bytes_size=0)
+    report = make_progress(progress)
+    data = _aliyun_download(aliyun_git, url, report, max_show_bytes_size=0)
     return base64.b64encode(bytes(data)).decode("ascii")
 
 
-def download_remote_to_file(url, name, config=None):
+def download_remote_to_file(url, name, config=None, progress=None):
     root = _STATE.get("files_dir") or os.getcwd()
     target_dir = os.path.join(root, "downloads")
     os.makedirs(target_dir, exist_ok=True)
     safe_name = os.path.basename(str(name)) or "download.bin"
     target = os.path.join(target_dir, safe_name)
-    result = download_transfer(url, config=config, save_to=target)
+    result = download_transfer(url, config=config, save_to=target, progress=progress)
     return json.dumps(result, ensure_ascii=False)
 
 

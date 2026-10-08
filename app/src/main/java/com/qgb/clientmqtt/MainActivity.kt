@@ -9,6 +9,8 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.SystemClock
+import android.widget.Toast
 import android.provider.Settings
 import android.net.Uri
 import java.io.File
@@ -84,6 +86,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -94,6 +97,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.chaquo.python.Python
@@ -387,6 +391,28 @@ private fun ClientMqttScreen() {
             targetSettings -> targetSettings = false
             settings -> settings = false
             diagnostics -> diagnostics = false
+        }
+    }
+
+    // 无覆盖页时的全局返回：先交给当前 Python 自绘 feature（Files 在子目录时回上一层）；
+    // feature 不消费则"连按两次退出"（2 秒窗口 + Toast 提示），不再一闪退到桌面。
+    val backContext = LocalContext.current
+    var lastFeatureBackAt by remember { mutableLongStateOf(0L) }
+    val currentFeatureName = visibleFeatures.getOrNull(pagerState.currentPage)?.name
+    LaunchedEffect(currentFeatureName) { lastFeatureBackAt = 0L }
+    BackHandler(enabled = !permissions && !targetSettings && !settings && !diagnostics) {
+        val consumed = currentFeatureName?.let { name ->
+            // 纯查询/轻量 View 操作，在主线程快速返回；feature 异常时按未消费处理。
+            runCatching { service.callAttr("handle_feature_back", name).toBoolean() }
+                .getOrDefault(false)
+        } ?: false
+        if (consumed) return@BackHandler
+        val now = SystemClock.uptimeMillis()
+        if (now - lastFeatureBackAt in 1..2000L) {
+            (backContext as? android.app.Activity)?.finish()
+        } else {
+            lastFeatureBackAt = now
+            Toast.makeText(backContext, "再按一次退出", Toast.LENGTH_SHORT).show()
         }
     }
 

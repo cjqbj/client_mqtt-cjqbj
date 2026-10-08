@@ -113,22 +113,64 @@ class MqttTransport(Transport):
             allow_no_server_pubkey_response=self.allow_no_pub,
         )
 
-    def request_many(self, code: str, timeout: float = DEFAULT_TIMEOUT,
-                     gather: float = 0.8):
-        """PTY 握手专用可选能力：回收首包后再留 ``gather`` 秒收集其他持相同
-        key 的服务端进程的迟到回包，返回 ``(首包, 其余回包列表)``。
+    # 首包未回前向新连上的 broker 补发同一握手请求的时间点（秒）。
+    # 启动瞬间通常只有 1 个 broker 在线，单路径被公共 broker 限流时首包要
+    # 等数秒；补发让握手随 broker 陆续上线不断扩大多路径竞速。同一 req_id
+    # 由服务端 dedup_cache 去重、同 sid 由会话注册表幂等，安全。
+    HANDSHAKE_REPUBLISH_DELAYS = (0.4, 0.9, 1.8)
+    # 握手前等待多路径就绪：实测冷启动 0.6s 时已有 6~9 个 broker 在线。
+    # QoS0 首发只投递给当前在线 broker、且应答也是一次性 QoS0，单 broker
+    # 起步时握手 RTT 完全赌那一条路径的当下延迟；等到 6 路再首发，请求/
+    # 应答双向竞速，首包稳定在亚秒级。已在线 broker 足够时立即返回。
+    HANDSHAKE_MIN_BROKERS = 6
+    HANDSHAKE_READY_TIMEOUT = 0.7
 
-        一个握手请求会被每台在线设备各执行一次；第二个回包证明存在影子
-        服务端（旧机器/旧容器/同机双进程），RemotePty 据此做归属仲裁。
-        """
-        resp = self.node.request(
-            code,
+    def _handshake_ready(self):
+        net = getattr(self.node, "mqtt_net", None)
+        wait = getattr(net, "wait_connected", None) if net is not None else None
+        if callable(wait):
+            try:
+                wait(min_count=self.HANDSHAKE_MIN_BROKERS,
+                     timeout=self.HANDSHAKE_READY_TIMEOUT)
+            except Exception:
+                logger.exception("握手多路径就绪等待异常，按现状继续")
+
+    def _node_request_kwargs(self, timeout):
+        return dict(
             request_topic=self.request_topic,
             reply_topic=self.reply_topic,
             timeout=timeout,
             client_private_key_bytes=self.key,
             allow_no_server_pubkey_response=self.allow_no_pub,
+        )
+
+    def request_many(self, code: str, timeout: float = DEFAULT_TIMEOUT,
+                     gather: float = 0.8, on_extras=None):
+        """PTY/SOCKS5 握手专用可选能力，返回 ``(首包, 其余回包列表)``。
+
+        一个握手请求会被每台在线设备各执行一次；第二个回包证明存在影子
+        服务端（旧机器/旧容器/同机双进程），RemotePty 据此做归属仲裁。
+
+        - 首包未回前按 HANDSHAKE_REPUBLISH_DELAYS 补发，覆盖迟到 broker；
+        - ``on_extras`` 为 None（默认）：阻塞留 ``gather`` 秒收集迟到回包
+          后返回（旧行为）；
+        - ``on_extras`` 为回调：**首包一到立即返回**（extras 返回空），
+          ``gather`` 秒收集窗在后台进行，结束后回调
+          ``on_extras(extras: list)``，让首屏不再被收集窗阻塞。
+        """
+        self._handshake_ready()
+        ka = self._node_request_kwargs(timeout)
+        if on_extras is not None:
+            resp = self.node.request_bg_gather(
+                code, gather_window=gather,
+                republish_delays=self.HANDSHAKE_REPUBLISH_DELAYS,
+                on_gather=on_extras, **ka)
+            return (resp or None), []
+        resp = self.node.request(
+            code,
             gather_window=gather,
+            republish_delays=self.HANDSHAKE_REPUBLISH_DELAYS,
+            **ka,
         )
         if not resp:
             return None, []

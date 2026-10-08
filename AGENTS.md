@@ -18,6 +18,9 @@
   - feature 错误不影响 client 主程序：JVM→Python 回调边界（pyui_kit 的 Runnable/OnClick/attach/watch/run_async 回调）统一吞异常并写 logcat（tag `qgb-pyui`），禁止 feature 自建 dynamic_proxy 绕过护栏；异常变量不得在 except 闭包里延迟引用。
   - 顶栏名称只是别名，request topic 必须同屏显示；老内置名 "Target" 在显示层和下次保存时回退 topic 末段。
 - `enabled_features` 契约：每个目标可独立勾选生效 feature，默认全选（存 null，不存名单，新装 feature 自动可见）；字段贯穿持久化 → `device_catalog/device_settings` JSON → Kotlin `TargetDescriptor.enabledFeatures` → 底栏/侧栏/pager 过滤，所有消费端按 null=全选兜底；被过滤掉的 feature 不参与 tab 索引与恢复。
+- Python 调用原生控件：复杂手势控件用 Kotlin 写在 `com.qgb.clientmqtt.*`（如 ZoomableImageView：双指缩放/拖动/双击，未放大时放行父容器滚动手势），Python 只通过 pyui_kit 的 `make_xxx()` 包装调用（如 `make_zoom_image`），拿不到原生控件必须自动回退 Python 静态 View；禁止 feature 直接 import app 包类。
+- feature 互操作：跨 feature 只允许 `client_service.call_feature("b", "action", *json_args)`（JSON 入参/返回，异常结构化 ok:false），禁止 import 对方模块/共享状态；action 必须在 `FEATURE["actions"]` 声明且可选参数。已落地：Files 音频行 ▶Play 调 `audio.play(path)`。
+- 长任务进度：下载链路支持 `progress(got,total)` 回调并经 `client_service.make_progress` 节流到 ~2.5s（首包/完成必达），UI 更新走 `pyui_kit.on_main`；阻塞式 RPC 上传用 `pyui_kit.repeat_every(3, fn)` 心跳汇报秒数并 finally 停止；进度统一写页面状态行，回调不得抛错/做重活。
 - 拍照目标端代码和 `capture` 入口集中在 `feature_camera.py`；Compose 页面只负责选择相机并调用 feature。
 - 首次使用外部脚本目录时，可通过设置页的 Python 下载器安装缺失的 files、camera、wifi 脚本。下载要有超时、备用地址和重试，并在界面日志区显示逐步结果。
 

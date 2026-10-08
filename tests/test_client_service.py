@@ -145,6 +145,31 @@ class ClientServiceTests(unittest.TestCase):
                 if previous_module is not None:
                     sys.modules["feature_broken"] = previous_module
 
+    def test_describe_features_survives_systemexit_in_one_module(self):
+        import bootstrap
+
+        previous_update_dir = bootstrap._UPDATE_DIR
+        previous_path = list(sys.path)
+        previous_module = sys.modules.pop("feature_dying", None)
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                bootstrap.init_env(directory)
+                Path(directory, "feature_dying.py").write_text(
+                    "raise SystemExit('[FATAL] no config')\n", encoding="utf-8"
+                )
+                # 一个 feature 导入期 SystemExit 不能炸掉整个目录枚举。
+                described = bootstrap.describe_features()
+                dying = next(item for item in described if item["name"] == "dying")
+                self.assertIn("SystemExit", dying["error"])
+                # 其余正常 feature 仍然在列（files 是内置常驻 feature）。
+                self.assertIn("files", [item["name"] for item in described])
+            finally:
+                bootstrap._UPDATE_DIR = previous_update_dir
+                sys.path[:] = previous_path
+                sys.modules.pop("feature_dying", None)
+                if previous_module is not None:
+                    sys.modules["feature_dying"] = previous_module
+
     def test_rpc_passes_private_key_expression_to_mqtt_normalizer(self):
         previous_state = client_service._STATE.copy()
         with tempfile.TemporaryDirectory() as files_dir:
@@ -997,6 +1022,87 @@ class ClientServiceTests(unittest.TestCase):
             finally:
                 client_service._STATE.clear()
                 client_service._STATE.update(previous_state)
+
+    def test_make_progress_throttles_and_always_emits_first_and_last(self):
+        calls = []
+        report = client_service.make_progress(lambda got, total: calls.append((got, total)),
+                                              interval=10)
+        # 首次必发；随后同时间窗内被节流。
+        report(100, 1000)
+        report(200, 1000)
+        report(300, 1000)
+        self.assertEqual(calls, [(100, 1000)])
+        # 到总量（完成）时即使在时间窗内也必发一次。
+        report(1000, 1000)
+        self.assertEqual(calls, [(100, 1000), (1000, 1000)])
+        # 未知总大小（流式）每次都发，不被节流吞掉。
+        calls.clear()
+        report2 = client_service.make_progress(lambda got, total: calls.append((got, total)),
+                                               interval=10)
+        report2(10, 0)
+        report2(20, 0)
+        self.assertEqual(calls, [(10, 0), (20, 0)])
+        # callback 抛错不外泄。
+        def boom(got, total):
+            raise RuntimeError("ui dead")
+        client_service.make_progress(boom, interval=0)(5, 10)
+        self.assertIsNone(client_service.make_progress(None))
+
+    def test_download_progress_capability_detection_keeps_old_aliyun_git_working(self):
+        # 其他 topic 上的老版本 aliyun_git：download 没有 progress 形参。
+        class OldGit:
+            __file__ = "<test-old-aliyun_git>"
+
+            def download(self, url, save_to=None, max_show_bytes_size=0):
+                self.kwargs = {"save_to": save_to, "max_show_bytes_size": max_show_bytes_size}
+                return b"old"
+
+        class NewGit:
+            __file__ = "<test-new-aliyun_git>"
+
+            def download(self, url, save_to=None, max_show_bytes_size=0, progress=None):
+                self.progress_seen = progress
+                if progress is not None:
+                    progress(1, 1)
+                return b"new"
+
+        client_service._DOWNLOAD_PROGRESS_CAPABLE.discard("<test-old-aliyun_git>")
+        client_service._DOWNLOAD_PROGRESS_CAPABLE.discard("<test-new-aliyun_git>")
+        old = OldGit()
+        self.assertFalse(client_service._download_supports_progress(old))
+        # 老模块：不传 progress，下载照常完成（无速度显示而已）。
+        self.assertEqual(
+            client_service._aliyun_download(old, "u", lambda g, t: None, save_to=None),
+            b"old",
+        )
+        self.assertNotIn("progress", old.kwargs)
+
+        new = NewGit()
+        self.assertTrue(client_service._download_supports_progress(new))
+        ticks = []
+        self.assertEqual(
+            client_service._aliyun_download(new, "u", lambda g, t: ticks.append((g, t)),
+                                            save_to=None),
+            b"new",
+        )
+        self.assertEqual(ticks, [(1, 1)])
+
+    def test_feature_back_handler_registry_consumes_and_isolates_errors(self):
+        client_service.set_feature_back_handler("files", lambda: True)
+        self.assertTrue(client_service.handle_feature_back("files"))
+        client_service.set_feature_back_handler("files", lambda: False)
+        self.assertFalse(client_service.handle_feature_back("files"))
+
+        def boom():
+            raise RuntimeError("view gone")
+
+        client_service.set_feature_back_handler("files", boom)
+        # 回调异常不能把返回键流程带崩：按未消费处理。
+        self.assertFalse(client_service.handle_feature_back("files"))
+        # 未注册的 feature 直接放行给宿主双击退出。
+        self.assertFalse(client_service.handle_feature_back("camera"))
+        client_service.set_feature_back_handler("files", None)
+        self.assertFalse(client_service.handle_feature_back("files"))
 
     def test_unnamed_target_stops_displaying_legacy_default_name(self):
         previous_state = client_service._STATE.copy()

@@ -181,6 +181,60 @@ def click(view, fn):
     view.setOnClickListener(_onclick_class()(fn))
 
 
+def on_main(fn):
+    """把 fn 投递到主线程执行（工作线程更新 View 的唯一安全入口）。
+
+    回调经 Runnable 护栏包裹，fn 抛错只记 logcat，绝不穿透杀进程。
+    """
+    _post(guarded("on_main", fn))
+
+
+def repeat_every(seconds, fn):
+    """每隔 seconds 秒在主线程执行一次 fn，返回 stop()。
+
+    大文件上传/下载等长任务用它做"隔几秒汇报一次"的心跳，不要求实时。
+    典型用法：stop = repeat_every(3, lambda: set_status(...))，finally 里 stop()。
+    """
+    interval = max(0.2, float(seconds))
+    stop_event = threading.Event()
+
+    def loop():
+        while not stop_event.wait(interval):
+            _post(guarded("repeat_every", fn))
+
+    threading.Thread(target=loop, daemon=True).start()
+    return stop_event.set
+
+
+def make_zoom_image(context, height_dp=300):
+    """可双指缩放/拖动/双击还原的图片控件（原生优先，失败回退静态图）。
+
+    原生控件规范：优先实例化 Kotlin 写好的
+    com.qgb.clientmqtt.ZoomableImageView（手势、边界约束都在原生侧）；
+    任何原因拿不到（旧 APK / 实例化失败）都回退成 Python 侧静态
+    ImageView——不能缩放但页面完整、永不崩。返回的都是 ImageView 子类，
+    feature 直接 setImageBitmap/setVisibility 即可。
+    """
+    from android.view import View
+    from android.view import ViewGroup
+    from android.widget import ImageView
+
+    view = None
+    try:
+        from com.qgb.clientmqtt import ZoomableImageView
+        view = ZoomableImageView(context)
+    except BaseException as error:  # noqa: BLE001 - 兜底必须全吞
+        report_feature_error("native zoom image unavailable, use static", error)
+        view = ImageView(context)
+        view.setAdjustViewBounds(True)
+        view.setScaleType(ImageView.ScaleType.FIT_CENTER)
+    view.setVisibility(View.GONE)
+    # 预置固定高度的 LayoutParams；Page.add 识别 zoom 控件后沿用此高度。
+    view.setLayoutParams(ViewGroup.LayoutParams(_match(), dp(context, height_dp)))
+    view.setTag("qgb-zoom-image")
+    return view
+
+
 def make_button(context, label, fn):
     from android.widget import Button
     button = Button(context)
@@ -205,6 +259,11 @@ def make_text(context, text="", size=14, color=SUB, bold=False):
 def _color(value):
     from android.graphics import Color
     return Color.parseColor(value)
+
+
+def parse_color(value):
+    """#RRGGBB 颜色字符串转 Android int（feature 给原生 View 着色时用）。"""
+    return _color(value)
 
 
 def make_edit(context, text="", number=False):
@@ -247,11 +306,14 @@ class Page:
                 title_view,
                 LinearLayout.LayoutParams(_match(), _wrap()),
             )
+        # 副标题行固定在滚动区之外，不随内容滚动：长任务进度/状态借这里显示，
+        # 避免文件列表很长时状态被滚走看不到（feature 用 set_subtitle 更新）。
+        self.subtitle_view = None
         if subtitle:
-            sub = make_text(context, subtitle, size=13, color=MUTED)
+            self.subtitle_view = make_text(context, subtitle, size=13, color=MUTED)
             params = LinearLayout.LayoutParams(_match(), _wrap())
             params.topMargin = dp(context, 2)
-            self.root.addView(sub, params)
+            self.root.addView(self.subtitle_view, params)
 
         # 当前目标 topic 行：由 watch_target 实时刷新（切目标立刻跟着变）。
         self.target_line = TextView(context)
@@ -282,9 +344,25 @@ class Page:
     def set_target(self, text):
         self.target_line.setText(text)
 
-    def add(self, view, top=0, bottom=0):
+    def set_subtitle(self, text):
+        """更新固定副标题行（长任务进度/状态）；页面未建副标题时忽略。"""
+        if self.subtitle_view is not None:
+            self.subtitle_view.setText(str(text))
+
+    def add(self, view, top=0, bottom=0, height_dp=0):
         from android.widget import LinearLayout
-        params = LinearLayout.LayoutParams(_match(), _wrap())
+        # make_zoom_image 预置了固定高度（缩放手势需要确定高度的盒子）；
+        # height_dp 显式传入时优先。
+        fixed_height = None
+        if height_dp:
+            fixed_height = dp(self.context, height_dp)
+        elif str(view.getTag()) == "qgb-zoom-image":
+            existing = view.getLayoutParams()
+            if existing is not None and existing.height > 0:
+                fixed_height = existing.height
+        params = LinearLayout.LayoutParams(
+            _match(), fixed_height if fixed_height is not None else _wrap()
+        )
         if top:
             params.topMargin = dp(self.context, top)
         if bottom:

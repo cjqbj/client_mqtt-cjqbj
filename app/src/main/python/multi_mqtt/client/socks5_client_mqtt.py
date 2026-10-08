@@ -71,6 +71,7 @@ qos0 没有 broker 层重传：双向各自缓存最近 256 帧，缺口先 NACK
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import logging
 import os
@@ -125,6 +126,10 @@ alias_rpc_port        = ('rpc_port', 'rpc')
 alias_rpc_host        = ('rpc_host', 'rpc_ip')
 
 _GAP_DEFAULT = 15.0       # per-cid seq 缺口硬熔断秒数（先经 NACK 多轮重传）
+_HB_FLOOR_WIN = 60.0      # hb 延迟地板的滚动窗口秒数（单调 min 会被一次
+                          # NTP/GC/调度抖动永久钉死，pace 余生误判惩罚中）
+_FIN_CLOSE_GRACE = 120.0  # 远端 clean EOF 后等本地应用读完缓冲再 close socket
+                          # 的上限（Windows 防 RST）；会话条目不再被它拖住
 _NACK_FIRST = 0.8         # 缺口出现后多久发首轮重传请求
 _NACK_INTV = 1.2          # 后续重传请求轮询间隔（硬熔断前约 4 轮）
 _CACHE_MAX = 256          # per-conn 重传缓存帧数（≈256×16KiB=4MiB）
@@ -139,6 +144,16 @@ _PACE_START = 0.08        # 会话起跑节奏（≈200KB/s）：宁可慢，不
 _PACE_MAX = 0.5           # 最严节奏上限（2 帧/s≈32KB/s，仅惩罚期短暂进入）
 _WQ_MAX = 256             # per-conn 写队列帧数上限（≈256×16KiB=4MiB 背压红线）
 _INGRESS_MAX = 128        # per-cid 重组暂存帧数上限（防 closed 连接迟到帧堆积）
+# NACK 补发待办队列硬上限：元素只是 ucache 里既有帧的引用，不拷贝载荷；
+# 满量（NACK 风暴/补发长期被 bulk 队列反压）直接拒收新待办并留痕，补发
+# 由服务端下一轮 NACK（指数退避）重新驱动，不在回调线程堆积内存。
+_RESEND_Q_MAX = 512
+# NACK 大帧补发去重表的淘汰线：超过此条目数才做一轮清扫（避免每帧扫表），
+# 清扫只删超过 TTL 的键。去重窗口才 2s，30s 前的键绝无再用价值；cid 已
+# 死的键也随年龄一起走，防止 HTTP 短连接海量轮换下表只增不删。
+_RT_LAST_MAX = 4096
+_RT_LAST_TTL = 30.0
+_RT_LAST_PRUNE_INTV = 10.0
 
 
 def _info(msg):
@@ -242,6 +257,30 @@ def _cmq_socks5_start():
             _pc = lambda _d, decrypt=False, enabled=False: \
                 _j.dumps(_d, ensure_ascii=False)
 
+        def _pub_fail(_msg):
+            # 下行失败记账（随心跳 pe/pl 暴露）。注意 paho 在断连 client 上
+            # publish() 通常**不抛异常**，而是返回 rc!=0（MQTT_ERR_NO_CONN
+            # 等）把帧静默丢弃——只 try/except 抓不到这种"seq 已消费但帧
+            # 没出去"，缺口只能靠客户端 NACK 补发，但计数必须如实反映。
+            try:
+                _g["_cmq_s5_pub_err"] = _g.get("_cmq_s5_pub_err", 0) + 1
+                _g["_cmq_s5_pub_last"] = _msg
+            except Exception:
+                pass
+
+        def _cl_pub(_cl, _topic, _payload):
+            # 单个 paho client 发一帧：异常或 rc!=0 都算没出去，返回成败。
+            try:
+                if not _cl.is_connected():
+                    return False, "not connected"
+                _mi = _cl.publish(_topic, _payload, qos=0)
+                _rc = getattr(_mi, "rc", 0)
+                if _rc:
+                    return False, "paho rc=%s" % _rc
+                return True, None
+            except BaseException as _e:
+                return False, "%s: %s" % (type(_e).__name__, _e)
+
         def _pub(_fr, _subset=None):
             # 下行帧唯一出口。_subset=None：全 broker（控制帧/未学到名单前）；
             # 否则只发首选 broker（数据大帧），丢失由客户端 NACK 触发全 broker
@@ -251,28 +290,30 @@ def _cmq_socks5_start():
             _fr["owner"] = _uid
             try:
                 if not _subset:
+                    # publish_broadcast 内部逐个 client 发送且不回传 rc，
+                    # 这里只能兜异常；子集路径的静默失败由下方 rc 检查记账。
                     _net.publish_broadcast(_out_topic, _fr)
                     return
                 _payload = _pc(_fr, decrypt=False,
                                enabled=getattr(_net, "enable_crypto", False))
                 with _net.lock:
                     _items = list(_net.clients.items())
+                _tried = 0
                 for _h, _cl in _items:
                     if _h in _subset:
-                        try:
-                            if _cl.is_connected():
-                                _cl.publish(_out_topic, _payload, qos=0)
-                        except Exception:
-                            pass
+                        _tried += 1
+                        _sent, _why = _cl_pub(_cl, _out_topic, _payload)
+                        if not _sent:
+                            # 不主动改走全 broker 兜底：broker 过载时全扇出
+                            # 只会加剧 13× 放大，缺帧统一由客户端 NACK 补发。
+                            _pub_fail("subset %s: %s" % (_h, _why))
+                if _tried == 0:
+                    # 子集 broker 在主连接上一个 client 都没有：帧静默没
+                    # 出去（上面循环无任何记账），seq 已消费，等 NACK 补发。
+                    _pub_fail("subset empty: no matching broker client")
             except BaseException as _e:
-                # paho 断连/队列满等：帧没出去但 seq 已消费会造成客户端缺口。
-                # 计数随心跳暴露，供网络分析定位；丢失帧可经 NACK 补发。
-                try:
-                    _g["_cmq_s5_pub_err"] = _g.get("_cmq_s5_pub_err", 0) + 1
-                    _g["_cmq_s5_pub_last"] = "%s: %s" % (
-                        type(_e).__name__, _e)
-                except Exception:
-                    pass
+                # 序列化/网络层异常：帧没出去但 seq 已消费会造成客户端缺口。
+                _pub_fail("%s: %s" % (type(_e).__name__, _e))
 
         def _bulk_pub(_fr):
             # 大数据帧专用出口：只连首选 broker 的**独立第二路 paho 连接**。
@@ -280,7 +321,10 @@ def _cmq_socks5_start():
             # 十几秒（broker/链路按连接排队）；大帧走独立连接后控制/交互
             # 帧（走 _net 主连接，全 broker）不再被队头阻塞。名单变化时
             # 惰性重建，重建期间退回主连接子集发送。
-            global _bnet, _bhosts
+            # 必须 nonlocal：_bnet/_bhosts 是 _cmq_socks5_start 的局部闭包
+            # 变量。误用 global 会绑到 executor 模块全局——多会话共享且
+            # 初值不存在，_want!=_bhosts 首次读取即 NameError。
+            nonlocal _bnet, _bhosts
             _want = frozenset(_pb[:_PB_MAX])
             _node = None
             if _want:
@@ -322,25 +366,24 @@ def _cmq_socks5_start():
             if _node is not None and getattr(_node, "clients", None):
                 _fr["s5"] = _sid
                 _fr["owner"] = _uid
+                _bok = 0
                 try:
                     _payload = _pc(_fr, decrypt=False,
                                    enabled=getattr(_node, "enable_crypto", False))
                     with _node.lock:
                         _items = list(_node.clients.items())
                     for _h, _cl in _items:
-                        try:
-                            if _cl.is_connected():
-                                _cl.publish(_out_topic, _payload, qos=0)
-                        except Exception:
-                            pass
-                    return
+                        _sent, _why = _cl_pub(_cl, _out_topic, _payload)
+                        if _sent:
+                            _bok += 1
+                        else:
+                            _pub_fail("bulk %s: %s" % (_h, _why))
                 except BaseException as _e:
-                    try:
-                        _g["_cmq_s5_pub_err"] = _g.get("_cmq_s5_pub_err", 0) + 1
-                        _g["_cmq_s5_pub_last"] = "%s: %s" % (
-                            type(_e).__name__, _e)
-                    except Exception:
-                        pass
+                    _pub_fail("bulk %s: %s" % (type(_e).__name__, _e))
+                if _bok:
+                    return  # 至少一份入队：全丢再由客户端 NACK 触发补发
+                # bulk client 全断/rc 全失败：落到主连接兜底（子集或全
+                # broker），不能像旧代码那样 return 假装已发出。
             # bulk 连接未就绪/发送异常：退回主连接（子集或全 broker）
             _pub(_fr, set(_want) if _want else None)
 
@@ -353,7 +396,10 @@ def _cmq_socks5_start():
         _rt_last = {}   # NACK 大帧补发去重 (cid,seq)->monotonic
 
         def _bsend_loop():
-            global _pace_intv
+            # nonlocal：_pace_intv 是闭包变量，由 _in_loop 收 ps 帧热调。
+            # global 会让首帧（ps 到达前）读模块全局未定义名 → NameError
+            # 打死本线程，此后 _bq 无人消费、堆满反压，读循环整个卡死。
+            nonlocal _pace_intv
             _last = 0.0
             while True:
                 try:
@@ -472,6 +518,11 @@ def _cmq_socks5_start():
             _c["closed"] = True
             _c["r_done"] = True
             _c["w_done"] = True
+            # connect 可能仍在进行：释放正等 sock_ev 的 writer，避免它白等
+            try:
+                _c["sock_ev"].set()
+            except Exception:
+                pass
             try:
                 _c["wq"].put_nowait(None)
             except Exception:
@@ -503,7 +554,15 @@ def _cmq_socks5_start():
                         break
                     _s = _c.get("sock")
                     if _s is None:
-                        break
+                        # sock 未就绪：connect 还在进行（慢目标可达 _ctimeout
+                        # 秒）。正常客户端会等 opened 才发数据，但上行 NACK
+                        # 补发/乱序重放可能让数据帧早于建连完成到达此处。
+                        # 直接 break 会让 writer 死亡、之后所有上行字节被
+                        # wq 静默吞掉（连接表面正常，单向断流，极难排查）。
+                        _c["sock_ev"].wait(_ctimeout + 5.0)
+                        _s = _c.get("sock")
+                        if _s is None:
+                            break  # 建连失败：失败路径已 r_done+投 None
                     _s.sendall(_item)
             except Exception:
                 _close_conn(_cid, "write_error")
@@ -538,10 +597,13 @@ def _cmq_socks5_start():
                 _c["r_done"] = True
                 # sock 根本没建出来：必须唤醒 writer，否则它阻塞在 wq.get()
                 # 上永不退出，_conns 条目也永不摘除（线程+条目双泄漏）。
+                _c["sock_ev"].set()
                 _wake_writer(_c)
                 _gc(_cid, _c)
                 return
             _c["sock"] = _s
+            # sock 先落字典再 set：writer 醒来时保证 _c["sock"] 可见。
+            _c["sock_ev"].set()
             with _c["seq_lock"]:
                 _fr0 = {"cid": _cid, "seq": 0, "opened": {"ok": True}}
                 _cache_put(_c, _fr0)
@@ -588,14 +650,40 @@ def _cmq_socks5_start():
                     _c = {"sock": None, "wq": _qe.Queue(_WQ_MAX),
                           "closed": False, "r_done": False, "w_done": False,
                           "seq_lock": _th.Lock(), "out_seq": 0,
-                          "rcache": {}}
+                          "rcache": {},
+                          # connect 结果事件：成功时先放 sock 再 set，失败
+                          # 路径 r_done+唤醒后 set。writer 在 sock 尚未就绪
+                          # 时必须等它，绝不能直接退出（见 _writer）。
+                          "sock_ev": _th.Event()}
                     _conns[_cid] = _c
-                _th.Thread(target=_conn_main,
-                           args=(_cid, _c, str(_op.get("host")),
-                                 int(_op.get("port"))),
-                           name="s5-conn-%s" % _cid, daemon=True).start()
-                _th.Thread(target=_writer, args=(_cid, _c),
-                           name="s5-wr-%s" % _cid, daemon=True).start()
+                _t1 = _th.Thread(target=_conn_main,
+                                 args=(_cid, _c, str(_op.get("host")),
+                                       int(_op.get("port"))),
+                                 name="s5-conn-%s" % _cid, daemon=True)
+                _t2 = _th.Thread(target=_writer, args=(_cid, _c),
+                                 name="s5-wr-%s" % _cid, daemon=True)
+                try:
+                    _t1.start()
+                    _t2.start()
+                except (RuntimeError, OSError):
+                    # 系统线程/资源耗尽：_c 已入 _conns，但一个或两个 worker
+                    # 没起来（sock_ev 永不 set、writer 永不消费 wq），不兜
+                    # 会挂到会话结束才被清。按建连失败回 opened+closed；
+                    # conn_main 若已起，closed 标志会让它建连后立即退出并
+                    # 由 _gc 关 sock（opened 重复 seq=0 客户端按副本去重）。
+                    try:
+                        with _c["seq_lock"]:
+                            if _c["out_seq"] == 0:
+                                _fr0 = {"cid": _cid, "seq": 0, "opened": {
+                                    "ok": False,
+                                    "error": "server cannot start worker "
+                                             "thread"}}
+                                _cache_put(_c, _fr0)
+                                _pub(_fr0)
+                                _c["out_seq"] = 1
+                    except Exception:
+                        pass
+                    _close_conn(_cid, "thread_start_failed")
                 return
             with _lock:
                 _c = _conns.get(_cid)
@@ -618,7 +706,10 @@ def _cmq_socks5_start():
             # 上行重组：同一帧被每个 broker 各投递一次且会乱序。按 per-cid
             # seq 连续放行；缺口超 _GAP 秒判真丢帧——SOCKS5 承载 TCP 流，
             # 跳号=数据损坏，必须断连而不是像 PTY 那样跳号放行。
-            global _pb, _pace_intv
+            # nonlocal：_pb/_pace_intv 必须与 _bulk_pub/_bsend_loop 读的
+            # 是同一个闭包单元；global 会让 pb 写进模块全局而 bulk 路径
+            # 永远读到空名单（大帧全部退回 13 broker 广播）。
+            nonlocal _pb, _pace_intv
             while not _end.is_set():
                 try:
                     _fr = _inq.get(timeout=0.25)
@@ -890,10 +981,18 @@ class _ConnReassembly:
     与 PTY 的 _PtyReorderBuffer 唯一但关键的区别：缺口**绝不跳号**——
     TCP 流丢一段就是损坏。缺口后先经 NACK 请求服务端从 per-conn 重传缓存
     补发（多轮），硬超时仍补不齐才熔断该连接。
+
+    交付串行化：add 被每个 broker 各自的 paho 网络线程并发调用，在锁内只能
+    保证"放行集合按 seq 连续"，锁外若直接回调 deliver，两个线程可能把
+    seq=6 先于 seq=5 写进本地 socket——TCP 字节序静默错乱（长度合法、内容
+    错位），比缺口熔断危险得多。故每条连接配一个专职交付线程：add 锁内
+    drain 后只把帧 FIFO 入队，单线程严格按放行顺序 deliver（PTY 侧也要求
+    同样的顺序语义）。
     """
 
     def __init__(self, deliver, on_gap, on_nack, gap=_GAP_DEFAULT,
-                 nack_first=_NACK_FIRST, nack_intv=_NACK_INTV):
+                 nack_first=_NACK_FIRST, nack_intv=_NACK_INTV, name="",
+                 on_log=None):
         self.next = 0
         self.pending = {}
         self.deadline = None       # 硬熔断时刻
@@ -903,23 +1002,62 @@ class _ConnReassembly:
         self.nack_intv = float(nack_intv)
         self.nround = 0           # NACK 轮次（间隔指数退避，封顶 3s）
         self.broken = False
+        self.dropped_full = 0     # pending 堆满被拒收的首到帧（靠 NACK 补）
         self._deliver = deliver
         self._on_gap = on_gap
         self._on_nack = on_nack
+        self._on_log = on_log or (lambda m: None)
+        self._name = str(name)
         self._lock = threading.Lock()
+        # 待交付帧 FIFO：唯一写者是各 broker 回调（持 _lock 时入队），
+        # 唯一读者是本连接的交付线程。无界：入队候选受 pending<_INGRESS_MAX
+        # 约束，且 deliver 路径全部非阻塞（put_nowait/event.set），唯一的
+        # 背压出口（wq 满）会立即 drop_connection→close→哨兵停线程。
+        self._dq = queue.Queue()
+        self._closing = False
+        t = threading.Thread(target=self._deliver_loop,
+                             name="s5-deliver-%s" % name, daemon=True)
+        t.start()
+
+    def _deliver_loop(self):
+        while True:
+            fr = self._dq.get()
+            if fr is None:
+                return
+            try:
+                self._deliver(fr)
+            except Exception as e:
+                # 单帧异常绝不能打死交付线程，否则后续字节全部滞留、顺序
+                # 与存活水位一起失真；但静默吞掉会让线上彻底黑障，必须留痕。
+                try:
+                    self._on_log("[cid=%s] 下行帧交付异常（已跳过）: %s: %s"
+                                 % (self._name, type(e).__name__, e))
+                except Exception:
+                    pass
 
     def add(self, seq: int, frame: dict) -> bool:
-        """返回 True=该 (cid,seq) 的首个副本（投递它的 broker 赢了竞速），
-        False=迟到重复副本/已熔断。供 per-broker 竞速统计用。"""
-        ready = []
+        """返回 True=该 (cid,seq) 的首个副本且已被接收（投递它的 broker 赢了
+        竞速），False=迟到重复副本/已熔断/**pending 堆满拒收**。满队拒收不
+        能算竞速胜利：帧没进缓存、没入交付队列，要靠后续 NACK 补发，计成
+        win 会让 broker 竞速胜率与实际接收量永久对不上。"""
         with self._lock:
             if self.broken:
                 return False
             seq = int(seq)
             if seq < self.next or seq in self.pending:
                 return False  # 重复副本
-            if len(self.pending) < _INGRESS_MAX:
-                self.pending[seq] = frame
+            if len(self.pending) >= _INGRESS_MAX:
+                self.dropped_full += 1
+                try:
+                    self._on_log(
+                        "[cid=%s] 下行缺口暂存已满 %d 帧，拒收 seq=%d"
+                        "（等 NACK 补发/缺口熔断）"
+                        % (self._name, _INGRESS_MAX, seq))
+                except Exception:
+                    pass
+                return False
+            self.pending[seq] = frame
+            ready = []
             while self.next in self.pending:
                 ready.append(self.pending.pop(self.next))
                 self.next += 1
@@ -932,9 +1070,22 @@ class _ConnReassembly:
                 self.deadline = None
                 self.ndeadline = None
                 self.nround = 0
-        for fr in ready:
-            self._deliver(fr)
+            # 入队必须仍在锁内：FIFO 只保证单次 put 原子，两个并发 add
+            # 若在锁外各自 put，seq=6 仍可能先于 seq=5 入队。drain 与
+            # enqueue 同临界区，队列顺序就与 next 推进严格一致。Queue 无界，
+            # put 立即返回，不增加锁持有时间。
+            if not self._closing:
+                for fr in ready:
+                    self._dq.put(fr)
         return True
+
+    def deliver_now(self, frame: dict) -> None:
+        """无 seq 兼容帧也走交付 FIFO：否则它在 broker 回调线程直接交付，
+        会与交付线程上的 seq 数据帧并发写本地 socket，绕过保序。"""
+        with self._lock:
+            if self._closing:
+                return
+            self._dq.put(frame)
 
     def check(self) -> None:
         """由会话清扫线程周期调用：到点发 NACK；硬超时才熔断。"""
@@ -971,8 +1122,14 @@ class _ConnReassembly:
 
     def close(self) -> None:
         with self._lock:
+            if self._closing:
+                return
+            self._closing = True
             self.broken = True
             self.pending.clear()
+            # 哨兵入队：已在 FIFO 里的放行帧先交付（连接已从 _conns 摘除，
+            # _deliver_by_cid 会丢弃），随后交付线程退出，不残留线程。
+            self._dq.put(None)
 
 
 class _ClientConn:
@@ -981,7 +1138,8 @@ class _ClientConn:
     __slots__ = ("cid", "desc", "wq", "opened", "open_result", "reassembly",
                  "local_sock", "closed", "remote_closed", "seq_lock",
                  "out_seq", "bytes_up", "bytes_down", "created",
-                 "ucache", "local_read_done")
+                 "ucache", "state_lock",
+                 "reader_done", "fin_close_pending")
 
     def __init__(self, cid, desc, reassembly):
         self.cid = cid
@@ -993,6 +1151,12 @@ class _ClientConn:
         self.local_sock = None
         self.closed = False
         self.remote_closed = False
+        # closed/remote_closed 生命周期状态位的唯一保护锁：_deliver（MQTT
+        # 分发线程）与 drop_connection（reader/writer/收尾线程）会并发写，
+        # writer 还要把两个标志当一对来判定 clean EOF。裸 bool 虽有 GIL
+        # 不致损坏，但组合读会撕裂——正常远端 EOF 可能被误记 local_error。
+        # seq_lock 只保护打号/缓存，语义不同，不复用。
+        self.state_lock = threading.Lock()
         self.seq_lock = threading.Lock()
         self.out_seq = 0          # 上行 per-cid seq（open=0，其后递增）
         self.bytes_up = 0
@@ -1000,8 +1164,15 @@ class _ClientConn:
         self.created = time.time()
         # 上行重传缓存：seq -> 已发完整帧（服务端 NACK 时原样重发）
         self.ucache = {}
-        # 本地读线程已退出（应用已关本地连接）：writer 发 FIN 后据此安全 close
-        self.local_read_done = threading.Event()
+        # reader_done：只由本连接的本地读线程自身在退出时 set（cid 单调
+        # 不回收，线程持 conn 对象直接置位，与条目是否已被 drop 弹出
+        # _conns 无关）；fin 收尾线程据此判断应用是否真的读完，避免
+        # "drop 已弹条目→reader finally 查字典为 None→信号永不置位→
+        # fin 死等 120s" 的互等。
+        self.reader_done = threading.Event()
+        # clean EOF 时 socket 的关闭权已移交 s5-fin 收尾线程，drop_connection
+        # 不得再直接 close（Windows 下会把接收缓冲里应用未读的数据打成 RST）
+        self.fin_close_pending = False
 
 
 class RemoteSocks5:
@@ -1055,12 +1226,37 @@ class RemoteSocks5:
         self._bhosts = frozenset()
         self._bnet_lock = threading.Lock()
         self._bulk_q = queue.Queue(maxsize=64)  # 上行大帧平滑队列
+        # NACK 补发待办（conn, seqs）：paho 回调线程只入队，由 s5-rsnd
+        # 单线程消费——补发的大帧要进 _bulk_q（满则按 0.5s 粒度反压，
+        # 64 格最坏挡数十秒），在回调线程同步等会卡死该 broker 的整条
+        # 下行 FIFO（其它 cid/hb/NACK 全部头阻塞）。
+        self._resend_q = queue.Queue(maxsize=_RESEND_Q_MAX)
         self._rt_last = {}                        # NACK 大帧补发去重 (cid,seq)->t
+        self._rt_last_prune = 0.0               # 上次清扫去重表时刻
         self.pace_intv = _PACE_START              # 当前大帧节奏（闭环热调）
-        self.hb_floor = None                      # 全 broker 实测 hb 延迟地板（含时钟偏差）
+        # hb 延迟地板：最近 _HB_FLOOR_WIN 秒内全 broker 样本的最小值。
+        # 单调 min 会被一次 NTP 步进/GC stop-the-world/OS 调度抖动钉出的
+        # 极小值永久锁死，此后 best 恒偏大、pace 单调爬到 _PACE_MAX，会话
+        # 余生被误限速。滚动窗口让异常样本 60s 后自然淘汰（多线程回调，
+        # 用专用锁保护 deque 与 min 计算）。
+        self._hb_floor_samples = deque()
+        self._hb_lock = threading.Lock()
+        self._closing = False                     # close() 幂等/防 bnet 复活
         self._pace_ok = 0                         # 连续健康轮次（恢复要慢）
         self._last_ps = 0.0                       # 上次下发 ps 指令时刻
         self._open_mono = time.monotonic()      # 会话起点（pb 热身计时用）
+
+    @property
+    def hb_floor(self):
+        """最近 _HB_FLOOR_WIN 秒 hb 延迟（ms）的滚动最小值；窗口内无样本
+        返回 None。deque 的物理淘汰只发生在收到新 hb 时（_track_broker），
+        长断网期间没有新 hb、旧样本会滞留；读取处再按当前 monotonic 过滤
+        一遍，保证"无近期 hb → 地板消失"，不依赖新样本驱动淘汰。"""
+        now = time.monotonic()
+        with self._hb_lock:
+            live = [d for t, d in self._hb_floor_samples
+                    if now - t <= _HB_FLOOR_WIN]
+            return min(live) if live else None
 
     # ---- 握手 ----
 
@@ -1140,6 +1336,8 @@ class RemoteSocks5:
                          daemon=True).start()
         threading.Thread(target=self._bulk_send_loop, name="s5-bulk",
                          daemon=True).start()
+        threading.Thread(target=self._resend_loop, name="s5-rsnd",
+                         daemon=True).start()
         # 立刻下发种子名单并建立本端 bulk 连接：竞速热身完成前大帧也只走
         # 3 条 broker，绝不回退成全 13 broker 扇出。
         try:
@@ -1162,11 +1360,21 @@ class RemoteSocks5:
     def _send(self, conn: _ClientConn, extra: dict) -> None:
         """上行帧唯一出口：per-cid 打号 + 盖 owner 后发出。
 
-        打号与 publish 在同一把 per-conn 锁内原子完成（与 PTY 的 _publish_input
-        同因）：否则读线程/收尾线程并发时序号与投递顺序不一致，服务端重组
-        会把晚到的低 seq 当真丢帧，NACK/超时后误断连接。帧副本进 per-conn
-        重传缓存，服务端上行缺口回 NACK 时原样补发（qos0 无 broker 重传）。
+        打号与入重传缓存在同一把 per-conn 锁内原子完成：序号必须连续无竞，
+        否则服务端重组把晚到低 seq 当真缺帧、NACK/超时误断连接。**实际
+        发送必须在锁外**：大帧走 _bulk_enqueue（队列满时按 0.5s 粒度反压，
+        64 格最坏要挡数十秒），主连接 publish 在 paho 内部队列紧张时也会
+        短暂阻塞；持着 seq_lock 阻塞会把同连接的 close 帧（eof_connection/
+        drop_connection）一起堵在锁外，半关延迟数十秒。锁外乱序到达无害——
+        服务端按 per-cid seq 重组，乱序只进 pending 不会错放（大帧走 bulk、
+        小帧走主连接本就是两条路，到达顺序从来不保证）。
         """
+        # extra 只允许业务键（open/d/close）：s5/cid/seq/owner 是打号与
+        # 身份字段，必须由本函数统一生成，被 extra 覆盖会拼出非法序号/身份
+        # 的帧且静默成功——编程错误，在占号之前直接抛出，不吞序号。
+        bad = [k for k in ("s5", "cid", "seq", "owner") if k in extra]
+        if bad:
+            raise ValueError("_send 的 extra 不得携带保留帧字段 %r" % bad)
         with conn.seq_lock:
             frame = {"s5": self.sid, "cid": conn.cid, "seq": conn.out_seq}
             conn.out_seq += 1
@@ -1178,10 +1386,11 @@ class RemoteSocks5:
                 for _k in sorted(conn.ucache)[:64]:
                     conn.ucache.pop(_k, None)
             _d = frame.get("d")
-            if isinstance(_d, str) and len(_d) > 2048:
-                self._bulk_enqueue(frame)    # 大帧：平滑队列→专用连接
-            else:
-                self.tr.publish(self.in_topic, frame)
+            big = isinstance(_d, str) and len(_d) > 2048
+        if big:
+            self._bulk_enqueue(frame)    # 大帧：平滑队列→专用连接
+        else:
+            self.tr.publish(self.in_topic, frame)
 
     def _send_nack(self, cid: int, seqs) -> None:
         """上行缺口重传请求（控制帧，无 seq，走全 broker）。"""
@@ -1191,6 +1400,45 @@ class RemoteSocks5:
                              "owner": self.owner, "nack": [int(s) for s in seqs]})
         except Exception:
             pass
+
+    def _resend_loop(self) -> None:
+        """NACK 补发的唯一消费线程（s5-rsnd）：把所有可能阻塞的补发动作
+        （大帧 _bulk_q 反压、publish）移出 paho 回调线程。单线程串行，
+        同一轮 NACK 列表内的补发顺序保持。"""
+        while True:
+            try:
+                item = self._resend_q.get(timeout=0.5)
+            except queue.Empty:
+                if self._end_event.is_set():
+                    return
+                continue
+            if item is None:
+                return
+            conn, seqs = item
+            # 待办排队期间连接可能已被 drop：对象虽还在，但帧发出去服务端
+            # 也会按未知 cid 丢弃，直接跳过（ucache 随 conn 对象一起回收）。
+            with self._lock:
+                alive = self._conns.get(conn.cid) is conn
+            if not alive or self._end_event.is_set():
+                continue
+            try:
+                self._resend_uplink(conn, seqs)
+            except Exception as e:
+                # 与交付线程同理：单轮补发异常不能打死消费线程
+                try:
+                    self.on_log("[cid=%s] NACK 补发异常（已跳过本轮）: %s: %s"
+                                % (conn.cid, type(e).__name__, e))
+                except Exception:
+                    pass
+            # 低频清扫补发去重表：只在超量后每 10s 扫一次，删 30s 前的键
+            now = time.monotonic()
+            if (len(self._rt_last) > _RT_LAST_MAX
+                    and now - self._rt_last_prune > _RT_LAST_PRUNE_INTV):
+                self._rt_last_prune = now
+                stale = [k for k, t in self._rt_last.items()
+                         if now - t > _RT_LAST_TTL]
+                for k in stale:
+                    self._rt_last.pop(k, None)
 
     def _resend_uplink(self, conn: _ClientConn, seqs) -> None:
         """服务端回 NACK：从上行重传缓存原样补发（seq 不变，服务端去重）。
@@ -1245,14 +1493,18 @@ class RemoteSocks5:
                 d = int(time.time() * 1000) - int(hb)
             except (TypeError, ValueError):
                 return
+            now_mono = time.monotonic()
             st["hb_n"] += 1
             st["hb_sum"] += d
             st["hb_last_ms"] = d
-            st["hb_last_t"] = time.monotonic()
-            if self.hb_floor is None:
-                self.hb_floor = d
-            elif d < self.hb_floor:
-                self.hb_floor = d
+            st["hb_last_t"] = now_mono
+            # 滚动窗口地板：淘汰 60s 前的样本，异常极小值不会永久锁死 pacing
+            with self._hb_lock:
+                self._hb_floor_samples.append((now_mono, d))
+                while (self._hb_floor_samples
+                       and now_mono - self._hb_floor_samples[0][0]
+                       > _HB_FLOOR_WIN):
+                    self._hb_floor_samples.popleft()
             st["hb_min"] = d if st["hb_min"] is None else min(st["hb_min"], d)
             st["hb_max"] = d if st["hb_max"] is None else max(st["hb_max"], d)
             srv = data.get("srv")
@@ -1296,10 +1548,21 @@ class RemoteSocks5:
             return  # 已关闭连接的迟到副本帧
         nk = data.get("nack")
         if nk is not None:
-            # 服务端上行缺口：从 per-conn 上行缓存原样补发
+            # 服务端上行缺口：补发只入待办队列，绝不在 paho 回调线程同步
+            # 执行——大帧补发进 _bulk_q 时队列满可反压数十秒，会把该
+            # broker 承载的全部会话/cid 下行（含 hb 与后续 NACK）头阻塞。
             self._track_broker(broker, data, is_new=False)
-            if isinstance(nk, (list, tuple)):
-                self._resend_uplink(conn, nk)
+            if isinstance(nk, (list, tuple)) and nk:
+                try:
+                    # 有界队列 put_nowait：多 broker 回调并发下也是严格硬
+                    # 上限（无 qsize 检查与入队之间的竞态窗口）。
+                    self._resend_q.put_nowait((conn, list(nk)))
+                except queue.Full:
+                    self.on_log("[cid=%d] NACK 补发待办已满 %d，"
+                                "丢弃本轮 %d 个待办（等下轮 NACK）"
+                                % (cid, _RESEND_Q_MAX, len(nk)))
+                except Exception:
+                    pass
             return
         seq = data.get("seq")
         if seq is not None:
@@ -1307,7 +1570,9 @@ class RemoteSocks5:
             self._track_broker(broker, data, is_new=is_new)
         else:
             self._track_broker(broker, data)
-            self._deliver(conn, data)  # 无 seq 宽松放行（兼容）
+            # 无 seq 宽松放行（兼容）：仍走该连接的交付 FIFO，不允许在
+            # broker 回调线程直接写本地 socket 而绕过保序。
+            conn.reassembly.deliver_now(data)
 
     def net_report(self) -> dict:
         """网络分析快照（JSON 可序列化）。全部来自被动观察，无额外请求：
@@ -1316,6 +1581,12 @@ class RemoteSocks5:
         系统级每 broker 连接质量（在线率/掉线/重连）用内置的
         ``transport.node.mqtt_net.stats.get_report(probe=False)``（别动它，
         probe=True 会发起主动探测产生额外流量）。
+
+        注意：这是**无锁非一致快照，仅供诊断参考**——conns 列表先在锁内
+        拷出，但各 conn 的 reassembly.next/pending/bytes 在交付线程并发
+        推进下逐字段读取，同一 cid 的 down_delivered_next 与 down_waiting
+        可能瞬时对不齐（如 next=5 而 waiting 里还看得到 4），不保证也不
+        需要事务一致性，不要据此刻画正确性判断。
         """
         with self._lock:
             conns = list(self._conns.values())
@@ -1355,6 +1626,7 @@ class RemoteSocks5:
                           {"cid": c.cid, "desc": c.desc,
                            "down_delivered_next": c.reassembly.next,
                            "down_waiting": sorted(c.reassembly.pending)[:8],
+                           "down_dropped_full": c.reassembly.dropped_full,
                            "up_next_seq": c.out_seq}
                           for c in conns]},
             "note": "hb_delay_ms 含两端时钟偏差，仅跨 broker 横向比较有"
@@ -1381,11 +1653,19 @@ class RemoteSocks5:
                 self.drop_connection(conn.cid, reason="backpressure")
             return
         if fr.get("closed"):
-            conn.remote_closed = True
+            with conn.state_lock:
+                conn.remote_closed = True
             try:
                 conn.wq.put_nowait(None)
-            except Exception:
-                pass
+            except queue.Full:
+                # close 语义绝不能丢：wq 堆满（writer 正被慢本地端 sendall
+                # 背压）时 None 投不进去，writer 排空后会永久阻塞在 get()，
+                # 连 fd/线程/条目一起泄漏。强收尾：close(local_sock) 会
+                # 打断 writer 的 sendall 使其退出（与服务端 _close_conn 对称）。
+                self.on_log("[cid=%d] 本地写队列满，closed 信号无法入队，"
+                            "强制收尾 %s" % (conn.cid, conn.desc))
+                self.drop_connection(conn.cid,
+                                     reason="close_signal_dropped")
 
     def _on_conn_gap(self, cid: int) -> None:
         self.on_log("[cid=%d] 下行 seq 缺口超过 %.1fs（NACK 多轮补发仍失败），"
@@ -1397,6 +1677,8 @@ class RemoteSocks5:
         小帧延迟的最小值（即当前最快小帧路径；时钟偏差只取 min，天然稳）。
         最快小帧都 >3s：大帧已触发账号级惩罚，节奏放慢 1.5×；持续 <1.2s：
         逐步恢复。指令 ps 随 1 字节级控制帧全 broker 上行。"""
+        if self._end_event.is_set() or self.in_topic is None:
+            return  # 会话关闭中：不再产生任何上行帧
         now = time.monotonic()
         if now - self._last_ps < 3.0:
             return
@@ -1450,9 +1732,15 @@ class RemoteSocks5:
         """按首选名单（重）建上行大帧专用连接；变化才重建，旧连接后台关闭。"""
         want = frozenset(str(h) for h in (hosts or ()))
         with self._bnet_lock:
+            # 与 close() 互斥：会话关闭中/已关闭绝不建连，否则新建的管理器
+            # 不在 close() 的清理快照里，会带着一条真实 MQTT 连接泄漏
+            # （"_bnet 复活"竞态）。
+            if self._closing or self._end_event.is_set():
+                return
             if want == self._bhosts:
                 return
             old = self._bnet
+            nn = None
             try:
                 sub = [b for b in BROKER_LIST if b[0] in want]
                 if len(sub) != len(want):
@@ -1465,6 +1753,15 @@ class RemoteSocks5:
                     nn.wait_connected(min_count=1, timeout=4.0)
                 except Exception:
                     pass
+                # wait_connected 最长阻塞 4s，期间 close() 可能已经拿走并
+                # 停掉旧 _bnet：赋值前复查，关闭中则当场掐死新连接，绝不
+                # 写回 self._bnet 造成复活。
+                if self._closing or self._end_event.is_set():
+                    try:
+                        nn.stop()
+                    except Exception:
+                        pass
+                    return
                 self._bnet = nn
                 self._bhosts = want
                 if old is not None:
@@ -1477,9 +1774,15 @@ class RemoteSocks5:
                 self.on_log("[s5] 上行大帧专用连接就绪: %s"
                             % ", ".join(sorted(want)))
             except Exception as e:
-                self._bnet = None
-                self._bhosts = frozenset()
-                self.on_log("[s5] 上行大帧专用连接建立失败，回退主连接: %r" % e)
+                # self._bnet 只在上面的成功路径整体替换，异常发生时它从未
+                # 被摘走——旧连接原样保留（若有），这里只停掉半成品 nn，
+                # 绝不能误停仍在服务大帧的活连接。
+                if nn is not None:
+                    try:
+                        nn.stop()
+                    except Exception:
+                        pass
+                self.on_log("[s5] 上行大帧专用连接建立失败，保持现有连接: %r" % e)
 
     def _bulk_publish(self, frame: dict) -> None:
         """大帧走专用连接；未就绪/异常时回退主连接全 broker。"""
@@ -1500,6 +1803,13 @@ class RemoteSocks5:
                 return
             except queue.Full:
                 pass
+        # 会话结束导致未入队：以前静默返回，发送方以为帧已进管线，线上
+        # 定位"最后几 KB 没到"时完全无线索，必须留痕（序号可对照缓存）。
+        try:
+            self.on_log("[s5] 会话结束，上行大帧未入平滑队列而丢弃: cid=%s seq=%s"
+                        % (frame.get("cid"), frame.get("seq")))
+        except Exception:
+            pass
 
     def _bulk_send_loop(self) -> None:
         last = 0.0
@@ -1606,13 +1916,17 @@ class RemoteSocks5:
                     lambda fr, c=cid: self._deliver_by_cid(c, fr),
                     lambda c=cid: self._on_conn_gap(c),
                     lambda seqs, c=cid: self._send_nack(c, seqs),
-                    gap=self.gap_timeout))
+                    gap=self.gap_timeout, name=str(cid),
+                    on_log=self.on_log))
             self._conns[cid] = conn
         try:
             self._send(conn, {"open": {"host": str(host), "port": int(port)}})
         except Exception:
             with self._lock:
                 self._conns.pop(cid, None)
+            # 发送已移到 seq_lock 外：失败回滚时必须停掉交付线程，否则它
+            # 永久阻塞在空 FIFO 上（daemon 不挡退出，但每条失败连接漏一个）。
+            conn.reassembly.close()
             raise
         return cid
 
@@ -1638,7 +1952,11 @@ class RemoteSocks5:
     def send_data(self, cid: int, data: bytes) -> None:
         with self._lock:
             conn = self._conns.get(cid)
-        if conn is None or conn.closed:
+        if conn is None:
+            raise RemoteError("连接已关闭")
+        with conn.state_lock:
+            closed = conn.closed
+        if closed:
             raise RemoteError("连接已关闭")
         conn.bytes_up += len(data)
         self._send(conn, {"d": bytes_to_wire(bytes(data))})
@@ -1648,7 +1966,11 @@ class RemoteSocks5:
         目标剩余响应照常经下行回传（HTTP POST 等场景必须半关）。"""
         with self._lock:
             conn = self._conns.get(cid)
-        if conn is None or conn.closed:
+        if conn is None:
+            return
+        with conn.state_lock:
+            closed = conn.closed
+        if closed:
             return
         try:
             self._send(conn, {"close": True})
@@ -1661,21 +1983,27 @@ class RemoteSocks5:
             conn = self._conns.pop(cid, None)
         if conn is None:
             return
-        conn.closed = True
+        # closed 置位与 remote_closed 快照必须原子：与 _deliver 的远端
+        # closed 帧同瞬到达时，据此一致决定要不要补发上行 close，writer
+        # 也据此对 clean EOF / local_error 做不撕裂的判定。
+        with conn.state_lock:
+            conn.closed = True
+            remote_closed = conn.remote_closed
         conn.reassembly.close()
-        conn.local_read_done.set()
         self.total_bytes_up += conn.bytes_up
         self.total_bytes_down += conn.bytes_down
         try:
             conn.wq.put_nowait(None)
         except Exception:
             pass
-        if conn.local_sock is not None:
+        # clean EOF 的 socket 归 s5-fin 线程按"应用读完/grace"节奏关，这里
+        # 直接 close 会在 Windows 上把未读数据打成 RST
+        if conn.local_sock is not None and not conn.fin_close_pending:
             try:
                 conn.local_sock.close()
             except Exception:
                 pass
-        if not self.ended and not conn.remote_closed:
+        if not self.ended and not remote_closed:
             try:
                 self._send(conn, {"close": True})
             except Exception:
@@ -1694,21 +2022,39 @@ class RemoteSocks5:
         return self._end_event.wait(timeout)
 
     def close(self) -> None:
-        """断开会话：通知服务端停止、退订、关掉所有本地连接；不停 transport。"""
-        if self.sid is not None and not self.ended:
+        """断开会话：通知服务端停止、退订、关掉所有本地连接；不停 transport。
+
+        顺序关键：必须**先**置结束位再做任何清理，最后才清会话身份。旧顺序
+        先干活、末尾才清 sid，而服务端不回 end（UDP 式 qos0 丢包/1.5s 超时）
+        时 _end_event 永远不置位——sweep/pb/bulk 线程与 open() 异步拉起的
+        _ensure_bnet 全程活着：会继续 publish（sid 清空后拼出垃圾帧），还
+        可能在 bnet 已 stop 之后新建并写回 _bnet（真实 MQTT 连接无人停）。
+        """
+        if self._closing:
+            return
+        self._closing = True
+        # 1. 先停本地所有循环：sweep/pb/bulk/ensure 立即不再产生帧与新连接
+        self._end_event.set()
+        # 2. best-effort 通知服务端停止（此刻 sid/topic 仍在，帧合法）；
+        #    不阻塞等待 end 回包：本地资源回收不依赖服务端确认，它收不到
+        #    stop 也有 TTL 兜底。
+        sid, in_topic, owner = self.sid, self.in_topic, self.owner
+        if sid is not None and in_topic is not None:
             try:
-                self.tr.publish(self.in_topic,
-                                {"s5": self.sid, "stop": True,
-                                 "owner": self.owner})
+                self.tr.publish(in_topic,
+                                {"s5": sid, "stop": True, "owner": owner})
             except Exception:
                 pass
-            self._end_event.wait(1.5)
+        # 3. 退订：杜绝收尾期间又有下行帧进来触发收尾/日志
         if self._handler is not None and self.out_topic is not None:
             try:
                 self.tr.stream_unsubscribe(self.out_topic, self._handler)
             except Exception:
                 pass
+        # 4. 关全部本地连接（ended=True，drop 不再补发上行 close 垃圾帧）
         self.abort_all()
+        # 5. 排空大帧队列并投哨兵停 bulk 发送线程；NACK 补发队列同样
+        #    排空+哨兵，避免 s5-rsnd 持着已关闭会话的待办空转
         try:
             while True:
                 self._bulk_q.get_nowait()
@@ -1718,16 +2064,31 @@ class RemoteSocks5:
             self._bulk_q.put_nowait(None)
         except Exception:
             pass
-        if self._bnet is not None:
-            _bn = self._bnet
+        try:
+            while True:
+                self._resend_q.get_nowait()
+        except Exception:
+            pass
+        try:
+            self._resend_q.put_nowait(None)
+        except Exception:
+            pass
+        # 6. 停 bulk 管理器：持 _bnet_lock 停，与 _ensure_bnet 互斥，杜绝
+        #    "已 stop 又被异步线程重建"的复活泄漏
+        with self._bnet_lock:
+            bn = self._bnet
             self._bnet = None
             self._bhosts = frozenset()
+        if bn is not None:
             try:
-                _bn.stop()
+                bn.stop()
             except Exception:
                 pass
+        # 7. 最后清会话身份：任何漏网路径也拼不出带本会话 sid 的帧
         self.sid = None
         self.owner = None
+        self.in_topic = None
+        self.out_topic = None
 
 
 # ============================ 本地 SOCKS5 监听服务 ============================
@@ -1851,6 +2212,19 @@ class _Socks5Server:
         except Exception as exc:
             self.on_log("[s5] 本地连接处理异常: %s: %s"
                         % (type(exc).__name__, exc))
+            # 泵送阶段的非预期异常：reader 自身已对已知错误收尾，这里是最后
+            # 一道保险（防止未来新增逃逸路径让 conn/writer/fd 静默泄漏）。
+            # fin 已接管 socket（clean EOF）时不抢关：reader_done 已置位，
+            # fin 线程会自己立刻 close。
+            if entered_pump and cid is not None:
+                try:
+                    with self.session._lock:
+                        cc = self.session._conns.get(cid)
+                    if cc is not None and not cc.fin_close_pending:
+                        self.session.drop_connection(
+                            cid, reason="handle_fatal")
+                except Exception:
+                    pass
         finally:
             if not entered_pump:
                 if cid is not None:
@@ -1864,6 +2238,10 @@ class _Socks5Server:
         """本地 socket -> 上行帧。EOF 时发 in-seq close（半关），连接其余
         收尾由 writer 收到远端 closed 后完成；本地读出错则整条连接收尾。"""
         sess = self.session
+        # 入口即持有本连接对象：cid 单调不回收，之后即便条目被 drop 弹出
+        # _conns，本线程的信号/状态也必须落到自己的 conn 上，不能再查字典。
+        with sess._lock:
+            own = sess._conns.get(cid)
         try:
             while not sess.ended:
                 data = csock.recv(sess.frame_max)
@@ -1872,18 +2250,29 @@ class _Socks5Server:
                     return
                 sess.send_data(cid, data)
         except (ConnectionError, OSError, RemoteError):
-            with sess._lock:
-                conn = sess._conns.get(cid)
-            if conn is not None and conn.remote_closed:
-                # csock 是 writer 在远端 closed 后主动关的，收尾归 writer
-                return
+            if own is not None:
+                with own.state_lock:
+                    remote_closed = own.remote_closed
+                if remote_closed:
+                    # csock 是 writer/fin 在远端 closed 后主动 shutdown/close
+                    # 的，收尾归它们，这里只退出
+                    return
             sess.drop_connection(cid, reason="local_error")
+        except Exception:
+            # 网络三异常以外的非预期错误（库内部 RuntimeError/MemoryError
+            # 等）：正常路径不会走到。不兜住的话异常只冒泡到 _handle 记一行
+            # 日志，而 entered_pump 后 _handle 不关 csock、writer 永远阻塞
+            # 在 wq.get()——fd、conn 条目、writer 线程全部静默泄漏。
+            try:
+                sess.drop_connection(cid, reason="reader_fatal")
+            except Exception:
+                pass
         finally:
-            # 读线程退出 = 应用端已关闭（FIN/RST 已到），writer 可安全回收
-            with sess._lock:
-                conn = sess._conns.get(cid)
-            if conn is not None:
-                conn.local_read_done.set()
+            # 读线程退出 = 应用端已关闭（FIN/RST 已到），fin 可安全 close
+            # fd。必须无条件置位：clean EOF 时 drop_connection 已先于应用
+            # 关闭把条目弹出 _conns，靠字典回查会让 fin 白等 120s grace。
+            if own is not None:
+                own.reader_done.set()
 
     def _local_writer(self, cid: int, csock: socket.socket) -> None:
         """下行帧 -> 本地 socket。收到 None（远端 closed 或本地收尾）即结束；
@@ -1894,34 +2283,70 @@ class _Socks5Server:
         if conn is None:
             return
         clean = False
+        already_closed = False
         try:
             while True:
                 item = conn.wq.get()
                 if item is None:
-                    # 区分：远端 EOF（clean）还是 drop_connection 强收尾
-                    clean = conn.remote_closed and not conn.closed
+                    # 区分：远端 EOF（clean）还是 drop_connection 强收尾。
+                    # 两个标志必须在同一把锁内成对快照，否则 None 入队与
+                    # drop 同瞬发生时，正常远端 EOF 会被误判成 local_error。
+                    with conn.state_lock:
+                        already_closed = conn.closed
+                        clean = conn.remote_closed and not already_closed
                     break
                 csock.sendall(item)
         except (ConnectionError, OSError):
             clean = False
+            with conn.state_lock:
+                already_closed = conn.closed
         if clean:
             # 远端半关：只 shutdown 写方向给应用发 FIN，绝不能直接 close()——
             # Windows 下 socket 接收缓冲里还有应用未读完的数据时，close()
             # 会直接发 RST，把已完整送达的下载/响应在应用侧打成连接重置。
-            # 等读线程（应用关闭后）退出再 close，fd 由 drop_connection 回收。
             try:
                 csock.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
-            conn.local_read_done.wait(120.0)
-        try:
-            csock.close()
-        except Exception:
-            pass
-        if clean:
+            # socket 最终 close 权移交专职 fin 线程：它等本地读线程退出
+            # （应用读完）或 grace 上限；会话被 abort 时 0.5s 内兜底关 fd。
+            # 会话侧资源（_conns 条目/重组/缓存/统计）则**立即**回收，
+            # writer 线程不再为一个只读长连接白挂 120s。
+            conn.fin_close_pending = True
+
+            def _fin_close(_c=conn, _s=csock):
+                deadline = time.monotonic() + _FIN_CLOSE_GRACE
+                while not sess.ended:
+                    remain = deadline - time.monotonic()
+                    if remain <= 0:
+                        break
+                    if _c.reader_done.wait(min(0.5, remain)):
+                        break
+                if not _c.reader_done.is_set():
+                    # 走到这里说明 reader 仍阻塞在 recv（应用拖着写端不关，
+                    # 或会话 abort）。Windows 上另一线程 close() 叫不醒阻塞
+                    # 的 recv（fd 被一直占着），必须先 shutdown 双向：recv
+                    # 随即返回 EOF/异常，reader 退出并置 reader_done。
+                    # 连接条目此时已被 drop 弹出，reader 的 eof/drop 均 no-op。
+                    try:
+                        _s.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                try:
+                    _s.close()
+                except Exception:
+                    pass
+
+            threading.Thread(target=_fin_close,
+                             name="s5-fin-%d" % cid, daemon=True).start()
             sess.drop_connection(cid, reason="remote_closed")
-        elif not conn.closed:
-            sess.drop_connection(cid, reason="local_error")
+        else:
+            try:
+                csock.close()
+            except Exception:
+                pass
+            if not already_closed:
+                sess.drop_connection(cid, reason="local_error")
 
 
 # ============================ CLI ============================

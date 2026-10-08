@@ -51,6 +51,23 @@ class RunAsyncTests(unittest.TestCase):
         posted[0]()
         self.assertEqual(seen["value"], 42)
 
+    def test_repeat_every_posts_on_main_and_stops(self):
+        # 长任务心跳：周期回调经 _post 投递主线程；stop() 后不再发。
+        posted = []
+        ticks = []
+        with mock.patch.object(pyui_kit, "_post", lambda fn: posted.append(fn)):
+            stop = pyui_kit.repeat_every(0.2, lambda: ticks.append(1))
+            threading.Event().wait(0.55)
+            stop()
+            count_after_stop = len(posted)
+            for fn in posted[:]:
+                fn()  # 护栏回调执行不应抛
+            threading.Event().wait(0.35)
+        self.assertGreaterEqual(count_after_stop, 1)
+        self.assertLessEqual(count_after_stop, 3)
+        self.assertEqual(len(posted), count_after_stop)
+        self.assertEqual(len(ticks), count_after_stop)
+
     def test_guarded_swallows_every_exception_including_base_exception(self):
         # JVM 回调边界铁律：feature 回调任何异常都不能穿透到 Android 主线程。
         def fail_hard():
