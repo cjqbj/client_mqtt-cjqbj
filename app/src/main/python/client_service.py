@@ -897,6 +897,10 @@ def _health_defaults(selected):
         "device_id": selected.get("id") or selected.get("request_topic"),
         "topic": selected.get("request_topic", "unknown"),
         "inflight_count": 0,
+        # 在飞请求租约绝对时间戳（ms）。并发请求时取最远到期时间；
+        # target_health 发现租约已过而计数没归零（线程被杀/异常漏记），
+        # 一律按 0 处理 —— UI 永远不会被一次卡死的调用永久钉在 checking。
+        "inflight_until_ms": 0,
         # 专用探针（在线判定唯一依据）
         "last_probe_at_ms": 0,
         "last_probe_ok": None,
@@ -912,11 +916,28 @@ def _health_defaults(selected):
     }
 
 
+# 给在飞请求的宽限：声明超时之外再给 12s 传输/收尾余量，
+# 超过仍未 end 的调用按泄漏处理（极端 MQTT 卡死也不拖死在线状态）。
+_INFLIGHT_GRACE_MS = 12_000
+
+
 def target_health(device_ref=None):
     selected = _device_config(device_ref)
     key = selected.get("id") or selected["request_topic"]
+    now = int(time.time() * 1000)
     with _STATE["lock"]:
-        health = dict(_STATE.get("rpc_health", {}).get(key, {}))
+        stored = _STATE.get("rpc_health", {}).get(key)
+        health = dict(stored) if isinstance(stored, dict) else {}
+        # 租约过期自愈：计数若没被 end 归零，这里强制归零并清租约，
+        # 避免"探针早超时了，顶栏永远 checking"。
+        inflight = int(health.get("inflight_count", 0) or 0)
+        lease_until = int(health.get("inflight_until_ms", 0) or 0)
+        if inflight > 0 and lease_until and now >= lease_until:
+            health["inflight_count"] = 0
+            health["inflight_until_ms"] = 0
+            if isinstance(stored, dict):
+                stored["inflight_count"] = 0
+                stored["inflight_until_ms"] = 0
     defaults = _health_defaults(selected)
     defaults.update(health)
     defaults["device_id"] = key
@@ -936,15 +957,23 @@ def _health_entry(selected):
     return health
 
 
-def _record_request_start(selected):
+def _record_request_start(selected, timeout_seconds=10):
     if not selected:
         return
     key = selected.get("id") or selected.get("request_topic")
     if not key:
         return
+    now = int(time.time() * 1000)
+    try:
+        lease_seconds = max(1.0, float(timeout_seconds or 10))
+    except (TypeError, ValueError):
+        lease_seconds = 10.0
+    lease_until = now + int(lease_seconds * 1000) + _INFLIGHT_GRACE_MS
     with _STATE["lock"]:
         health = _health_entry(selected)
         health["inflight_count"] = health.get("inflight_count", 0) + 1
+        # 并发请求取最远到期时间；任一请求泄漏，租约一过整体自愈。
+        health["inflight_until_ms"] = max(health.get("inflight_until_ms", 0), lease_until)
 
 
 def _record_request_end(selected, kind, ok, error=""):
@@ -957,7 +986,10 @@ def _record_request_end(selected, kind, ok, error=""):
     now = int(time.time() * 1000)
     with _STATE["lock"]:
         health = _health_entry(selected)
-        health["inflight_count"] = max(0, health.get("inflight_count", 0) - 1)
+        remaining = max(0, health.get("inflight_count", 0) - 1)
+        health["inflight_count"] = remaining
+        if remaining == 0:
+            health["inflight_until_ms"] = 0
         health[f"last_{kind}_at_ms"] = now
         health[f"last_{kind}_ok"] = bool(ok)
         health[f"last_{kind}_error"] = str(error or "")[:300]
@@ -1022,7 +1054,7 @@ def probe_online(device=None, timeout=PROBE_TIMEOUT, topic=None):
         "error": "",
         "raw": None,
     }
-    _record_request_start(selected)
+    _record_request_start(selected, effective_timeout)
     started = time.perf_counter()
     try:
         mqtt_client = _mqtt_client_module()
@@ -1245,13 +1277,13 @@ def rpc(code, device=None, timeout=None):
     effective_timeout = None
     try:
         selected = _device_config(device)
-        _record_request_start(selected)
         if timeout is None:
             timeout = float(selected.get("timeout", 10))
         effective_timeout = min(
             max(float(timeout), _RPC_TIMEOUT_MIN), _RPC_TIMEOUT_MAX
         )
         timeout = effective_timeout
+        _record_request_start(selected, effective_timeout)
         topic = selected["request_topic"]
         private_key = selected.get("private_key") or None
         key_kind = _private_key_kind(private_key)
@@ -1401,6 +1433,136 @@ def online(device=None):
     不再走吃设备长超时的业务 rpc()。返回与历史调用方兼容的 {ok, result}。"""
     result = probe_online(device)
     return json.dumps({"ok": bool(result.get("ok")), "result": result}, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# 远程 feature 目录扫描
+#
+# 本地 feature 列表本来就由 bootstrap 按目录自动发现（feature_catalog），
+# "刷新本地"没有意义；设置页的 Refresh 要的是【目标端】有哪些 feature 文件。
+# 下面这段代码在目标端自包含执行（裸 multi_mqtt 也能跑，不 import bootstrap）：
+# 1) 由 multi_mqtt 包位置反推出 AssetFinder/app 内置目录；
+# 2) 加上内/外部 py_updates 热更目录；
+# 3) ast 静态解析 FEATURE manifest（不 import，避免副作用），
+#    同名文件 py_updates 遮蔽 builtin。
+# 末行必须是给 r 赋值的表达式（rpc 执行器按 r 回传）。
+# ---------------------------------------------------------------------------
+REMOTE_FEATURE_SCAN_CODE = r'''
+import ast, glob, json, os, sys
+candidate_dirs, seen_dirs = [], set()
+def _add_dir(d):
+    if not d:
+        return
+    d = os.path.abspath(str(d))
+    if d not in seen_dirs and os.path.isdir(d):
+        seen_dirs.add(d)
+        candidate_dirs.append(d)
+app_dir = ""
+try:
+    import multi_mqtt
+    # multi_mqtt 是无 __init__.py 的命名空间包，__file__ 为 None，
+    # 必须用 __path__（普通包则退回 __file__）。
+    _pkg_paths = [str(p) for p in (getattr(multi_mqtt, "__path__", None) or []) if p]
+    if not _pkg_paths and getattr(multi_mqtt, "__file__", None):
+        _pkg_paths = [os.path.dirname(os.path.abspath(multi_mqtt.__file__))]
+    if _pkg_paths:
+        app_dir = os.path.dirname(os.path.abspath(_pkg_paths[0]))
+        _add_dir(app_dir)
+except Exception:
+    pass
+for _p in list(sys.path):
+    if _p and os.path.isfile(os.path.join(_p, "multi_mqtt", "rpc_executor.py")):
+        _add_dir(os.path.abspath(_p))
+_add_dir("/sdcard/apm/client_mqtt/py_updates")
+if app_dir:
+    _parts = app_dir.split(os.sep)
+    if "chaquopy" in _parts:
+        _i = len(_parts) - 1 - _parts[::-1].index("chaquopy")
+        _files_dir = os.sep.join(_parts[:_i])
+        if _files_dir:
+            _add_dir(os.path.join(_files_dir, "client_mqtt", "py_updates"))
+for _p in os.environ.get("QGB_EXTRA_FEATURE_DIRS", "").split(os.pathsep):
+    _add_dir(_p)
+def _manifest(path):
+    info = {"version": None, "actions": [], "icon": "", "ui": "", "title": "", "error": ""}
+    try:
+        with open(path, "r", encoding="utf-8") as _f:
+            _tree = ast.parse(_f.read(), path)
+        for _node in _tree.body:
+            if isinstance(_node, ast.Assign):
+                for _t in _node.targets:
+                    if isinstance(_t, ast.Name) and _t.id == "FEATURE":
+                        _data = ast.literal_eval(_node.value)
+                        if isinstance(_data, dict):
+                            info["version"] = _data.get("version")
+                            info["actions"] = [str(a) for a in (_data.get("actions") or [])]
+                            info["icon"] = str(_data.get("icon") or "")
+                            info["ui"] = str(_data.get("ui") or "")
+                            info["title"] = str(_data.get("title") or "")
+    except Exception as _e:
+        info["error"] = "%s: %s" % (type(_e).__name__, _e)
+    return info
+_features = {}
+for _d in candidate_dirs:
+    _source = "py_updates" if os.path.basename(_d.rstrip(os.sep)) == "py_updates" else "builtin"
+    for _path in sorted(glob.glob(os.path.join(_d, "feature_*.py"))):
+        _name = os.path.basename(_path)[8:-3]
+        if not _name.isidentifier():
+            continue
+        _st = os.stat(_path)
+        _loc = {"dir": _d, "source": _source, "file": _path,
+                "size": int(_st.st_size), "mtime_ms": int(_st.st_mtime * 1000)}
+        _loc.update(_manifest(_path))
+        _features.setdefault(_name, {"name": _name, "sources": []})["sources"].append(_loc)
+for _name, _entry in _features.items():
+    _entry["active"] = next(
+        (s for s in _entry["sources"] if s["source"] == "py_updates"),
+        _entry["sources"][0],
+    )
+r = json.dumps({"ok": True, "candidate_dirs": candidate_dirs,
+                "features": [_features[k] for k in sorted(_features)]}, ensure_ascii=False)
+'''.lstrip()
+
+
+def remote_feature_catalog(device=None, timeout=10):
+    """扫描【当前选中目标】上的 feature_*.py（内置 AssetFinder + py_updates）。
+
+    返回 JSON：{ok, topic, elapsed_ms, candidate_dirs, features:[
+      {name, active:{source,dir,file,version,actions,icon,ui,title,error}, sources:[...]}, ...
+    ]}。目标离线/超时时 ok=False 并带 error，UI 直接呈现，不拿本地列表冒充。
+    """
+    try:
+        effective_timeout = min(max(float(timeout or 10), 1.0), 60.0)
+    except (TypeError, ValueError):
+        effective_timeout = 10.0
+    result = rpc(REMOTE_FEATURE_SCAN_CODE, device, timeout=effective_timeout)
+    topic = result.get("topic") if isinstance(result, dict) else None
+    elapsed = result.get("elapsed_ms") if isinstance(result, dict) else None
+    if not isinstance(result, dict):
+        return json.dumps({"ok": False, "topic": topic, "error": "no RPC response"},
+                          ensure_ascii=False)
+    if result.get("r") is None:
+        return json.dumps(
+            {"ok": False, "topic": topic, "elapsed_ms": elapsed,
+             "error": result.get("error") or "no result (target offline?)",
+             "broker_states": result.get("broker_states")},
+            ensure_ascii=False,
+        )
+    try:
+        payload = json.loads(result["r"])
+    except (TypeError, ValueError) as error:
+        return json.dumps(
+            {"ok": False, "topic": topic, "elapsed_ms": elapsed,
+             "error": "bad remote catalog JSON: %s" % error, "raw": str(result.get("r"))[:500]},
+            ensure_ascii=False,
+        )
+    if not isinstance(payload, dict):
+        return json.dumps({"ok": False, "topic": topic, "error": "remote payload is not an object"},
+                          ensure_ascii=False)
+    payload["ok"] = True
+    payload["topic"] = topic
+    payload["elapsed_ms"] = elapsed
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _set_aliyun_config(config):

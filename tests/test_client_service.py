@@ -1,5 +1,6 @@
 import ast
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -344,6 +345,118 @@ class ClientServiceTests(unittest.TestCase):
         health = json.loads(client_service.target_health())
         self.assertFalse(health["last_probe_ok"])
         self.assertEqual(health["inflight_count"], 0)
+
+    def _init_k12(self, files_dir):
+        client_service.initialize(files_dir)
+        client_service.update_device_settings("sys/device/request", {
+            "request_topic": "sys/device/k12",
+            "response_topic": "sys/device/response",
+        })
+        # 健康表按设备 uuid id 建档（不是 request_topic）。
+        selected = client_service._device_config(None)
+        return selected, selected.get("id") or selected["request_topic"]
+
+    def test_stale_inflight_lease_self_heals_to_zero(self):
+        # 复现"probe 已超时但 UI 卡 checking"：计数泄漏为 1 且租约已过期，
+        # target_health 必须就地把 count/lease 归零。
+        with tempfile.TemporaryDirectory() as files_dir:
+            selected, key = self._init_k12(files_dir)
+            try:
+                stored = client_service._health_entry(selected)
+                stored["inflight_count"] = 1
+                stored["inflight_until_ms"] = int(client_service.time.time() * 1000) - 1
+                health = json.loads(client_service.target_health())
+                self.assertEqual(health["inflight_count"], 0)
+                self.assertEqual(health["inflight_until_ms"], 0)
+                self.assertEqual(stored["inflight_count"], 0)
+                self.assertEqual(stored["inflight_until_ms"], 0)
+            finally:
+                client_service._STATE["rpc_health"].pop(key, None)
+
+    def test_fresh_inflight_lease_stays_during_request_and_clears_on_end(self):
+        with tempfile.TemporaryDirectory() as files_dir:
+            selected, key = self._init_k12(files_dir)
+            try:
+                client_service._record_request_start(selected, timeout_seconds=2)
+                health = json.loads(client_service.target_health())
+                self.assertEqual(health["inflight_count"], 1)
+                self.assertGreater(health["inflight_until_ms"],
+                                   int(client_service.time.time() * 1000))
+                client_service._record_request_end(selected, "probe", True)
+                health = json.loads(client_service.target_health())
+                self.assertEqual(health["inflight_count"], 0)
+                self.assertEqual(health["inflight_until_ms"], 0)
+            finally:
+                client_service._STATE["rpc_health"].pop(key, None)
+
+    def test_remote_feature_catalog_success(self):
+        remote_payload = json.dumps({
+            "ok": True,
+            "candidate_dirs": ["/asset/app", "/sdcard/apm/client_mqtt/py_updates"],
+            "features": [
+                {"name": "repl", "active": {"source": "py_updates", "dir": "/upd",
+                                            "file": "feature_repl.py", "version": 9,
+                                            "actions": ["eval"], "ui": "python"},
+                 "sources": [{"source": "builtin"}, {"source": "py_updates"}]},
+            ],
+        })
+        with mock.patch.object(client_service, "rpc",
+                               return_value={"r": remote_payload, "topic": "sys/device/k12",
+                                             "elapsed_ms": 42}):
+            result = json.loads(client_service.remote_feature_catalog())
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["topic"], "sys/device/k12")
+        self.assertEqual(result["elapsed_ms"], 42)
+        self.assertEqual(len(result["candidate_dirs"]), 2)
+        self.assertEqual(result["features"][0]["name"], "repl")
+        self.assertEqual(result["features"][0]["active"]["source"], "py_updates")
+
+    def test_remote_feature_catalog_timeout_returns_error_not_local_list(self):
+        with mock.patch.object(client_service, "rpc",
+                               return_value={"r": None, "topic": "sys/device/k12",
+                                             "elapsed_ms": 2000, "error": "RPC timeout"}):
+            result = json.loads(client_service.remote_feature_catalog())
+        self.assertFalse(result["ok"])
+        self.assertIn("RPC timeout", result["error"])
+        self.assertNotIn("features", result)
+
+    def test_remote_feature_catalog_bad_json(self):
+        with mock.patch.object(client_service, "rpc",
+                               return_value={"r": "not-json{{", "topic": "t"}):
+            result = json.loads(client_service.remote_feature_catalog())
+        self.assertFalse(result["ok"])
+        self.assertIn("bad remote catalog JSON", result["error"])
+
+    def test_remote_scan_code_runs_standalone_and_shadows_builtin(self):
+        # 目标端脚本必须自包含可 exec：在临时 py_updates 放覆盖版 repl +
+        # 新 feature，断言发现、遮蔽与元数据解析。
+        tmp_root = tempfile.mkdtemp()
+        updates_dir = os.path.join(tmp_root, "py_updates")
+        os.makedirs(updates_dir)
+        with open(os.path.join(updates_dir, "feature_repl.py"), "w", encoding="utf-8") as handle:
+            handle.write("FEATURE = {'version': 9999, 'actions': ['eval'], 'ui': 'python'}\n")
+        with open(os.path.join(updates_dir, "feature_tempone.py"), "w", encoding="utf-8") as handle:
+            handle.write("FEATURE = {'version': 1, 'actions': ['run'], 'ui': 'compose'}\n")
+        previous_env = os.environ.get("QGB_EXTRA_FEATURE_DIRS")
+        os.environ["QGB_EXTRA_FEATURE_DIRS"] = updates_dir
+        try:
+            namespace = {"__name__": "<rpc>"}
+            exec(compile(client_service.REMOTE_FEATURE_SCAN_CODE, "<remote_scan>", "exec"),
+                 namespace)
+            payload = json.loads(namespace["r"])
+        finally:
+            if previous_env is None:
+                os.environ.pop("QGB_EXTRA_FEATURE_DIRS", None)
+            else:
+                os.environ["QGB_EXTRA_FEATURE_DIRS"] = previous_env
+        self.assertTrue(payload["ok"])
+        names = {item["name"] for item in payload["features"]}
+        self.assertIn("repl", names)
+        self.assertIn("tempone", names)
+        repl = next(item for item in payload["features"] if item["name"] == "repl")
+        self.assertEqual(repl["active"]["source"], "py_updates")
+        self.assertEqual(repl["active"]["version"], 9999)
+        self.assertGreaterEqual(len(repl["sources"]), 2)
 
     def test_rpc_success_log_shows_request_source_and_response_metadata(self):
         previous_state = client_service._STATE.copy()

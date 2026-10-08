@@ -124,6 +124,20 @@ private data class FeatureDescriptor(
     val error: String? = null
 )
 
+// 设置页"目标端 feature 列表"的一行：由远程扫描 RPC 返回。
+private data class RemoteFeatureEntry(
+    val name: String,
+    val title: String,
+    val actions: List<String>,
+    val version: String,
+    // 生效版本来源：builtin（AssetFinder 内置）/ py_updates（热更遮蔽）。
+    val source: String,
+    val dir: String,
+    // 同名文件同时存在于内置目录和 py_updates。
+    val shadowed: Boolean,
+    val error: String? = null
+)
+
 private fun featureIcon(feature: FeatureDescriptor) = when (feature.icon?.lowercase()) {
     "folder", "files", "file", "directory" -> Icons.Outlined.Folder
     "camera", "photo", "image" -> Icons.Outlined.CameraAlt
@@ -338,14 +352,16 @@ private fun ClientMqttScreen() {
             val lastProbeAt = health.optLong("last_probe_at_ms", 0)
             val inFlight = health.optInt("inflight_count", 0)
             val lastProbeOk = health.optBoolean("last_probe_ok", false)
+            // 在飞只作为后缀修饰，绝不覆盖已有结论：探针超时/异常结束后
+            // 必须落回 offline，而不是被计数钉死在 checking。
+            val suffix = if (inFlight > 0) " · checking" else ""
             onlineStatus = when {
-                inFlight > 0 -> "checking"
                 lastProbeAt == 0L && !onlineProbeEnabled -> "probe disabled"
                 lastProbeAt == 0L -> "checking"
                 lastProbeOk && !onlineProbeEnabled -> "online · probe disabled"
                 !lastProbeOk && !onlineProbeEnabled -> "offline · probe disabled"
-                lastProbeOk -> "online"
-                else -> "offline"
+                lastProbeOk -> "online$suffix"
+                else -> "offline$suffix"
             }
 
             val probeDue = lastProbeAt == 0L || System.currentTimeMillis() - lastProbeAt >= onlineProbeInterval * 1_000L
@@ -689,6 +705,7 @@ private fun ClientMqttScreen() {
                     settings -> Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
                         SettingsPage(
                             modifier = Modifier.padding(padding),
+                            selectedTopic = selectedTopic,
                             onBack = { settings = false },
                             onPermissions = { permissions = true },
                             // 设置页"刷新列表"/下载完成后立刻重扫 catalog，
@@ -1097,6 +1114,7 @@ private fun TargetSettingsPage(
 @Composable
 private fun SettingsPage(
     modifier: Modifier = Modifier,
+    selectedTopic: String,
     onBack: () -> Unit,
     onPermissions: () -> Unit,
     onRefreshFeatureList: () -> Unit
@@ -1123,6 +1141,11 @@ private fun SettingsPage(
     // 实际扫描到的 feature 全量列表（内置 + py_updates，含加载失败条目）。
     var featureList by remember { mutableStateOf(listOf<FeatureDescriptor>()) }
     var featureListBusy by remember { mutableStateOf(false) }
+    // 远程目标扫描出的 feature 列表（Refresh 按钮打的是目标端，不是本机）。
+    var remoteFeatures by remember { mutableStateOf(listOf<RemoteFeatureEntry>()) }
+    var remoteBusy by remember { mutableStateOf(false) }
+    var remoteStatus by remember { mutableStateOf("") }
+    var remoteOk by remember { mutableStateOf(false) }
     // feature 下载根 URL：Python 端有默认值（ghfast 代理 GitHub main），
     // 加载完成前输入框显示占位，绝不能把空串回写覆盖默认配置。
     var featureUrlRoot by remember { mutableStateOf("") }
@@ -1193,6 +1216,72 @@ private fun SettingsPage(
             featureList = parseFeatureCatalog(raw)
         }
     }
+
+    // 扫描【远程目标】的 feature 文件（内置 AssetFinder + 目标端 py_updates）。
+    // 本机列表自动发现、无需手刷；这里的 Refresh 专门问目标端要清单。
+    fun parseRemoteCatalog(raw: String): List<RemoteFeatureEntry> {
+        val payload = JSONObject(raw)
+        val array = payload.optJSONArray("features") ?: return emptyList()
+        return buildList {
+            for (index in 0 until array.length()) {
+                val item = array.optJSONObject(index) ?: continue
+                val name = item.optString("name")
+                if (name.isBlank()) continue
+                val sources = item.optJSONArray("sources")
+                val active = item.optJSONObject("active") ?: JSONObject()
+                val title = active.optString("title").ifBlank {
+                    name.replaceFirstChar { it.uppercase() }
+                }
+                val actionsArray = active.optJSONArray("actions") ?: org.json.JSONArray()
+                add(RemoteFeatureEntry(
+                    name = name,
+                    title = title,
+                    actions = buildList {
+                        for (actionIndex in 0 until actionsArray.length()) {
+                            add(actionsArray.optString(actionIndex))
+                        }
+                    },
+                    version = active.opt("version")?.toString().orEmpty(),
+                    source = active.optString("source").ifBlank { "unknown" },
+                    dir = active.optString("dir"),
+                    shadowed = (sources?.length() ?: 0) > 1,
+                    error = active.optString("error").ifBlank { null }
+                ))
+            }
+        }
+    }
+
+    suspend fun refreshRemoteFeatures() {
+        remoteBusy = true
+        try {
+            val raw = withContext(Dispatchers.IO) {
+                service.callAttr("remote_feature_catalog").toString()
+            }
+            val payload = JSONObject(raw)
+            remoteOk = payload.optBoolean("ok")
+            if (remoteOk) {
+                remoteFeatures = parseRemoteCatalog(raw)
+                val dirs = payload.optJSONArray("candidate_dirs")
+                val elapsed = payload.opt("elapsed_ms")
+                remoteStatus = buildString {
+                    append("${remoteFeatures.size} features · ${dirs?.length() ?: 0} dirs")
+                    if (elapsed != null) append(" · ${elapsed}ms")
+                }
+            } else {
+                remoteFeatures = emptyList()
+                remoteStatus = payload.optString("error").ifBlank { "scan failed" }
+            }
+        } catch (error: Exception) {
+            remoteOk = false
+            remoteFeatures = emptyList()
+            remoteStatus = "scan failed: ${error.message}"
+        } finally {
+            remoteBusy = false
+        }
+    }
+
+    // 进入设置页自动扫一次远程；之后手动 Refresh 才再扫（避免频繁 RPC）。
+    LaunchedEffect(Unit) { runCatching { refreshRemoteFeatures() } }
 
     suspend fun refreshDownloadLogs() {
         val raw = withContext(Dispatchers.IO) { service.callAttr("operation_logs").toString() }
@@ -1404,6 +1493,86 @@ private fun SettingsPage(
         )
         Text("After any successful RPC, the next probe waits for this interval. Minimum 5 seconds.", style = MaterialTheme.typography.bodySmall)
         Text(probeSettingsStatus, style = MaterialTheme.typography.bodySmall)
+        HorizontalDivider()
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("Features on target", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Scans the SELECTED TARGET's AssetFinder and py_updates over RPC: $selectedTopic",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            OutlinedButton(
+                enabled = !remoteBusy,
+                onClick = { scope.launch { runCatching { refreshRemoteFeatures() } } }
+            ) {
+                Icon(Icons.Outlined.Refresh, contentDescription = null)
+                Text(if (remoteBusy) "Scanning..." else "Refresh target list")
+            }
+        }
+        if (remoteStatus.isNotBlank()) {
+            SelectionContainer {
+                Text(
+                    remoteStatus,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (remoteOk) MaterialTheme.colorScheme.onSurfaceVariant
+                    else MaterialTheme.colorScheme.error
+                )
+            }
+        }
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .heightIn(min = 48.dp, max = 240.dp)
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                .verticalScroll(rememberScrollState())
+                .padding(8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            if (remoteFeatures.isEmpty()) {
+                Text(
+                    if (remoteBusy) "Scanning target..."
+                    else "Not scanned yet. Tap \"Refresh target list\".",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            remoteFeatures.forEach { entry ->
+                Column {
+                    Text(
+                        buildString {
+                            append("${entry.title}  (${entry.name})")
+                            if (entry.shadowed) append("  · override")
+                        },
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Text(
+                        buildString {
+                            append(if (entry.source == "py_updates") "py_updates" else "built-in")
+                            if (entry.version.isNotBlank()) append("  · v${entry.version}")
+                            if (entry.actions.isNotEmpty()) append("  · ${entry.actions.joinToString()}")
+                        },
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    SelectionContainer {
+                        Text(entry.dir, style = MaterialTheme.typography.bodySmall)
+                    }
+                    entry.error?.let { message ->
+                        SelectionContainer {
+                            Text(
+                                "error: $message",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+                    HorizontalDivider()
+                }
+            }
+        }
         if (useExternal && externalAllowed) {
             HorizontalDivider()
             Text("External feature scripts", style = MaterialTheme.typography.titleMedium)
@@ -1429,8 +1598,9 @@ private fun SettingsPage(
                 OutlinedButton(
                     enabled = !downloading && !featureListBusy,
                     onClick = {
-                        // 立即让 Python 重扫 py_updates（同时收养新 feature 进
+                        // 立即让 Python 重扫【本机】py_updates（同时收养新 feature 进
                         // 目标白名单），然后刷新本页列表和外层底栏。
+                        // 远程目标的 feature 列表用上面的 "Refresh target list"。
                         scope.launch {
                             runCatching { rescanFeatureList() }
                             onRefreshFeatureList()
@@ -1438,7 +1608,7 @@ private fun SettingsPage(
                     }
                 ) {
                     Icon(Icons.Outlined.Refresh, contentDescription = null)
-                    Text(if (featureListBusy) "Scanning..." else "Refresh feature list")
+                    Text(if (featureListBusy) "Scanning..." else "Rescan this device")
                 }
             }
             // 实际扫描到的 feature 全量列表（文件名即 feature 名）：
