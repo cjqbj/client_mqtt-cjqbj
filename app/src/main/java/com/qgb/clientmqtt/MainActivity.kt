@@ -6,18 +6,16 @@ import android.content.ClipboardManager as AndroidClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
-import android.util.Base64
 import android.net.Uri
 import java.io.File
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -35,9 +33,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -54,6 +52,7 @@ import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Menu
 import androidx.compose.material.icons.outlined.NetworkWifi
+import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Terminal
@@ -62,7 +61,6 @@ import androidx.compose.material.icons.twotone.Security
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -84,20 +82,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.chaquo.python.Python
@@ -108,28 +102,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-
-private data class RemoteFile(
-    val path: String,
-    val kind: String,
-    val size: Long,
-    val modified: Double
-)
-
-/**
- * 相机页按设备托管的界面状态。
- *
- * 提到页面外（ClientMqttScreen 持有、按设备 id 索引）后：
- * - 切换 feature tab、打开设置/日志页（页面仍在组合中）状态不丢；
- * - 切换到其他 topic 再切回来（deviceId 变走又变回），照片/输出仍在；
- * - 状态字段都是 snapshot state，相机页直接读写即可触发重组。
- */
-private class CameraPageState {
-    var facing: Int? by mutableStateOf(null)
-    var facingLoaded by mutableStateOf(false)
-    var status: String by mutableStateOf("Ready")
-    var preview: ImageBitmap? by mutableStateOf(null)
-}
 
 private data class FeatureDescriptor(
     val name: String,
@@ -147,6 +119,7 @@ private fun featureIcon(feature: FeatureDescriptor) = when (feature.icon?.lowerc
     "folder", "files", "file", "directory" -> Icons.Outlined.Folder
     "camera", "photo", "image" -> Icons.Outlined.CameraAlt
     "wifi", "network", "wireless" -> Icons.Outlined.NetworkWifi
+    "audio", "sound", "speaker", "play" -> Icons.Outlined.PlayArrow
     "terminal", "shell", "console" -> Icons.Outlined.Terminal
     "bug", "debug" -> Icons.Outlined.BugReport
     "info", "about" -> Icons.Outlined.Info
@@ -206,15 +179,12 @@ private fun ClientMqttScreen() {
     // 每个设备分别记住最后选中的 feature：记录已完成恢复的设备 id，
     // 恢复完成前禁止回写，避免冷启动的占位页覆盖持久化选择。
     var featureRestoredFor by remember { mutableStateOf("") }
-    var targetRemoteRoot by remember { mutableStateOf("/data/data") }
     var onlineStatus by remember { mutableStateOf("checking") }
     var onlineProbeEnabled by remember { mutableStateOf(true) }
     var onlineProbeInterval by remember { mutableStateOf(30) }
     val snackbarHostState = remember { SnackbarHostState() }
     val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
-    // 相机页状态按设备 id 托管在屏幕级：切 tab / 覆盖页 / 切 topic 都不丢。
-    val cameraStates = remember { mutableStateMapOf<String, CameraPageState>() }
 
     fun parseTargets(raw: String) = buildList {
         val array = org.json.JSONArray(raw)
@@ -275,7 +245,6 @@ private fun ClientMqttScreen() {
                 selectedDeviceId = target.id
                 selectedTopic = target.requestTopic
                 selectedDevice = target.name
-                targetRemoteRoot = target.remoteRoot
                 if (target.id != activeId) {
                     withContext(Dispatchers.IO) { service.callAttr("select_device", target.id) }
                 }
@@ -306,7 +275,6 @@ private fun ClientMqttScreen() {
                 if (active != null) {
                     selectedTopic = active.requestTopic
                     selectedDevice = active.name
-                    targetRemoteRoot = active.remoteRoot
                 }
             }
             delay(1_000)
@@ -323,15 +291,6 @@ private fun ClientMqttScreen() {
                 onlineProbeInterval = config.optInt("online_probe_interval", 30).coerceIn(5, 3600)
             }
             delay(1_000)
-        }
-    }
-
-    LaunchedEffect(selectedTopic) {
-        targetRemoteRoot = withContext(Dispatchers.IO) {
-            runCatching {
-                JSONObject(service.callAttr("device_settings", selectedTopic).toString())
-                    .optString("remote_root", "/data/data")
-            }.getOrDefault("/data/data")
         }
     }
 
@@ -415,6 +374,14 @@ private fun ClientMqttScreen() {
                     Text("Scripts", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                     Text("Long-press to reload", style = MaterialTheme.typography.labelSmall)
                 }
+                // feature 多了之后 Scripts 区必须限范围：占满抽屉剩余高度并在区内
+                // 滚动，Targets 区始终固定可见、不被挤出屏幕。
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                ) {
                 features.forEachIndexed { index, feature ->
                     val featureSelected = pagerState.currentPage == index && !settings && !targetSettings
                     // 自绘条目：combinedClickable 同一处理器内确定地分发短按/长按，
@@ -458,6 +425,7 @@ private fun ClientMqttScreen() {
                         )
                     }
                 }
+                }
                 HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
                 Text("Targets", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(16.dp))
                 targets.forEach { target ->
@@ -469,7 +437,6 @@ private fun ClientMqttScreen() {
                             selectedDeviceId = target.id
                             selectedTopic = target.requestTopic
                             selectedDevice = target.name
-                            targetRemoteRoot = target.remoteRoot
                             val chosenId = target.id
                             scope.launch {
                                 withContext(Dispatchers.IO) {
@@ -531,13 +498,20 @@ private fun ClientMqttScreen() {
                 if (!settings && !targetSettings && !permissions && !diagnostics && features.isNotEmpty()) {
                     val selectedPage = pagerState.currentPage.coerceIn(0, features.lastIndex)
                     NavigationBar {
+                        // 每项固定 72dp：一屏平铺约 6 个；feature 更多时整条横向滚动，
+                        // 不再用 weight 平分把大量图标压成看不清的细条。
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                        ) {
                         features.forEachIndexed { index, feature ->
                             val itemSelected = selectedPage == index
                             // 自绘底部条目：短按切页、长按重载由同一个 combinedClickable
                             // 确定分发；NavigationBarItem 内部 clickable 会吞掉叠加的长按手势。
                             Row(
                                 modifier = Modifier
-                                    .weight(1f)
+                                    .width(72.dp)
                                     .height(80.dp)
                                     .combinedClickable(
                                         interactionSource = remember { MutableInteractionSource() },
@@ -578,6 +552,7 @@ private fun ClientMqttScreen() {
                                 }
                             }
                         }
+                        }
                     }
                 }
             }
@@ -598,16 +573,9 @@ private fun ClientMqttScreen() {
                             beyondViewportPageCount = features.size
                         ) { page ->
                             key(features[page].name) {
-                                when (features[page].name) {
-                                    "files" -> FilesPage(targetRemoteRoot, service)
-                                    "camera" -> CameraPage(service, selectedDeviceId, cameraStates)
-                                    "wifi" -> WifiPage(service)
-                                    else -> if (features[page].ui == "python") {
-                                        PythonViewPage(features[page], service)
-                                    } else {
-                                        DynamicFeaturePage(features[page], service)
-                                    }
-                                }
+                                // 所有 feature 界面都由 feature_*.py 自绘（ui=python），
+                                // APK 端只保留这一个通用宿主；新增/改版界面只热更脚本。
+                                PythonViewPage(features[page], service)
                             }
                         }
                     }
@@ -693,276 +661,6 @@ private fun ClientMqttScreen() {
     }
 }
 
-@Composable
-private fun FilesPage(initialRoot: String, service: PyObject) {
-    var root by remember(initialRoot) { mutableStateOf(initialRoot) }
-    var limit by remember { mutableStateOf("100") }
-    var status by remember { mutableStateOf("Ready") }
-    var entries by remember { mutableStateOf(listOf<RemoteFile>()) }
-    var nextOffset by remember { mutableStateOf(0) }
-    var hasMore by remember { mutableStateOf(false) }
-    var loading by remember { mutableStateOf(false) }
-    var preview by remember { mutableStateOf<ImageBitmap?>(null) }
-    val scope = rememberCoroutineScope()
-    val listState = rememberLazyListState()
-    val rootBoundary = initialRoot.trimEnd('/').ifEmpty { "/" }
-
-    fun loadPage(start: Int, scanRoot: String = root) {
-        if (loading) return
-        loading = true
-        status = "Scanning $scanRoot at $start..."
-        val pageSize = limit.toIntOrNull()?.coerceIn(1, 10000) ?: 100
-        scope.launch {
-            val raw = withContext(Dispatchers.IO) {
-                service.callAttr("call_feature", "files", "scan", scanRoot, start, pageSize).toString()
-            }
-            try {
-                val result = JSONObject(raw)
-                if (!result.optBoolean("ok", true)) {
-                    if (start == 0) entries = emptyList()
-                    hasMore = false
-                    status = result.optString("error", "Feature action failed")
-                    return@launch
-                }
-                val page = result.optJSONArray("items") ?: org.json.JSONArray()
-                val newEntries = buildList {
-                    for (index in 0 until page.length()) {
-                        val item = page.optJSONObject(index) ?: continue
-                        add(RemoteFile(
-                            item.optString("path"),
-                            item.optString("kind", "file"),
-                            item.optLong("size"),
-                            item.optDouble("modified")
-                        ))
-                    }
-                }
-                entries = if (start == 0) newEntries else entries + newEntries
-                hasMore = result.optBoolean("has_more")
-                nextOffset = result.optInt("next_offset", start + newEntries.size)
-                status = "Loaded ${entries.size} files${if (hasMore) ", more below" else ""}"
-            } catch (error: Exception) {
-                status = "Invalid scan response: ${error.message}"
-            } finally {
-                loading = false
-            }
-        }
-    }
-
-    LaunchedEffect(listState, hasMore, loading, entries.size) {
-        snapshotFlow { listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1 }
-            .collect { last ->
-                if (hasMore && !loading && entries.isNotEmpty() && last >= entries.lastIndex) {
-                    loadPage(nextOffset)
-                }
-            }
-    }
-    Column(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        // 文件列表在上占满剩余空间；页码输入与 Up/Refresh 固定屏幕下部。
-        Text(status, style = MaterialTheme.typography.labelMedium)
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            items(entries) { entry ->
-                Row(
-                    Modifier.fillMaxWidth().clickable {
-                        if (entry.kind == "directory") {
-                            val childRoot = root.trimEnd('/') + "/" + entry.path
-                            root = childRoot
-                            entries = emptyList()
-                            nextOffset = 0
-                            hasMore = false
-                            status = "Opening $childRoot..."
-                            scope.launch { listState.scrollToItem(0) }
-                            loadPage(0, childRoot)
-                        } else {
-                            val currentRoot = root
-                            status = "Downloading ${entry.path}..."
-                            scope.launch {
-                                try {
-                                    val transfer = withContext(Dispatchers.IO) {
-                                        service.callAttr("call_feature", "files", "upload", currentRoot.trimEnd('/') + "/" + entry.path).toString()
-                                    }
-                                    val transferJson = JSONObject(transfer)
-                                    if (!transferJson.optBoolean("ok", true)) error(transferJson.optString("error", "upload failed"))
-                                    val url = transferJson.optString("url")
-                                    if (url.isBlank()) error(transferJson.optString("error", "upload returned no URL"))
-                                    val saved = withContext(Dispatchers.IO) {
-                                        JSONObject(service.callAttr("download_remote_to_file", url, entry.path.substringAfterLast('/')).toString())
-                                    }
-                                    if (!saved.optBoolean("ok")) error(saved.optString("error", "download failed"))
-                                    if (entry.path.lowercase().matches(Regex(".*\\.(jpg|jpeg|png|webp|gif)$"))) {
-                                        val encoded = withContext(Dispatchers.IO) {
-                                            service.callAttr("download_transfer_base64", url).toString()
-                                        }
-                                        val bytes = Base64.decode(encoded, Base64.DEFAULT)
-                                        preview = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
-                                    }
-                                    status = "Saved to app script directory downloads/"
-                                } catch (error: Exception) {
-                                    status = "Download failed: ${error.message}"
-                                }
-                            }
-                        }
-                    }.padding(vertical = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text(entry.path, style = MaterialTheme.typography.bodyMedium)
-                        Text(
-                            if (entry.kind == "directory") "Folder" else "${entry.size} B · ${entry.modified}",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                    Text(if (entry.kind == "directory") "Open" else "Download", style = MaterialTheme.typography.labelSmall)
-                }
-            }
-            if (loading) item { Text("Loading...") }
-        }
-        preview?.let { bitmap ->
-            Image(
-                bitmap = bitmap,
-                contentDescription = "Remote image",
-                modifier = Modifier.fillMaxWidth().heightIn(max = 200.dp)
-            )
-        }
-        OutlinedTextField(
-            limit,
-            { limit = it.filter(Char::isDigit) },
-            Modifier.fillMaxWidth(),
-            singleLine = true,
-            label = { Text("Page size") }
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            Button(enabled = root != rootBoundary, onClick = {
-                val parent = root.trimEnd('/').substringBeforeLast('/', rootBoundary).ifEmpty { "/" }
-                val parentRoot = if (parent.length < rootBoundary.length || !parent.startsWith(rootBoundary)) {
-                    rootBoundary
-                } else {
-                    parent
-                }
-                root = parentRoot
-                entries = emptyList()
-                nextOffset = 0
-                hasMore = false
-                scope.launch { listState.scrollToItem(0) }
-                loadPage(0, parentRoot)
-            }) { Text("Up") }
-            Text(root, modifier = Modifier.weight(1f).align(androidx.compose.ui.Alignment.CenterVertically), maxLines = 2)
-            Button(onClick = {
-                entries = emptyList()
-                nextOffset = 0
-                hasMore = false
-                loadPage(0, root)
-            }) { Text("Refresh") }
-        }
-    }
-}
-
-@Composable
-private fun CameraPage(
-    service: PyObject,
-    deviceId: String,
-    // 屏幕级、按设备 id 托管：切 tab / 覆盖页 / 切 topic 再回来照片和状态都还在。
-    states: MutableMap<String, CameraPageState>,
-) {
-    val state = states.getOrPut(deviceId) { CameraPageState() }
-    val scope = rememberCoroutineScope()
-
-    // 每个设备只从持久化加载一次前后摄选择（facingLoaded 闸门，避免反复覆盖）。
-    LaunchedEffect(deviceId) {
-        if (state.facingLoaded) return@LaunchedEffect
-        state.facing = withContext(Dispatchers.IO) {
-            runCatching {
-                JSONObject(service.callAttr("feature_settings", "camera", deviceId).toString())
-                    .optInt("lens_facing", 0)
-            }.getOrDefault(0)
-        }
-        state.facingLoaded = true
-    }
-
-    fun selectFacing(value: Int) {
-        state.facing = value
-        scope.launch(Dispatchers.IO) {
-            runCatching {
-                service.callAttr(
-                    "update_feature_settings",
-                    "camera",
-                    JSONObject().put("lens_facing", value).toString(),
-                    deviceId,
-                )
-            }
-        }
-    }
-
-    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        // 结果区在上占满；预览图限高；底部固定芯片+快门，不被列表顶出屏幕。
-        if (state.status.trimStart().startsWith("{")) {
-            FeatureOutput(state.status, modifier = Modifier.fillMaxWidth().weight(1f))
-        } else {
-            Box(Modifier.fillMaxWidth().weight(1f)) {
-                Text(state.status)
-            }
-        }
-        state.preview?.let { bitmap ->
-            Image(
-                bitmap = bitmap,
-                contentDescription = "Captured photo",
-                modifier = Modifier.fillMaxWidth().heightIn(max = 240.dp)
-            )
-        }
-        Text("JPEG stays in memory on the target and is transferred outside MQTT.", style = MaterialTheme.typography.bodySmall)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            FilterChip(
-                selected = state.facing == 0,
-                onClick = { selectFacing(0) },
-                label = { Text("Back camera") },
-                enabled = state.facing != null,
-            )
-            FilterChip(
-                selected = state.facing == 1,
-                onClick = { selectFacing(1) },
-                label = { Text("Front camera") },
-                enabled = state.facing != null,
-            )
-            Button(
-                enabled = state.facing != null,
-                modifier = Modifier.weight(1f),
-                onClick = {
-                state.status = "Capturing..."
-                state.preview = null
-                scope.launch {
-                    try {
-                        val raw = withContext(Dispatchers.IO) {
-                            service.callAttr("call_feature", "camera", "capture", state.facing ?: 0).toString()
-                        }
-                        val result = JSONObject(raw)
-                        if (!result.optBoolean("ok")) {
-                            state.status = raw
-                            return@launch
-                        }
-                        val url = result.optString("url")
-                        if (url.isNotBlank()) {
-                            val encoded = withContext(Dispatchers.IO) {
-                                service.callAttr("download_transfer_base64", url).toString()
-                            }
-                            val bytes = Base64.decode(encoded, Base64.DEFAULT)
-                            state.preview = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
-                        }
-                        state.status = raw
-                    } catch (error: Exception) {
-                        state.status = "Capture failed: ${error.message}"
-                    }
-                }
-            }) { Text("Capture") }
-        }
-    }
-}
-
 /**
  * Python 自绘 feature 的通用宿主：feature 脚本提供 build_view(context) 返回
  * android.view.View，APK 只负责把它挂进 Compose。新增自绘 feature 无需改 APK，
@@ -984,49 +682,6 @@ private fun PythonViewPage(feature: FeatureDescriptor, service: PyObject) {
             }
         }
     )
-}
-
-@Composable
-private fun WifiPage(service: PyObject) {
-    var status by remember { mutableStateOf("Waiting for target RPC") }
-    var copyStatus by remember { mutableStateOf("") }
-    val scope = rememberCoroutineScope()
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as AndroidClipboardManager
-    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        // 结果区在上占满；Refresh/Copy 固定屏幕下部。
-        if (status.trimStart().startsWith("{")) {
-            FeatureOutput(status, modifier = Modifier.fillMaxWidth().weight(1f))
-        } else {
-            Box(Modifier.fillMaxWidth().weight(1f)) {
-                SelectionContainer { Text(status, style = MaterialTheme.typography.bodyMedium) }
-            }
-        }
-        if (copyStatus.isNotBlank()) Text(copyStatus, style = MaterialTheme.typography.labelSmall)
-        Row(
-            horizontalArrangement = Arrangement.SpaceBetween,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Button(onClick = {
-                status = "Querying..."
-                scope.launch {
-                    try {
-                        val raw = withContext(Dispatchers.IO) {
-                            service.callAttr("call_feature", "wifi", "info").toString()
-                        }
-                        status = runCatching { JSONObject(raw).toString(2) }.getOrDefault(raw)
-                        copyStatus = ""
-                    } catch (error: Exception) {
-                        status = "Wi-Fi query failed: ${error.message}"
-                    }
-                }
-            }) { Text("Refresh Wi-Fi") }
-            TextButton(onClick = {
-                clipboard.setPrimaryClip(ClipData.newPlainText("Wi-Fi result", status))
-                copyStatus = "Copied"
-            }) { Text("Copy") }
-        }
-    }
 }
 
 @Composable
@@ -1102,75 +757,6 @@ private fun DiagnosticsPage(
                     }
                     HorizontalDivider()
                 }
-            }
-        }
-    }
-}
-
-@Composable
-private fun FeatureOutput(raw: String, modifier: Modifier = Modifier) {
-    // raw 是 Python 端 json.dumps 出来的原始字符串；这里只按字段取出
-    // stdout/stderr/error 单独原样显示，不再用 Java 重排/美化 print 内容。
-    val parsed = remember(raw) { runCatching { JSONObject(raw) }.getOrNull() }
-    fun fieldText(key: String): String? = parsed
-        ?.takeIf { it.has(key) && !it.isNull(key) }
-        ?.optString(key)
-        ?.takeIf { it.isNotEmpty() }
-    val stdout = fieldText("_stdout")
-    val stderr = fieldText("_stderr")
-    val remoteError = fieldText("_remote_error") ?: fieldText("error")
-    Column(
-        modifier.verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        if (stdout != null) {
-            Text("Python stdout", style = MaterialTheme.typography.labelLarge)
-            SelectionContainer {
-                Text(stdout, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-            }
-        }
-        if (stderr != null) {
-            Text("Python stderr", style = MaterialTheme.typography.labelLarge)
-            SelectionContainer {
-                Text(stderr, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-            }
-        }
-        if (remoteError != null) {
-            Text("Target error", style = MaterialTheme.typography.labelLarge)
-            SelectionContainer {
-                Text(remoteError, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-            }
-        }
-        Text("Raw response (Python)", style = MaterialTheme.typography.labelLarge)
-        SelectionContainer {
-            Text(raw, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-        }
-    }
-}
-
-@Composable
-private fun DynamicFeaturePage(feature: FeatureDescriptor, service: PyObject) {
-    var result by remember(feature.name) { mutableStateOf("Ready") }
-    val scope = rememberCoroutineScope()
-    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(feature.title, style = MaterialTheme.typography.headlineSmall)
-        Text("feature_${feature.name}.py · actions=${feature.actions.joinToString()}", style = MaterialTheme.typography.bodySmall)
-        // 结果区在上占满；动作按钮固定屏幕下部。
-        FeatureOutput(result, modifier = Modifier.fillMaxWidth().weight(1f))
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            feature.actions.forEach { action ->
-                Button(onClick = {
-                    result = "Running $action..."
-                    scope.launch {
-                        result = withContext(Dispatchers.IO) {
-                            runCatching { service.callAttr("call_feature", feature.name, action).toString() }
-                                .getOrElse { "Error: ${it.message}" }
-                        }
-                    }
-                }) { Text(action) }
             }
         }
     }
@@ -1569,21 +1155,27 @@ private fun SettingsPage(
                 },
                 style = MaterialTheme.typography.bodySmall
             )
-            Button(enabled = !downloading, onClick = {
+            // force=false 只补缺失；force=true 无条件重下全部并清模块/pyc 缓存，
+            // 下一次 call_feature 立刻用新脚本，无需重启。
+            fun startBuiltinDownload(force: Boolean) {
                 downloading = true
                 downloadStatus = "Starting Python downloader..."
                 downloadLogs = emptyList()
                 scope.launch {
                     try {
+                        val method = if (force) "reinstall_builtin_features" else "install_builtin_features"
                         val response = withContext(Dispatchers.IO) {
-                            service.callAttr("install_builtin_features", scriptRoot, 4, 15).toString()
+                            service.callAttr(method, scriptRoot, 4, 15).toString()
                         }
                         val result = JSONObject(response)
                         val ready = result.optJSONArray("results")?.length() ?: 0
-                        downloadStatus = if (result.optBoolean("ok")) {
-                            "$ready feature scripts ready. Restart if you just changed the script directory."
-                        } else {
-                            "Some scripts failed. Check the download log and retry."
+                        downloadStatus = when {
+                            !result.optBoolean("ok") ->
+                                "Some scripts failed. Check the download log and retry."
+                            force ->
+                                "$ready feature scripts re-downloaded and loaded immediately."
+                            else ->
+                                "$ready feature scripts ready. Restart if you just changed the script directory."
                         }
                     } catch (error: Exception) {
                         downloadStatus = "Download failed: ${error.message}"
@@ -1593,8 +1185,18 @@ private fun SettingsPage(
                         scriptRevision++
                     }
                 }
-            }) {
+            }
+            Button(
+                enabled = !downloading,
+                onClick = { startBuiltinDownload(force = false) }
+            ) {
                 Text(if (downloading) "Downloading scripts..." else "Download missing feature scripts")
+            }
+            Button(
+                enabled = !downloading,
+                onClick = { startBuiltinDownload(force = true) }
+            ) {
+                Text(if (downloading) "Re-downloading all scripts..." else "Re-download all feature scripts")
             }
             Text("Download or refresh one feature script", style = MaterialTheme.typography.labelLarge)
             builtinFeatureFiles.forEach { filename ->

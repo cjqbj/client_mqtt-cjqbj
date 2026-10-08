@@ -11,7 +11,7 @@ from urllib.error import URLError
 import urllib.request
 
 _UPDATE_DIR = None
-BUILTIN_FEATURES = ("files", "camera", "wifi", "audio", "probe", "pyui")
+BUILTIN_FEATURES = ("files", "camera", "wifi", "audio", "probe")
 MAX_FEATURE_SIZE = 2 * 1024 * 1024
 _FEATURE_LOCK = threading.RLock()
 _RPC_SERVER_STARTED = False

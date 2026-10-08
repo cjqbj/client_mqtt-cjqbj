@@ -24,7 +24,7 @@ class BootstrapTests(unittest.TestCase):
                 bootstrap.init_env(str(Path(directory) / "updates"))
                 self.assertEqual(
                     set(bootstrap.list_features()),
-                    {"files", "camera", "wifi", "audio", "probe", "pyui"},
+                    {"files", "camera", "wifi", "audio", "probe"},
                 )
             finally:
                 bootstrap.__file__ = previous_file
@@ -145,6 +145,24 @@ class BootstrapTests(unittest.TestCase):
     def test_feature_name_is_restricted(self):
         with self.assertRaises(ValueError):
             bootstrap.load_feature("../unsafe")
+
+    def test_all_builtin_features_render_with_python_ui(self):
+        # 所有内置 feature 界面都必须由脚本自绘（ui=python + build_view），
+        # APK 端不再保留任何 Compose 专属页面。
+        import importlib
+
+        self.assertEqual(
+            set(bootstrap.BUILTIN_FEATURES),
+            {"files", "camera", "wifi", "audio", "probe"},
+        )
+        for name in bootstrap.BUILTIN_FEATURES:
+            module = importlib.import_module("feature_%s" % name)
+            self.assertEqual(module.FEATURE.get("ui"), "python", name)
+            self.assertTrue(callable(getattr(module, "build_view", None)), name)
+        # 共享自绘工具包必须能在无 android 模块的桌面环境导入。
+        import pyui_kit  # noqa: F401
+
+        self.assertTrue(callable(pyui_kit.run_async))
 
 
 if __name__ == "__main__":

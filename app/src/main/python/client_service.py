@@ -52,10 +52,6 @@ _BUILTIN_FEATURE_SOURCES = {
         "https://github.com/cjqbj/client_mqtt-cjqbj/raw/refs/heads/main/app/src/main/python/feature_probe.py",
         "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/main/app/src/main/python/feature_probe.py",
     ),
-    "feature_pyui.py": (
-        "https://github.com/cjqbj/client_mqtt-cjqbj/raw/refs/heads/main/app/src/main/python/feature_pyui.py",
-        "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/main/app/src/main/python/feature_pyui.py",
-    ),
 }
 
 
@@ -238,20 +234,27 @@ def standardize_private_key(value):
         return bytes(normalized).decode("utf-8")
 
 
-def install_builtin_features(script_root, retries=4, timeout=15):
-    """Install missing bundled feature scripts into a chosen script root."""
+def install_builtin_features(script_root, retries=4, timeout=15, force=False):
+    """Install missing bundled feature scripts into a chosen script root.
+
+    force=True 时（设置页"一键全部重新下载"）忽略已存在文件，全部重新拉取，
+    并清掉旧模块缓存/pyc，让新脚本在不重启 App 的情况下立即生效。
+    """
     import bootstrap
 
     update_dir = os.path.join(os.path.abspath(str(script_root)), "py_updates")
     os.makedirs(update_dir, exist_ok=True)
     with _STATE["lock"]:
         _STATE.setdefault("operation_logs", []).clear()
-    _append_operation_log(f"Installing built-in features into {update_dir}")
+    _append_operation_log(
+        ("Force reinstalling" if force else "Installing")
+        + f" built-in features into {update_dir}"
+    )
     results = []
 
     for filename, urls in _BUILTIN_FEATURE_SOURCES.items():
         destination = os.path.join(update_dir, filename)
-        if os.path.isfile(destination):
+        if not force and os.path.isfile(destination):
             try:
                 with open(destination, "rb") as feature_file:
                     compile(feature_file.read(), filename, "exec")
@@ -265,6 +268,17 @@ def install_builtin_features(script_root, retries=4, timeout=15):
             result = _install_builtin_feature_file(
                 bootstrap, filename, update_dir, retries, timeout
             )
+            if force and result.get("ok"):
+                # 丢弃旧缓存，下一次动作/打开页面即用新文件。
+                feature_name = filename[8:-3]
+                try:
+                    sys.modules.pop("feature_" + feature_name, None)
+                    bootstrap._purge_feature_pyc("feature_" + feature_name)
+                    result["reloaded"] = True
+                except Exception as reload_error:
+                    _append_operation_log(
+                        f"{filename}: downloaded but cache purge failed: {reload_error}"
+                    )
             results.append(result)
         except Exception as error:
             detail = f"{type(error).__name__}: {error}"[:300]
@@ -276,9 +290,15 @@ def install_builtin_features(script_root, retries=4, timeout=15):
     return json.dumps({
         "ok": installed == len(results),
         "update_dir": update_dir,
+        "force": bool(force),
         "results": results,
         "logs": json.loads(operation_logs()),
     }, ensure_ascii=False)
+
+
+def reinstall_builtin_features(script_root, retries=4, timeout=15):
+    """设置页"一键全部重新下载"：无条件重下全部内置 feature 脚本。"""
+    return install_builtin_features(script_root, retries, timeout, force=True)
 
 
 def _install_builtin_feature_file(bootstrap, filename, update_dir, retries, timeout):

@@ -744,31 +744,52 @@ class ClientServiceTests(unittest.TestCase):
                     progress(f"{filename}: installed for test")
                     return {"filename": filename, "ok": True}
 
-                with mock.patch.object(bootstrap, "install_feature", side_effect=install) as download:
+                with mock.patch.object(bootstrap, "install_feature", side_effect=install) as download, \
+                        mock.patch.object(bootstrap, "_purge_feature_pyc") as purge:
                     result = json.loads(client_service.install_builtin_features(script_root))
                     self.assertTrue(result["ok"])
-                    self.assertEqual(len(result["results"]), 6)
+                    self.assertFalse(result["force"])
+                    self.assertEqual(len(result["results"]), 5)
                     self.assertTrue(all(item["ok"] for item in result["results"]))
                     self.assertTrue(any("installed for test" in item for item in result["logs"]))
-                    self.assertEqual(download.call_count, 6)
+                    self.assertEqual(download.call_count, 5)
+                    # 非 force：已存在文件直接跳过，不重新下载、不清缓存。
+                    purge.assert_not_called()
 
                     second = json.loads(client_service.install_builtin_features(script_root))
                     self.assertTrue(all(item.get("skipped") for item in second["results"]))
-                    self.assertEqual(download.call_count, 6)
+                    self.assertEqual(download.call_count, 5)
 
                     single = json.loads(
                         client_service.install_builtin_feature(script_root, "feature_audio.py")
                     )
                     self.assertTrue(single["ok"])
                     self.assertEqual(single["result"]["filename"], "feature_audio.py")
-                    self.assertEqual(download.call_count, 7)
+                    self.assertEqual(download.call_count, 6)
 
                     invalid = json.loads(
                         client_service.install_builtin_feature(script_root, "feature_unknown.py")
                     )
                     self.assertFalse(invalid["ok"])
                     self.assertIn("unknown built-in feature file", invalid["result"]["error"])
-                    self.assertEqual(download.call_count, 7)
+                    self.assertEqual(download.call_count, 6)
+
+                    # force（一键全部重新下载）：不跳过任何文件，全部重下（计数 6→11），
+                    # 每个成功项都弹出模块缓存并清 pyc，reinstall_ 入口等价于 force=True。
+                    forced = json.loads(client_service.reinstall_builtin_features(script_root))
+                    self.assertTrue(forced["ok"])
+                    self.assertTrue(forced["force"])
+                    self.assertEqual(len(forced["results"]), 5)
+                    self.assertTrue(all(not item.get("skipped") for item in forced["results"]))
+                    self.assertTrue(all(item.get("reloaded") for item in forced["results"]))
+                    self.assertEqual(download.call_count, 11)
+                    self.assertEqual(purge.call_count, 5)
+                    purged = {call.args[0] for call in purge.call_args_list}
+                    self.assertEqual(
+                        purged,
+                        {"feature_files", "feature_camera", "feature_wifi",
+                         "feature_audio", "feature_probe"},
+                    )
             finally:
                 client_service._STATE.clear()
                 client_service._STATE.update(previous_state)

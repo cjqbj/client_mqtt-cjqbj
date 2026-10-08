@@ -32,6 +32,8 @@ class ProbeParseTests(unittest.TestCase):
 
 
 class ProbeRunTests(unittest.TestCase):
+    SELECTED_TOPIC = "sys/device/k12"
+
     def _patch_rpc(self, response=None, side_effect=None):
         fake_mqtt = mock.Mock()
         if side_effect is not None:
@@ -39,7 +41,11 @@ class ProbeRunTests(unittest.TestCase):
         else:
             fake_mqtt.rpc.return_value = response
         return (
-            mock.patch.object(feature_probe.client_service, "_device_config", return_value={}),
+            mock.patch.object(
+                feature_probe.client_service,
+                "_device_config",
+                return_value={"request_topic": self.SELECTED_TOPIC},
+            ),
             mock.patch.object(feature_probe.client_service, "_mqtt_client_module", return_value=fake_mqtt),
             fake_mqtt,
         )
@@ -50,6 +56,7 @@ class ProbeRunTests(unittest.TestCase):
             {"ok": True, "r": raw_repr, "elapsed_ms": 128}
         )
         with config_patch as device_config, mqtt_patch:
+            # 显式传 topic 仍可覆盖默认目标。
             result = json.loads(feature_probe.run("q", 2.0))
 
         self.assertTrue(result["ok"])
@@ -65,14 +72,26 @@ class ProbeRunTests(unittest.TestCase):
         kwargs = fake_mqtt.rpc.call_args.kwargs
         self.assertEqual(kwargs["request_topic"], "q")
         self.assertEqual(kwargs["timeout"], 2.0)
-        device_config.assert_called_once_with(None)
+        device_config.assert_called_with(None)
+
+    def test_run_without_topic_follows_selected_target(self):
+        raw_repr = "('/usr/bin/python3', 'k12', 'x86_64', '5.15.0')"
+        config_patch, mqtt_patch, fake_mqtt = self._patch_rpc(
+            {"ok": True, "r": raw_repr, "elapsed_ms": 88}
+        )
+        with config_patch, mqtt_patch:
+            result = json.loads(feature_probe.run())
+        # 无参 run()：topic 取当前选中目标的 request_topic，不再写死 "q"。
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["topic"], self.SELECTED_TOPIC)
+        self.assertEqual(fake_mqtt.rpc.call_args.kwargs["request_topic"], self.SELECTED_TOPIC)
 
     def test_run_timeout_returns_structured_offline_error(self):
         config_patch, mqtt_patch, _ = self._patch_rpc({"r": None, "elapsed_ms": 2000})
         with config_patch, mqtt_patch:
             result = json.loads(feature_probe.run())
         self.assertFalse(result["ok"])
-        self.assertEqual(result["topic"], feature_probe.DEFAULT_TOPIC)
+        self.assertEqual(result["topic"], self.SELECTED_TOPIC)
         self.assertIn("timeout", result["error"].lower())
 
     def test_run_rpc_exception_returns_json_error(self):

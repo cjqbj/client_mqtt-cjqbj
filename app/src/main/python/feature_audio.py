@@ -9,6 +9,8 @@ FEATURE = {
     "title": "Audio",
     "version": 1,
     "actions": ["play"],
+    "ui": "python",
+    "icon": "audio",
 }
 
 AUDIO_PATH = "/sdcard/apm/mm.mp3"
@@ -118,3 +120,38 @@ r = json.dumps({{key: r[key] for key in order if key in r}}, ensure_ascii=False)
 def play(path=AUDIO_PATH):
     result = client_service.rpc(build_play_code(path))
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
+
+
+def build_view(context):
+    """Chaquopy 自绘：播放结果区 + 底部 Play（目标机扬声器播放 /sdcard/apm/mm.mp3）。"""
+    import bootstrap
+    import pyui_kit
+
+    page = pyui_kit.Page(
+        context, "Audio", "Play %s on the target phone speaker" % AUDIO_PATH
+    )
+    result = pyui_kit.make_text(context, "Ready")
+    page.add(result)
+    play = pyui_kit.make_button(context, "Play", lambda: None)
+
+    def on_play():
+        result.setText("Playing ...")
+
+        def work():
+            return bootstrap.call_feature("audio", "play")
+
+        def apply_ok(raw):
+            result.setText(pyui_kit.render_result(raw))
+
+        def apply_error(error):
+            result.setText("Play failed: %s" % error)
+
+        pyui_kit.run_async(work, apply_ok, apply_error, buttons=(play,))
+
+    pyui_kit.click(play, on_play)
+    page.bottom_add(play, weight=1.0)
+    pyui_kit.watch_target(
+        page.root,
+        lambda key, topic, cfg: page.set_target("target topic: " + topic),
+    )
+    return page.root
