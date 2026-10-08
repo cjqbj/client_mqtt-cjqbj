@@ -29,7 +29,45 @@ _DEFAULT_DEVICE = {
     "allow_no_server_pubkey_response": True,
     "timeout": 10,
     "remote_root": "/data/data",
+    # None/缺省 = 全部 feature 对该目标生效（默认全选）；
+    # 显式列表 = 白名单，只有列出的 feature 在该目标显示/可用。
+    "enabled_features": None,
 }
+
+
+def _normalize_enabled_features(value):
+    """None/缺省 -> None（全选）；序列 -> 去重去 feature_ 前缀的合法标识列表。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, list):
+        raise ValueError("enabled_features must be a list or null")
+    names = []
+    for item in value:
+        name = str(item).strip()
+        if name.startswith("feature_"):
+            name = name[8:]
+        if name and name.isidentifier() and name not in names:
+            names.append(name)
+    return names
+
+
+def enabled_features(device_ref=None):
+    """某目标的 feature 白名单 JSON；null 表示全部生效。供 feature/UI 统一查询。"""
+    enabled = _device_config(device_ref).get("enabled_features")
+    return json.dumps(_normalize_enabled_features(enabled), ensure_ascii=False)
+
+
+def is_feature_enabled(feature, device_ref=None):
+    """目标级开关判定；缺省配置（None）恒为 True。"""
+    name = _normalize_feature_name(feature)
+    allowed = _device_config(device_ref).get("enabled_features")
+    if allowed is None:
+        return True
+    return name in _normalize_enabled_features(allowed)
+
+
 _CONFIG_NAME = "client_mqtt.json"
 # feature 脚本下载根目录（设置页可改）。默认走 ghfast 代理拉 GitHub main；
 # 内置 feature 在首选 URL 失败时再按 _FALLBACK_FEATURE_URL_ROOTS 顺序回退。
@@ -835,8 +873,19 @@ def update_device_settings(existing_device, values):
         selected.update(values)
         selected["id"] = selected.get("id") or uuid.uuid4().hex
         selected["request_topic"] = request_topic
-        selected["name"] = str(values.get("name") or request_topic.rsplit("/", 1)[-1])
+        # name 规则：显式传入用传入；否则保留已有的自定义名；
+        # 老版本内置默认 "Target"（用户没起过名）回退 topic 末段，
+        # 避免 request topic 在顶栏永远显示成误导性的 "Target"。
+        explicit_name = str(values.get("name") or "").strip()
+        if explicit_name:
+            selected["name"] = explicit_name
+        elif not selected.get("name") or selected.get("name") == "Target":
+            selected["name"] = request_topic.rsplit("/", 1)[-1]
         selected["remote_root"] = str(values.get("remote_root", "/data/data"))
+        if "enabled_features" in values:
+            selected["enabled_features"] = _normalize_enabled_features(
+                values.get("enabled_features")
+            )
         if timeout_draft is None:
             selected.pop("timeout_draft", None)
         else:

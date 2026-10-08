@@ -53,6 +53,53 @@ def wrap():
 
 _PROXY_CLASSES = {}
 
+# 桌面单测没有 java 包；设备上 java.lang.Throwable 单独一条 except，
+# 保证 OOM 这类 java.lang.Error 同样穿不过 JVM 回调边界
+# （Chaquopy 下它不一定挂在 Python BaseException 上）。
+try:  # pragma: no cover - 平台分支
+    from java.lang import Throwable as _JavaThrowable
+except Exception:  # pragma: no cover
+    _JavaThrowable = None
+
+
+def report_feature_error(where, error):
+    """feature 回调出错只记录、不外抛：logcat(主) + stderr(兜底)。
+
+    铁律：任何 JVM->Python 回调里未捕获的异常都会变成主线程/工作线程的
+    UncaughtException，Android 直接杀进程。feature 错误永远不能崩 client。
+    """
+    detail = "%s failed: %s: %s" % (where, type(error).__name__, error)
+    try:  # pragma: no cover - 设备分支
+        from android.util import Log
+        Log.e("qgb-pyui", detail[:500])
+    except Exception:
+        pass
+    print(detail[:500])
+
+
+if _JavaThrowable is not None:  # pragma: no cover - 仅 Chaquopy 设备执行
+    def guarded(where, fn):
+        """把任意回调包成"永不抛出"版本（JVM 代理边界统一使用）。"""
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except BaseException as error:  # noqa: BLE001 - 边界必须全吞
+                report_feature_error(where, error)
+            except _JavaThrowable as error:  # noqa: BLE001 - java.lang.Error 兜底
+                report_feature_error(where, error)
+            return None
+        return wrapper
+else:
+    def guarded(where, fn):
+        """把任意回调包成"永不抛出"版本（桌面单测分支）。"""
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except BaseException as error:  # noqa: BLE001 - 边界必须全吞
+                report_feature_error(where, error)
+                return None
+        return wrapper
+
 
 def _runnable_class():
     """java.lang.Runnable 的唯一 dynamic_proxy 类（全进程共享，见模块约束）。"""
@@ -67,8 +114,9 @@ def _runnable_class():
                 self.fn = fn
 
             def run(self):
+                # 回调边界：feature 的 Runnable 异常只记录，绝不杀进程。
                 if self.fn is not None:
-                    self.fn()
+                    guarded("runnable", self.fn)()
 
         cls = _PROXY_CLASSES["runnable"] = RunnableProxy
     return cls
@@ -88,8 +136,9 @@ def _onclick_class():
                 self.fn = fn
 
             def onClick(self, _view):
+                # 点击回调里任何 feature 异常都不能穿透到 Android 主线程。
                 if self.fn is not None:
-                    self.fn()
+                    guarded("click", self.fn)()
 
         cls = _PROXY_CLASSES["onclick"] = OnClickProxy
     return cls
@@ -110,11 +159,11 @@ def _attach_class():
 
             def onViewAttachedToWindow(self, _view):
                 if self.on_attach_fn is not None:
-                    self.on_attach_fn()
+                    guarded("attach", self.on_attach_fn)()
 
             def onViewDetachedFromWindow(self, _view):
                 if self.on_detach_fn is not None:
-                    self.on_detach_fn()
+                    guarded("detach", self.on_detach_fn)()
 
         cls = _PROXY_CLASSES["attach"] = AttachProxy
     return cls
@@ -289,9 +338,9 @@ def watch_target(anchor, on_change):
             key, topic, cfg = read_config()
             if key != state["key"]:
                 state["key"] = key
-                on_change(key, topic, cfg)
-        except Exception:
-            pass
+                guarded("target change callback", lambda: on_change(key, topic, cfg))()
+        except BaseException as error:  # noqa: BLE001 - 轮询 tick 绝不能炸
+            report_feature_error("watch target", error)
         handler.postDelayed(tick, 800)
 
     tick.fn = tick_fn
@@ -309,26 +358,35 @@ def watch_target(anchor, on_change):
 
 
 def run_async(work, on_ok=None, on_error=None, buttons=()):
-    """工作线程跑 work()，结果/异常回主线程；执行期间禁用给定按钮。"""
+    """工作线程跑 work()，结果/异常回主线程；执行期间禁用给定按钮。
+
+    历史血泪坑：except ... as error 退出块时 CPython 会 del 掉 error，
+    不能在 except 里定义引用 error 的闭包再 _post 延迟执行——主线程真正
+    回调时会 NameError: cannot access free variable，直接崩 Activity。
+    必须用默认参数在定义时把 error 绑死。
+    """
     buttons = tuple(buttons)
+
+    def _restore_buttons():
+        for button in buttons:
+            guarded("enable button", lambda b=button: b.setEnabled(True))()
 
     def worker():
         try:
             value = work()
-        except BaseException as error:  # noqa: BLE001 - UI 必须看到失败原因
-            def apply_error():
-                for button in buttons:
-                    button.setEnabled(True)
+        except BaseException as captured_error:  # noqa: BLE001 - UI 必须看到失败原因
+            # 默认参数在定义时绑定，绕开 except 变量块结束被 del 的作用域坑。
+            def apply_error(err=captured_error):
+                _restore_buttons()
                 if on_error:
-                    on_error(error)
+                    guarded("on_error callback", lambda: on_error(err))()
             _post(apply_error)
             return
 
-        def apply_ok():
-            for button in buttons:
-                button.setEnabled(True)
+        def apply_ok(result=value):
+            _restore_buttons()
             if on_ok:
-                on_ok(value)
+                guarded("on_ok callback", lambda: on_ok(result))()
         _post(apply_ok)
 
     for button in buttons:

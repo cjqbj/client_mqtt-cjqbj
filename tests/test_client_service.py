@@ -937,6 +937,95 @@ class ClientServiceTests(unittest.TestCase):
                 if previous_wifi is not None:
                     sys.modules["feature_wifi"] = previous_wifi
 
+    def test_enabled_features_default_to_all_and_isolate_per_target(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                first_id = json.loads(client_service.device_settings())["id"]
+                second_id = json.loads(client_service.update_device_settings("sys/device/two", {
+                    "request_topic": "sys/device/two",
+                }))["id"]
+
+                # 缺省：enabled_features 为 None（全选），任何 feature 都生效。
+                self.assertIsNone(json.loads(client_service.device_settings())["enabled_features"])
+                self.assertIsNone(json.loads(client_service.enabled_features(first_id)))
+                self.assertTrue(client_service.is_feature_enabled("camera", first_id))
+                self.assertTrue(client_service.is_feature_enabled("feature_files", second_id))
+
+                # 白名单持久化：去 feature_ 前缀、去重、丢弃非法标识。
+                saved = json.loads(client_service.update_device_settings(first_id, {
+                    "request_topic": "sys/device/request",
+                    "enabled_features": ["feature_camera", "camera", "wifi", "bad-name!", ""],
+                }))
+                self.assertEqual(saved["enabled_features"], ["camera", "wifi"])
+                self.assertTrue(client_service.is_feature_enabled("camera", first_id))
+                self.assertFalse(client_service.is_feature_enabled("files", first_id))
+                self.assertEqual(
+                    json.loads(client_service.enabled_features(first_id)), ["camera", "wifi"]
+                )
+                # 另一目标不受影响，仍是全选。
+                self.assertTrue(client_service.is_feature_enabled("files", second_id))
+                # 白名单字符串 JSON 也接受。
+                saved = json.loads(client_service.update_device_settings(first_id, {
+                    "request_topic": "sys/device/request",
+                    "enabled_features": json.dumps(["files"]),
+                }))
+                self.assertEqual(saved["enabled_features"], ["files"])
+                # 非列表/非空值拒绝。
+                with self.assertRaises(ValueError):
+                    client_service.update_device_settings(first_id, {
+                        "request_topic": "sys/device/request",
+                        "enabled_features": {"camera": True},
+                    })
+                # JSON null 显式回到全选。
+                saved = json.loads(client_service.update_device_settings(first_id, {
+                    "request_topic": "sys/device/request",
+                    "enabled_features": None,
+                }))
+                self.assertIsNone(saved["enabled_features"])
+                self.assertTrue(client_service.is_feature_enabled("files", first_id))
+
+                # 重启后白名单仍在（重新落一份非空名单再模拟重启）。
+                client_service.update_device_settings(first_id, {
+                    "request_topic": "sys/device/request",
+                    "enabled_features": ["camera"],
+                })
+                client_service.initialize(files_dir)
+                self.assertTrue(client_service.is_feature_enabled("camera", first_id))
+                self.assertFalse(client_service.is_feature_enabled("wifi", first_id))
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_unnamed_target_stops_displaying_legacy_default_name(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                # 老版本持久化里用户没起过名，记录沿用内置默认 "Target"。
+                config_path = client_service._STATE["config_path"]
+                with open(config_path, "r", encoding="utf-8") as config_file:
+                    config = json.load(config_file)
+                config["devices"][0]["name"] = "Target"
+                with open(config_path, "w", encoding="utf-8") as config_file:
+                    json.dump(config, config_file)
+
+                # 任意一次设置保存（用户没传 name）都应回退成 topic 末段。
+                saved = json.loads(client_service.update_device_settings("sys/device/request", {
+                    "request_topic": "sys/device/request",
+                }))
+                self.assertEqual(saved["name"], "request")
+                # 显式自定义名保留。
+                saved = json.loads(client_service.update_device_settings("sys/device/request", {
+                    "request_topic": "sys/device/request",
+                    "name": "My Phone",
+                }))
+                self.assertEqual(saved["name"], "My Phone")
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
     def test_rescan_features_discovers_new_file_and_drops_deleted_runtime(self):
         import bootstrap
 

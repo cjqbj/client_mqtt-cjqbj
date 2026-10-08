@@ -43,6 +43,16 @@ Chaquopy 对同一个 Java 接口，全进程只能建**一个** `dynamic_proxy`
 - 组件只用：`Page`、`make_text/make_button/make_edit/make_hrow`、`copy_text`、`render_result/pretty`。
 - 跨实例状态（相机回调对象等）挂 `sys` 全局缓存，仿 feature_camera 的 `sys._qgb_photo_cb_cls`。
 
+### 4.1 错误隔离铁律：feature 错误不允许崩 client
+
+设计原则（按层兜底，每层独立）：
+
+- **服务器/topic 错误不影响 feature**：目标端报错、RPC 超时、返回 `ok:false`，feature 一律转成页面上的结构化错误文本（`on_error`/状态行），不弹崩溃框。
+- **feature 错误不影响 client 主程序**：任何 JVM→Python 回调里未捕获的异常都会变成 Android 未捕获异常直接杀进程。pyui_kit 的所有代理边界（点击、`_post` Runnable、attach/detach、watch tick、`run_async` 的 `on_ok/on_error`/按钮恢复）已统一吞掉异常并写 logcat（tag `qgb-pyui`）。feature 要做到：
+  - `run_async(work, on_ok, on_error, buttons)`：work 线程只管抛，错误经 `on_error` 回主线程；**不要**自己在 except 里定义引用异常变量的闭包再 `_post`（CPython 退出 except 会 `del error`，延迟回调必 NameError 崩进程——已踩过）。需要绑定时用默认参数，或直接交给 `run_async`。
+  - 回调里拿不准的 JVM 调用（View 已 detach、bitmap 为 None 后 setImageBitmap 等）自己也 try 一下，失败显示错误文本；即使漏了，边界护栏也只吞不崩，但页面会停在旧状态。
+  - `call_feature` 把 feature 动作异常（含 SystemExit）转成 `{ok:false, error}` JSON；Kotlin 建 View 异常兜成错误页。native/JVM 硬崩溃不在保护范围。
+
 ## 5. import 规则
 
 - `android.*`、`java.*` 及任何 Chaquopy/JVM 相关 import **只许写在函数体内**，禁止模块顶层 import（桌面单测与非安卓环境要能 import 模块）。
@@ -85,6 +95,10 @@ https://ghfast.top/https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/ref
 - `client_service.feature_settings(name)` / `update_feature_settings(name, values)`：按当前选中目标存 feature 自己的扁平 JSON（浅合并，别放秘钥/大 blob）。
 - 当前选中目标 tab 由外壳自动记忆（`selected_feature`），feature 不用管。
 - 当前目标配置：`client_service.selected_config()`（pyui_kit 内同名便捷封装）。
+- **每目标 feature 生效列表**（`enabled_features`）：
+  - 缺省/`null` = **全部 feature 对该目标生效（默认全选）**；显式列表 = 白名单，只有名单内 feature 在该目标的底栏/侧栏/pager 出现。全部重新勾齐回归 null，新装 feature 自动可见。
+  - 由目标设置页勾选，外壳负责过滤与持久化，feature 自身无感知。确需在代码里判断时用 `client_service.is_feature_enabled("camera", device_ref=None)` / `enabled_features(device_ref)`；写入只走 `update_device_settings`（自动归一化：去 `feature_` 前缀、去重、丢弃非法标识）。
+  - 字段随目标记录持久化，契约贯穿 `client_mqtt.json` → `device_catalog/device_settings` JSON → Kotlin `TargetDescriptor.enabledFeatures` → 过滤 UI，任何一端新增消费方都要按 null=全选兜底。
 
 ## 9. 自检
 

@@ -60,6 +60,7 @@ import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.twotone.Security
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -137,7 +138,9 @@ private data class TargetDescriptor(
     val id: String,
     val name: String,
     val requestTopic: String,
-    val remoteRoot: String
+    val remoteRoot: String,
+    // null = 全部 feature 对该目标生效（默认全选）；非空 = 白名单。
+    val enabledFeatures: List<String>? = null
 )
 
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
@@ -162,7 +165,16 @@ class MainActivity : ComponentActivity() {
 private fun ClientMqttScreen() {
     var features by remember { mutableStateOf(listOf<FeatureDescriptor>()) }
     var targets by remember { mutableStateOf(listOf<TargetDescriptor>()) }
-    val pagerState = rememberPagerState(pageCount = { features.size })
+    var selectedDevice by remember { mutableStateOf("Target") }
+    var selectedDeviceId by remember { mutableStateOf("") }
+    var selectedTopic by remember { mutableStateOf("sys/device/request") }
+    // 当前目标生效的 feature：目标 enabled_features 为 null 时全选（默认），
+    // 否则按白名单过滤。底栏/侧栏/pager 一律只用过滤后的列表，避免索引错位。
+    val visibleFeatures = remember(features, targets, selectedDeviceId) {
+        val whitelist = targets.firstOrNull { it.id == selectedDeviceId }?.enabledFeatures
+        if (whitelist == null) features else features.filter { it.name in whitelist }
+    }
+    val pagerState = rememberPagerState(pageCount = { visibleFeatures.size })
     val pagerScope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(initialValue = androidx.compose.material3.DrawerValue.Closed)
     var settings by remember { mutableStateOf(false) }
@@ -171,9 +183,6 @@ private fun ClientMqttScreen() {
     var editingDeviceId by remember { mutableStateOf<String?>(null) }
     var permissions by remember { mutableStateOf(false) }
     var reloadTarget by remember { mutableStateOf<FeatureDescriptor?>(null) }
-    var selectedDevice by remember { mutableStateOf("Target") }
-    var selectedDeviceId by remember { mutableStateOf("") }
-    var selectedTopic by remember { mutableStateOf("sys/device/request") }
     // 冷启动恢复闸门：Python 端 selected_device_id 恢复完成前，
     // 轮询协程不得用 Kotlin 占位 topic 匹配并覆盖持久化选择。
     var restoreDone by remember { mutableStateOf(false) }
@@ -192,11 +201,25 @@ private fun ClientMqttScreen() {
         for (index in 0 until array.length()) {
             val item = array.optJSONObject(index) ?: continue
             val topic = item.optString("request_topic")
-            if (topic.isNotBlank()) add(TargetDescriptor(
+            if (topic.isBlank()) continue
+            val rawName = item.optString("name", topic)
+            // 老版本内置默认名 "Target" 对任何 topic 都误导，显示层回退 topic 末段，
+            // 与 client_service.update_device_settings 的命名规则保持一致。
+            val name = rawName.ifBlank { topic }.let { if (it == "Target") topic.substringAfterLast('/') else it }
+            val enabledArray = if (item.isNull("enabled_features")) null else item.optJSONArray("enabled_features")
+            val enabledFeatures = enabledArray?.let { arr ->
+                buildList {
+                    for (featureIndex in 0 until arr.length()) {
+                        add(arr.optString(featureIndex))
+                    }
+                }
+            }
+            add(TargetDescriptor(
                 item.optString("id", topic),
-                item.optString("name", topic),
+                name,
                 topic,
-                item.optString("remote_root", "/data/data")
+                item.optString("remote_root", "/data/data"),
+                enabledFeatures
             ))
         }
     }
@@ -324,21 +347,22 @@ private fun ClientMqttScreen() {
         }
     }
 
-    LaunchedEffect(features.size) {
-        if (features.isNotEmpty() && pagerState.currentPage >= features.size) {
-            pagerState.animateScrollToPage(features.lastIndex)
+    LaunchedEffect(visibleFeatures.size) {
+        if (visibleFeatures.isNotEmpty() && pagerState.currentPage >= visibleFeatures.size) {
+            pagerState.scrollToPage(visibleFeatures.lastIndex)
         }
     }
 
     // 恢复当前设备上次选中的 feature tab（每设备只做一次；
     // 特性表 3s 轮询会反复替换列表，靠 featureRestoredFor 挡掉重入）。
-    LaunchedEffect(selectedDeviceId, features) {
+    // 只在该目标当前生效的 feature 里找，被禁用的记忆 tab 不恢复。
+    LaunchedEffect(selectedDeviceId, visibleFeatures) {
         val deviceId = selectedDeviceId
-        if (deviceId.isBlank() || features.isEmpty() || featureRestoredFor == deviceId) return@LaunchedEffect
+        if (deviceId.isBlank() || visibleFeatures.isEmpty() || featureRestoredFor == deviceId) return@LaunchedEffect
         val saved = withContext(Dispatchers.IO) {
             runCatching { service.callAttr("selected_feature", deviceId).toString() }.getOrDefault("")
         }
-        val index = features.indexOfFirst { it.name == saved }
+        val index = visibleFeatures.indexOfFirst { it.name == saved }
         if (index >= 0 && pagerState.currentPage != index) {
             pagerState.scrollToPage(index)
         }
@@ -346,10 +370,10 @@ private fun ClientMqttScreen() {
     }
 
     // 用户切页（点 tab 或滑动）后回写该设备的最后选中 feature。
-    LaunchedEffect(pagerState, selectedDeviceId, features.isNotEmpty()) {
+    LaunchedEffect(pagerState, selectedDeviceId, visibleFeatures.isNotEmpty()) {
         snapshotFlow { pagerState.currentPage }.collect { page ->
             val deviceId = selectedDeviceId
-            val feature = features.getOrNull(page) ?: return@collect
+            val feature = visibleFeatures.getOrNull(page) ?: return@collect
             if (deviceId.isBlank() || featureRestoredFor != deviceId) return@collect
             withContext(Dispatchers.IO) {
                 runCatching { service.callAttr("select_feature", feature.name, deviceId) }
@@ -383,7 +407,7 @@ private fun ClientMqttScreen() {
                         .fillMaxWidth()
                         .verticalScroll(rememberScrollState())
                 ) {
-                features.forEachIndexed { index, feature ->
+                visibleFeatures.forEachIndexed { index, feature ->
                     val featureSelected = pagerState.currentPage == index && !settings && !targetSettings
                     // 自绘条目：combinedClickable 同一处理器内确定地分发短按/长按，
                     // 不要在带内部 clickable 的 NavigationDrawerItem 上叠加 pointerInput，
@@ -468,7 +492,9 @@ private fun ClientMqttScreen() {
                     title = {
                         Column {
                             Text(selectedDevice)
-                            Text(onlineStatus, style = MaterialTheme.typography.labelSmall)
+                            // 名称只作别名，topic 必须同屏可见：
+                            // 避免"选了 sys/device/request 却只显示 Target"的困惑。
+                            Text("$selectedTopic · $onlineStatus", style = MaterialTheme.typography.labelSmall)
                         }
                     },
                     actions = {
@@ -496,8 +522,8 @@ private fun ClientMqttScreen() {
             },
             snackbarHost = { SnackbarHost(snackbarHostState) },
             bottomBar = {
-                if (!settings && !targetSettings && !permissions && !diagnostics && features.isNotEmpty()) {
-                    val selectedPage = pagerState.currentPage.coerceIn(0, features.lastIndex)
+                if (!settings && !targetSettings && !permissions && !diagnostics && visibleFeatures.isNotEmpty()) {
+                    val selectedPage = pagerState.currentPage.coerceIn(0, visibleFeatures.lastIndex)
                     NavigationBar {
                         // 每项固定 72dp：一屏平铺约 6 个；feature 更多时整条横向滚动，
                         // 不再用 weight 平分把大量图标压成看不清的细条。
@@ -506,7 +532,7 @@ private fun ClientMqttScreen() {
                                 .fillMaxWidth()
                                 .horizontalScroll(rememberScrollState())
                         ) {
-                        features.forEachIndexed { index, feature ->
+                        visibleFeatures.forEachIndexed { index, feature ->
                             val itemSelected = selectedPage == index
                             // 自绘底部条目：短按切页、长按重载由同一个 combinedClickable
                             // 确定分发；NavigationBarItem 内部 clickable 会吞掉叠加的长按手势。
@@ -563,22 +589,41 @@ private fun ClientMqttScreen() {
             // 进行中的网络请求继续跑，照片/输出等状态也都保留，返回时原样还在。
             Box(Modifier.fillMaxSize()) {
                 Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-                    if (features.isEmpty()) {
-                        Text("No feature scripts found", modifier = Modifier.padding(16.dp))
-                    } else {
-                        // 所有页常驻组合（不只是相邻页）：横向切 feature 时不丢任何
-                        // 页面状态；page 内容按 feature 名 key 住，目录刷新后身份不变。
-                        HorizontalPager(
-                            state = pagerState,
-                            modifier = Modifier.fillMaxSize().weight(1f),
-                            beyondViewportPageCount = features.size
-                        ) { page ->
-                            key(features[page].name) {
-                                // 所有 feature 界面都由 feature_*.py 自绘（ui=python），
-                                // APK 端只保留这一个通用宿主；新增/改版界面只热更脚本。
-                                PythonViewPage(features[page], service)
-                            }
+                    when {
+                        features.isEmpty() ->
+                            Text("No feature scripts found", modifier = Modifier.padding(16.dp))
+                        // 该目标把 feature 全关了：不崩不空转，引导去目标设置里勾选。
+                        visibleFeatures.isEmpty() -> Column(
+                            modifier = Modifier.fillMaxSize().padding(24.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Text(
+                                "No feature enabled for this target",
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                            Text(
+                                "Open target settings and choose which features apply to $selectedTopic.",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            OutlinedButton(onClick = {
+                                editingDeviceId = selectedDeviceId
+                                targetSettings = true
+                            }) { Text("Enable features") }
                         }
+                        else ->
+                            // 所有页常驻组合（不只是相邻页）：横向切 feature 时不丢任何
+                            // 页面状态；page 内容按 feature 名 key 住，目录刷新后身份不变。
+                            HorizontalPager(
+                                state = pagerState,
+                                modifier = Modifier.fillMaxSize().weight(1f),
+                                beyondViewportPageCount = visibleFeatures.size
+                            ) { page ->
+                                key(visibleFeatures[page].name) {
+                                    // 所有 feature 界面都由 feature_*.py 自绘（ui=python），
+                                    // APK 端只保留这一个通用宿主；新增/改版界面只热更脚本。
+                                    PythonViewPage(visibleFeatures[page], service)
+                                }
+                            }
                     }
                 }
                 // 覆盖页：不透明背景全盖住底层 pager，但不销毁它。
@@ -598,7 +643,11 @@ private fun ClientMqttScreen() {
                         TargetSettingsPage(
                             modifier = Modifier.padding(padding),
                             existingDeviceId = editingDeviceId,
-                            onBack = { targetSettings = false },
+                            onBack = {
+                                targetSettings = false
+                                // 勾选改动落盘后立刻重拉目录，不等 1s 轮询。
+                                scope.launch { runCatching { refreshTargets() } }
+                            },
                             onTargetCreated = { id ->
                                 selectedDeviceId = id
                             }
@@ -788,8 +837,29 @@ private fun TargetSettingsPage(
     var loaded by remember(existingDeviceId) { mutableStateOf(existingDeviceId == null) }
     var lastLocalEdit by remember(existingDeviceId) { mutableStateOf(0L) }
     var status by remember { mutableStateOf("") }
+    // feature 勾选：null=全部生效（默认全选）；非空=该目标的 feature 白名单。
+    val featureCatalog = remember { mutableStateOf(listOf<FeatureDescriptor>()) }
+    var enabledFeatures by remember(existingDeviceId) { mutableStateOf<List<String>?>(null) }
     val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        runCatching {
+            val raw = withContext(Dispatchers.IO) { service.callAttr("feature_catalog").toString() }
+            val array = org.json.JSONArray(raw)
+            featureCatalog.value = buildList {
+                for (index in 0 until array.length()) {
+                    val item = array.optJSONObject(index) ?: continue
+                    add(FeatureDescriptor(
+                        name = item.optString("name"),
+                        title = item.optString("title", item.optString("name")),
+                        actions = emptyList(),
+                        ui = item.optString("ui", "compose").ifBlank { "compose" }
+                    ))
+                }
+            }
+        }
+    }
 
     LaunchedEffect(deviceId, existingDeviceId) {
         val targetId = deviceId.ifBlank { existingDeviceId ?: return@LaunchedEffect }
@@ -805,6 +875,13 @@ private fun TargetSettingsPage(
                     privateKey = config.optString("private_key", "")
                     timeout = config.optString("timeout_draft", config.optString("timeout", "10"))
                     allowNoServerKey = config.optBoolean("allow_no_server_pubkey_response", true)
+                    val enabledArray = if (config.isNull("enabled_features")) null
+                        else config.optJSONArray("enabled_features")
+                    enabledFeatures = enabledArray?.let { arr ->
+                        buildList {
+                            for (featureIndex in 0 until arr.length()) add(arr.optString(featureIndex))
+                        }
+                    }
                     loaded = true
                 }
             }.onFailure { status = "Unable to sync target settings: ${it.message}" }
@@ -812,7 +889,7 @@ private fun TargetSettingsPage(
         }
     }
 
-    LaunchedEffect(deviceId, topic, remoteRoot, privateKey, timeout, allowNoServerKey, loaded) {
+    LaunchedEffect(deviceId, topic, remoteRoot, privateKey, timeout, allowNoServerKey, enabledFeatures, loaded) {
         if (!loaded || topic.isBlank()) return@LaunchedEffect
         delay(300)
         val timeoutValue = timeout.toDoubleOrNull()?.takeIf { it > 0 }
@@ -821,6 +898,9 @@ private fun TargetSettingsPage(
             .put("remote_root", remoteRoot)
             .put("private_key", privateKey)
             .put("allow_no_server_pubkey_response", allowNoServerKey)
+        // null 序列化成 JSON null：Python 端解释为"缺省=全选"。
+        if (enabledFeatures == null) values.put("enabled_features", JSONObject.NULL)
+        else values.put("enabled_features", org.json.JSONArray(enabledFeatures))
         if (timeoutValue != null) values.put("timeout", timeoutValue)
         else values.put("timeout_draft", timeout)
 
@@ -919,6 +999,61 @@ private fun TargetSettingsPage(
                 checked = allowNoServerKey,
                 onCheckedChange = { allowNoServerKey = it; lastLocalEdit = System.currentTimeMillis() }
             )
+        }
+        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+        // 每个目标独立的 feature 生效列表：默认全选（enabled_features=null），
+        // 勾掉任意一项才落白名单；重新勾齐回到 null（新装 feature 自动生效）。
+        val catalog = featureCatalog.value
+        val allFeaturesEnabled = enabledFeatures == null
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("Enabled features", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "Choose which features apply to this target. Default: all.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            Checkbox(
+                checked = allFeaturesEnabled,
+                onCheckedChange = { checked ->
+                    enabledFeatures = if (checked) null else emptyList()
+                    lastLocalEdit = System.currentTimeMillis()
+                }
+            )
+        }
+        if (!allFeaturesEnabled) {
+            catalog.forEach { descriptor ->
+                val checked = enabledFeatures?.contains(descriptor.name) == true
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .combinedClickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = LocalIndication.current,
+                            onClick = {
+                                val current = enabledFeatures ?: catalog.map { it.name }
+                                val next = if (checked) current - descriptor.name
+                                else (current + descriptor.name).distinct()
+                                // 全部勾齐时回归 null（默认全选语义），新装 feature 自动可见。
+                                enabledFeatures = if (catalog.all { it.name in next }) null else next
+                                lastLocalEdit = System.currentTimeMillis()
+                            }
+                        )
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(
+                        checked = checked,
+                        onCheckedChange = null
+                    )
+                    Text(descriptor.title)
+                }
+            }
         }
         Text(status, style = MaterialTheme.typography.bodySmall)
     }

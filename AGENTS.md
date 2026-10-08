@@ -12,7 +12,12 @@
 - 文件和照片字节通过目标端 `aliyun_git` 上传，再由客户端通过 HTTP 下载。
 - 拍照数据必须保留在内存中，不得在目标设备写入照片文件。
 
-- 每个 `request_topic` 对应带稳定 ID 的独立目标配置；topic、远程根目录、私钥、超时和验签回退选项保存在脚本根目录的 `client_mqtt.json`。Aliyun 是公共配置，保存在同一文件的顶层，不得放进目标记录。目标页和公共 Aliyun 设置页修改后自动保存，并轮询感知外部文件变更。
+- 每个 `request_topic` 对应带稳定 ID 的独立目标配置；topic、远程根目录、私钥、超时、验签回退选项和 feature 生效列表（`enabled_features`，缺省/null=全选）保存在脚本根目录的 `client_mqtt.json`。Aliyun 是公共配置，保存在同一文件的顶层，不得放进目标记录。目标页和公共 Aliyun 设置页修改后自动保存，并轮询感知外部文件变更。
+- 错误隔离设计原则，任何改动不得破坏：
+  - 服务器/topic 错误不影响 feature：目标端报错、RPC 超时/失败必须结构化为页面错误文本，不弹崩溃框。
+  - feature 错误不影响 client 主程序：JVM→Python 回调边界（pyui_kit 的 Runnable/OnClick/attach/watch/run_async 回调）统一吞异常并写 logcat（tag `qgb-pyui`），禁止 feature 自建 dynamic_proxy 绕过护栏；异常变量不得在 except 闭包里延迟引用。
+  - 顶栏名称只是别名，request topic 必须同屏显示；老内置名 "Target" 在显示层和下次保存时回退 topic 末段。
+- `enabled_features` 契约：每个目标可独立勾选生效 feature，默认全选（存 null，不存名单，新装 feature 自动可见）；字段贯穿持久化 → `device_catalog/device_settings` JSON → Kotlin `TargetDescriptor.enabledFeatures` → 底栏/侧栏/pager 过滤，所有消费端按 null=全选兜底；被过滤掉的 feature 不参与 tab 索引与恢复。
 - 拍照目标端代码和 `capture` 入口集中在 `feature_camera.py`；Compose 页面只负责选择相机并调用 feature。
 - 首次使用外部脚本目录时，可通过设置页的 Python 下载器安装缺失的 files、camera、wifi 脚本。下载要有超时、备用地址和重试，并在界面日志区显示逐步结果。
 
