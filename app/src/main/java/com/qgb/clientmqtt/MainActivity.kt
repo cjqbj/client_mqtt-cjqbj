@@ -124,18 +124,9 @@ private data class FeatureDescriptor(
     val error: String? = null
 )
 
-// 设置页"目标端 feature 列表"的一行：由远程扫描 RPC 返回。
-private data class RemoteFeatureEntry(
-    val name: String,
-    val title: String,
-    val actions: List<String>,
-    val version: String,
-    // 生效版本来源：builtin（AssetFinder 内置）/ py_updates（热更遮蔽）。
-    val source: String,
-    val dir: String,
-    // 同名文件同时存在于内置目录和 py_updates。
-    val shadowed: Boolean,
-    val error: String? = null
+// 设置页"下载服务器 feature 列表"的一行：只保留文件名，一行一个。
+private data class ServerFeatureFile(
+    val name: String
 )
 
 private fun featureIcon(feature: FeatureDescriptor) = when (feature.icon?.lowercase()) {
@@ -727,11 +718,13 @@ private fun ClientMqttScreen() {
             title = { Text("Reload feature module") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("${feature.title} (feature_${feature.name}.py)")
-                    Text(
-                        "Loaded from: " + (feature.moduleFile.ifBlank { "not loaded yet" }),
-                        style = MaterialTheme.typography.bodySmall
-                    )
+                    Text("feature_${feature.name}.py")
+                    SelectionContainer {
+                        Text(
+                            "Loaded from: " + (feature.moduleFile.ifBlank { "not loaded yet" }),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
                     Text(
                         "Drops sys.modules cache and pyc, then re-imports from py_updates.",
                         style = MaterialTheme.typography.bodySmall
@@ -1031,7 +1024,9 @@ private fun TargetSettingsPage(
             else "Private key: configured; value is never copied to RPC logs",
             style = MaterialTheme.typography.bodySmall
         )
-        if (privateKeyStatus.isNotBlank()) Text(privateKeyStatus, style = MaterialTheme.typography.bodySmall)
+        if (privateKeyStatus.isNotBlank()) SelectionContainer {
+            Text(privateKeyStatus, style = MaterialTheme.typography.bodySmall)
+        }
         OutlinedTextField(
             timeout,
             { timeout = it.filter { char -> char.isDigit() || char == '.' }; lastLocalEdit = System.currentTimeMillis() },
@@ -1101,7 +1096,7 @@ private fun TargetSettingsPage(
                         checked = checked,
                         onCheckedChange = null
                     )
-                    Text(descriptor.title)
+                    Text("feature_${descriptor.name}.py")
                 }
             }
         }
@@ -1141,11 +1136,13 @@ private fun SettingsPage(
     // 实际扫描到的 feature 全量列表（内置 + py_updates，含加载失败条目）。
     var featureList by remember { mutableStateOf(listOf<FeatureDescriptor>()) }
     var featureListBusy by remember { mutableStateOf(false) }
-    // 远程目标扫描出的 feature 列表（Refresh 按钮打的是目标端，不是本机）。
-    var remoteFeatures by remember { mutableStateOf(listOf<RemoteFeatureEntry>()) }
-    var remoteBusy by remember { mutableStateOf(false) }
-    var remoteStatus by remember { mutableStateOf("") }
-    var remoteOk by remember { mutableStateOf(false) }
+    // 下载服务器（ghfast 输入框那个 root）上的 feature 文件列表。
+    var serverFiles by remember { mutableStateOf(listOf<ServerFeatureFile>()) }
+    var serverListBusy by remember { mutableStateOf(false) }
+    var serverListStatus by remember { mutableStateOf("") }
+    var serverListOk by remember { mutableStateOf(false) }
+    // 设置持久化位置（/sdcard/apm/client_mqtt/settings 按 topic 分目录，重装不丢）。
+    var storageInfo by remember { mutableStateOf<JSONObject?>(null) }
     // feature 下载根 URL：Python 端有默认值（ghfast 代理 GitHub main），
     // 加载完成前输入框显示占位，绝不能把空串回写覆盖默认配置。
     var featureUrlRoot by remember { mutableStateOf("") }
@@ -1217,71 +1214,50 @@ private fun SettingsPage(
         }
     }
 
-    // 扫描【远程目标】的 feature 文件（内置 AssetFinder + 目标端 py_updates）。
-    // 本机列表自动发现、无需手刷；这里的 Refresh 专门问目标端要清单。
-    fun parseRemoteCatalog(raw: String): List<RemoteFeatureEntry> {
-        val payload = JSONObject(raw)
-        val array = payload.optJSONArray("features") ?: return emptyList()
-        return buildList {
-            for (index in 0 until array.length()) {
-                val item = array.optJSONObject(index) ?: continue
-                val name = item.optString("name")
-                if (name.isBlank()) continue
-                val sources = item.optJSONArray("sources")
-                val active = item.optJSONObject("active") ?: JSONObject()
-                val title = active.optString("title").ifBlank {
-                    name.replaceFirstChar { it.uppercase() }
-                }
-                val actionsArray = active.optJSONArray("actions") ?: org.json.JSONArray()
-                add(RemoteFeatureEntry(
-                    name = name,
-                    title = title,
-                    actions = buildList {
-                        for (actionIndex in 0 until actionsArray.length()) {
-                            add(actionsArray.optString(actionIndex))
-                        }
-                    },
-                    version = active.opt("version")?.toString().orEmpty(),
-                    source = active.optString("source").ifBlank { "unknown" },
-                    dir = active.optString("dir"),
-                    shadowed = (sources?.length() ?: 0) > 1,
-                    error = active.optString("error").ifBlank { null }
-                ))
-            }
-        }
-    }
-
-    suspend fun refreshRemoteFeatures() {
-        remoteBusy = true
+    // 从【下载服务器】（ghfast/raw URL root）拉 feature 文件清单。
+    // 本机列表自动发现、无需手刷；这里的 Refresh 专门验证远程 URL 能否取到列表。
+    suspend fun refreshServerFeatureFiles() {
+        serverListBusy = true
         try {
             val raw = withContext(Dispatchers.IO) {
-                service.callAttr("remote_feature_catalog").toString()
+                service.callAttr("download_server_feature_files", 20).toString()
             }
             val payload = JSONObject(raw)
-            remoteOk = payload.optBoolean("ok")
-            if (remoteOk) {
-                remoteFeatures = parseRemoteCatalog(raw)
-                val dirs = payload.optJSONArray("candidate_dirs")
-                val elapsed = payload.opt("elapsed_ms")
-                remoteStatus = buildString {
-                    append("${remoteFeatures.size} features · ${dirs?.length() ?: 0} dirs")
-                    if (elapsed != null) append(" · ${elapsed}ms")
+            serverListOk = payload.optBoolean("ok")
+            if (serverListOk) {
+                val array = payload.optJSONArray("files") ?: org.json.JSONArray()
+                serverFiles = buildList {
+                    for (index in 0 until array.length()) {
+                        val item = array.optJSONObject(index) ?: continue
+                        val name = item.optString("name")
+                        if (name.isNotBlank()) add(ServerFeatureFile(name = name))
+                    }
                 }
+                serverListStatus = "${serverFiles.size} files from ${payload.optString("source_url")}"
             } else {
-                remoteFeatures = emptyList()
-                remoteStatus = payload.optString("error").ifBlank { "scan failed" }
+                serverFiles = emptyList()
+                serverListStatus = payload.optString("error").ifBlank { "list failed" }
             }
         } catch (error: Exception) {
-            remoteOk = false
-            remoteFeatures = emptyList()
-            remoteStatus = "scan failed: ${error.message}"
+            serverListOk = false
+            serverFiles = emptyList()
+            serverListStatus = "list failed: ${error.message}"
         } finally {
-            remoteBusy = false
+            serverListBusy = false
         }
     }
 
-    // 进入设置页自动扫一次远程；之后手动 Refresh 才再扫（避免频繁 RPC）。
-    LaunchedEffect(Unit) { runCatching { refreshRemoteFeatures() } }
+    // 进设置页拉一次：设置持久化位置 + 远程文件清单（只读，安全）。
+    LaunchedEffect(Unit) {
+        runCatching {
+            storageInfo = JSONObject(
+                withContext(Dispatchers.IO) {
+                    service.callAttr("settings_storage_info").toString()
+                }
+            )
+        }
+        runCatching { refreshServerFeatureFiles() }
+    }
 
     suspend fun refreshDownloadLogs() {
         val raw = withContext(Dispatchers.IO) { service.callAttr("operation_logs").toString() }
@@ -1298,11 +1274,15 @@ private fun SettingsPage(
         }
     }
 
-    LaunchedEffect(Unit) {
+    // aliyun 按 topic 私有存放：切换目标时重新拉取该 topic 的配置。
+    LaunchedEffect(selectedTopic) {
+        aliyunLoaded = false
         while (true) {
             runCatching {
                 val config = withContext(Dispatchers.IO) {
-                    JSONObject(service.callAttr("aliyun_settings").toString())
+                    JSONObject(
+                        service.callAttr("aliyun_settings", selectedTopic).toString()
+                    )
                 }
                 if (System.currentTimeMillis() - aliyunLastEdit >= 1_200L) {
                     // 远端始终下发 aliyun_json_draft 键，无草稿时为 null。
@@ -1330,7 +1310,7 @@ private fun SettingsPage(
                     }
                     aliyunLoaded = true
                 }
-            }.onFailure { aliyunStatus = "Unable to sync shared Aliyun settings: ${it.message}" }
+            }.onFailure { aliyunStatus = "Unable to sync Aliyun settings: ${it.message}" }
             delay(1_000)
         }
     }
@@ -1345,13 +1325,13 @@ private fun SettingsPage(
         else values.put("aliyun", parsed)
         runCatching {
             withContext(Dispatchers.IO) {
-                service.callAttr("update_aliyun_settings", values.toString())
+                service.callAttr("update_aliyun_settings", values.toString(), selectedTopic)
             }
             // 解析失败只是提示：文本原样保留为草稿，上次有效配置继续生效，绝不清空输入框。
             aliyunStatus = if (parsed == null) {
                 "Invalid JSON (${parseResult.exceptionOrNull()?.message}); text kept as draft, last valid settings stay active"
             } else {
-                "Shared Aliyun settings saved"
+                "Aliyun settings saved for $selectedTopic"
             }
         }.onFailure { aliyunStatus = "Aliyun settings save failed: ${it.message}" }
     }
@@ -1444,7 +1424,11 @@ private fun SettingsPage(
             })
         }
         HorizontalDivider()
-        Text("Shared Aliyun configuration", style = MaterialTheme.typography.titleMedium)
+        Text("Aliyun configuration", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Stored per topic: $selectedTopic",
+            style = MaterialTheme.typography.bodySmall
+        )
         val aliyunParseError = remember(aliyunJson) {
             parseAliyunJson(aliyunJson).exceptionOrNull()?.message
         }
@@ -1464,7 +1448,9 @@ private fun SettingsPage(
             } else null,
             label = { Text("Aliyun configuration JSON") }
         )
-        Text(aliyunStatus, style = MaterialTheme.typography.bodySmall)
+        if (aliyunStatus.isNotBlank()) SelectionContainer {
+            Text(aliyunStatus, style = MaterialTheme.typography.bodySmall)
+        }
         HorizontalDivider()
         Text("Online status probe", style = MaterialTheme.typography.titleMedium)
         Row(
@@ -1492,7 +1478,23 @@ private fun SettingsPage(
             label = { Text("Probe interval in seconds") }
         )
         Text("After any successful RPC, the next probe waits for this interval. Minimum 5 seconds.", style = MaterialTheme.typography.bodySmall)
-        Text(probeSettingsStatus, style = MaterialTheme.typography.bodySmall)
+        if (probeSettingsStatus.isNotBlank()) SelectionContainer {
+            Text(probeSettingsStatus, style = MaterialTheme.typography.bodySmall)
+        }
+        HorizontalDivider()
+        // 设置持久化位置：外置存储时卸载/重装/删数据都不丢，每个 topic 一个子文件夹。
+        Text("Settings storage", style = MaterialTheme.typography.titleMedium)
+        SelectionContainer {
+            Text(
+                if (storageInfo?.optBoolean("external") == true)
+                    "On external storage (survives reinstall): ${storageInfo?.optString("settings_dir")}"
+                else
+                    "Internal app storage (lost on uninstall): ${storageInfo?.optString("legacy_path").orEmpty()}. Grant all-files access for /sdcard backup.",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (storageInfo?.optBoolean("external") == true) MaterialTheme.colorScheme.onSurfaceVariant
+                else MaterialTheme.colorScheme.error
+            )
+        }
         HorizontalDivider()
         Row(
             Modifier.fillMaxWidth(),
@@ -1500,26 +1502,26 @@ private fun SettingsPage(
             verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
         ) {
             Column(Modifier.weight(1f)) {
-                Text("Features on target", style = MaterialTheme.typography.titleMedium)
+                Text("Feature files on download server", style = MaterialTheme.typography.titleMedium)
                 Text(
-                    "Scans the SELECTED TARGET's AssetFinder and py_updates over RPC: $selectedTopic",
+                    "Lists feature_*.py under the URL root below (ghfast). Local files are discovered automatically.",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
             OutlinedButton(
-                enabled = !remoteBusy,
-                onClick = { scope.launch { runCatching { refreshRemoteFeatures() } } }
+                enabled = !serverListBusy,
+                onClick = { scope.launch { runCatching { refreshServerFeatureFiles() } } }
             ) {
                 Icon(Icons.Outlined.Refresh, contentDescription = null)
-                Text(if (remoteBusy) "Scanning..." else "Refresh target list")
+                Text(if (serverListBusy) "Fetching..." else "Refresh server list")
             }
         }
-        if (remoteStatus.isNotBlank()) {
+        if (serverListStatus.isNotBlank()) {
             SelectionContainer {
                 Text(
-                    remoteStatus,
+                    serverListStatus,
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (remoteOk) MaterialTheme.colorScheme.onSurfaceVariant
+                    color = if (serverListOk) MaterialTheme.colorScheme.onSurfaceVariant
                     else MaterialTheme.colorScheme.error
                 )
             }
@@ -1527,50 +1529,25 @@ private fun SettingsPage(
         Column(
             Modifier
                 .fillMaxWidth()
-                .heightIn(min = 48.dp, max = 240.dp)
+                .heightIn(min = 48.dp, max = 220.dp)
                 .background(MaterialTheme.colorScheme.surfaceVariant)
                 .verticalScroll(rememberScrollState())
                 .padding(8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+            verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            if (remoteFeatures.isEmpty()) {
+            if (serverFiles.isEmpty()) {
                 Text(
-                    if (remoteBusy) "Scanning target..."
-                    else "Not scanned yet. Tap \"Refresh target list\".",
+                    if (serverListBusy) "Fetching list..."
+                    else "Not fetched yet. Tap \"Refresh server list\".",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
-            remoteFeatures.forEach { entry ->
-                Column {
-                    Text(
-                        buildString {
-                            append("${entry.title}  (${entry.name})")
-                            if (entry.shadowed) append("  · override")
-                        },
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    Text(
-                        buildString {
-                            append(if (entry.source == "py_updates") "py_updates" else "built-in")
-                            if (entry.version.isNotBlank()) append("  · v${entry.version}")
-                            if (entry.actions.isNotEmpty()) append("  · ${entry.actions.joinToString()}")
-                        },
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    SelectionContainer {
-                        Text(entry.dir, style = MaterialTheme.typography.bodySmall)
-                    }
-                    entry.error?.let { message ->
-                        SelectionContainer {
-                            Text(
-                                "error: $message",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.error
-                            )
-                        }
-                    }
-                    HorizontalDivider()
-                }
+            // 只显示文件名，一条一行，避免 title/name 两套名字造成歧义。
+            serverFiles.forEach { file ->
+                Text(
+                    file.name,
+                    style = MaterialTheme.typography.bodyMedium
+                )
             }
         }
         if (useExternal && externalAllowed) {
@@ -1600,7 +1577,7 @@ private fun SettingsPage(
                     onClick = {
                         // 立即让 Python 重扫【本机】py_updates（同时收养新 feature 进
                         // 目标白名单），然后刷新本页列表和外层底栏。
-                        // 远程目标的 feature 列表用上面的 "Refresh target list"。
+                        // 下载服务器上有哪些文件，用上面的 "Refresh server list"。
                         scope.launch {
                             runCatching { rescanFeatureList() }
                             onRefreshFeatureList()
@@ -1636,8 +1613,10 @@ private fun SettingsPage(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(Modifier.weight(1f)) {
+                            // 只显示文件名，一条一行；title 由文件名美化而来，
+                            // 两套名字（如旧版 call vs dialer）只会造成歧义。
                             Text(
-                                "${descriptor.title}  (${descriptor.name})",
+                                "feature_${descriptor.name}.py",
                                 style = MaterialTheme.typography.bodyMedium
                             )
                             Text(
@@ -1706,7 +1685,7 @@ private fun SettingsPage(
                                         }
                                         val result = JSONObject(response)
                                         downloadStatus = if (result.optBoolean("ok")) {
-                                            "${descriptor.title} reloaded."
+                                            "feature_${descriptor.name}.py reloaded."
                                         } else {
                                             "Reload failed: ${result.optString("error", "unknown error")}"
                                         }
@@ -1739,7 +1718,9 @@ private fun SettingsPage(
                     Text("New and built-in feature_*.py files are fetched from <root>feature_<name>.py; built-ins then fall back to GitHub.")
                 }
             )
-            Text(featureUrlStatus, style = MaterialTheme.typography.bodySmall)
+            if (featureUrlStatus.isNotBlank()) SelectionContainer {
+                Text(featureUrlStatus, style = MaterialTheme.typography.bodySmall)
+            }
             // force=false 只补缺失；force=true 无条件重下全部并清模块/pyc 缓存，
             // 下一次 call_feature 立刻用新脚本，无需重启。
             fun startBuiltinDownload(force: Boolean) {

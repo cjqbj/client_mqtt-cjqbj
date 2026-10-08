@@ -7,8 +7,13 @@ import copy
 import importlib
 import importlib.util
 import os
+import re
+import shutil
 import sys
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import PurePosixPath
 
@@ -83,6 +88,239 @@ _FALLBACK_FEATURE_URL_ROOTS = (
 # 单次 RPC 允许的超时上下限：设备配置的 timeout 只是默认值，feature 可覆盖。
 _RPC_TIMEOUT_MIN = 1.0
 _RPC_TIMEOUT_MAX = 600.0
+
+# ---------------------------------------------------------------------------
+# 持久化设置存储
+#
+# 历史教训：配置曾放在 <scriptRoot>/client_mqtt.json，而 scriptRoot 由
+# SharedPreferences 的 use_external_scripts 决定——这个开关本身在应用私有目录，
+# 卸载/重装即被清掉。重装后 App 回到内部根目录，sdcard 上的旧配置成了孤儿，
+# 用户保存的 aliyun 设置"看起来丢了"。
+#
+# 现在设置固定优先落到外置根 /sdcard/apm/client_mqtt/settings/（与脚本开关无关），
+# 按 topic 建子文件夹单独存放；拿不到外置存储权限才回退 App 私有目录。
+#   settings/global.json                 全局设置 + topic 文件夹映射
+#   settings/topics/<safe-topic>/device.json   单个 topic 的设备设置 + aliyun
+# ---------------------------------------------------------------------------
+EXTERNAL_STORAGE_ROOT = "/sdcard/apm/client_mqtt"
+_SETTINGS_SUBDIR = "settings"
+_TOPICS_SUBDIR = "topics"
+_GLOBAL_FILE = "global.json"
+_DEVICE_FILE = "device.json"
+_DURABLE_SCHEMA = 2
+# 只放在 global.json、不属于任何 topic 的字段。
+_GLOBAL_FIELDS = (
+    "feature_url_root",
+    "online_probe_enabled",
+    "online_probe_interval",
+    "scan_limit",
+    "selected_device_id",
+)
+
+
+def _durable_storage_root():
+    """外置设置根：Android 真机固定 /sdcard；桌面测试需显式给 QGB_SETTINGS_ROOT，
+    防止在构建机（root）上误写真实 /sdcard 造成测试串状态。"""
+    override = os.environ.get("QGB_SETTINGS_ROOT", "").strip()
+    if override:
+        return override
+    if hasattr(sys, "getandroidapilevel"):
+        return EXTERNAL_STORAGE_ROOT
+    return None
+
+
+def _is_dir_writable(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_probe")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("ok")
+        os.unlink(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _empty_config():
+    return {"devices": [_DEFAULT_DEVICE.copy()], "scan_limit": 100,
+            "remote_root": "/data/data"}
+
+
+def _read_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _atomic_write_json(path, value):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2)
+    os.replace(temporary, path)
+
+
+def _safe_topic_name(topic):
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(topic or "")).strip("._-")
+    return name or "topic"
+
+
+def _find_topic_folder(paths, device, mapping):
+    """定位设备已有的 topic 文件夹：映射 → 按 id/topic 扫盘 → 新建唯一名。
+    topic 改名时旧文件夹里的 request_topic 对不上，会走到新建分支。"""
+    topics_dir = paths["topics_dir"]
+    device_id = device.get("id")
+    target_topic = device.get("request_topic")
+    mapped = mapping.get(device_id)
+    if mapped:
+        doc = _read_json_file(os.path.join(topics_dir, mapped, _DEVICE_FILE))
+        if isinstance(doc, dict) and (
+            not target_topic or doc.get("request_topic") == target_topic
+            or (not doc.get("request_topic") and doc.get("id") == device_id)
+        ):
+            return mapped
+    if os.path.isdir(topics_dir) and target_topic:
+        for name in sorted(os.listdir(topics_dir)):
+            doc = _read_json_file(os.path.join(topics_dir, name, _DEVICE_FILE))
+            # 一个 topic 只对应一个文件夹：topic 对得上就复用。
+            # 不能只按 id 匹配——topic 改名时旧文件夹必须让位给新文件夹。
+            if isinstance(doc, dict) and doc.get("request_topic") == target_topic:
+                return name
+    base = _safe_topic_name(target_topic or device_id or "topic")
+    name, counter = base, 1
+    while os.path.isdir(os.path.join(topics_dir, name)):
+        name = "%s__%d" % (base, counter)
+        counter += 1
+    return name
+
+
+def _load_durable_config(paths):
+    global_doc = _read_json_file(paths["global_path"]) or {}
+    combined = {key: global_doc[key] for key in _GLOBAL_FIELDS if key in global_doc}
+    combined["devices"] = []
+    combined["scan_limit"] = combined.get("scan_limit", 100)
+    topics_dir = paths["topics_dir"]
+    if os.path.isdir(topics_dir):
+        for name in sorted(os.listdir(topics_dir)):
+            doc = _read_json_file(os.path.join(topics_dir, name, _DEVICE_FILE))
+            if isinstance(doc, dict):
+                combined["devices"].append(doc)
+    if not combined["devices"]:
+        combined["devices"] = [_DEFAULT_DEVICE.copy()]
+    combined["aliyun"] = global_doc.get("aliyun")
+    if not isinstance(combined["aliyun"], dict):
+        combined["aliyun"] = {}
+    if "aliyun_json_draft" in global_doc:
+        combined["aliyun_json_draft"] = global_doc["aliyun_json_draft"]
+    return _apply_effective_aliyun(combined)
+
+
+def _save_durable_config(config, paths):
+    devices = [item for item in config.get("devices", []) if isinstance(item, dict)]
+    previous_global = _read_json_file(paths["global_path"]) or {}
+    mapping = dict(previous_global.get("topic_dirs") or {})
+    new_mapping, used_folders = {}, set()
+    for device in devices:
+        # 迁移自旧单文件配置的设备可能没有 id（id 过去只在编辑时才分配）。
+        device.setdefault("id", uuid.uuid4().hex)
+        folder = _find_topic_folder(paths, device, mapping)
+        while folder in used_folders:
+            # 不同 id 清洗后撞名：加序号拆开。
+            folder = "%s__%d" % (_safe_topic_name(device.get("request_topic") or "topic"),
+                                 len(used_folders) + 1)
+        used_folders.add(folder)
+        new_mapping[device["id"]] = folder
+        _atomic_write_json(
+            os.path.join(paths["topics_dir"], folder, _DEVICE_FILE), device
+        )
+    # 删除设备或 topic 改名后，旧文件夹不再被任何设备引用就删掉（只删登记过的）。
+    active_folders = set(new_mapping.values())
+    for folder in mapping.values():
+        if folder not in active_folders:
+            shutil.rmtree(os.path.join(paths["topics_dir"], folder), ignore_errors=True)
+    global_doc = {"schema": _DURABLE_SCHEMA, "topic_dirs": new_mapping}
+    for key in _GLOBAL_FIELDS:
+        if key in config:
+            global_doc[key] = config[key]
+    if isinstance(config.get("aliyun"), dict):
+        global_doc["aliyun"] = config["aliyun"]
+    if config.get("aliyun_json_draft") is not None:
+        global_doc["aliyun_json_draft"] = config["aliyun_json_draft"]
+    _atomic_write_json(paths["global_path"], global_doc)
+
+
+def _configure_storage(files_dir):
+    """决定本次运行用哪套设置存储，并在首次使用外置存储时迁移旧单文件配置。"""
+    legacy_path = os.path.join(files_dir, _CONFIG_NAME)
+    _STATE["legacy_config_path"] = legacy_path
+    root = _durable_storage_root()
+    paths = None
+    if root:
+        candidate = {
+            "root": root,
+            "settings_dir": os.path.join(root, _SETTINGS_SUBDIR),
+            "topics_dir": os.path.join(root, _SETTINGS_SUBDIR, _TOPICS_SUBDIR),
+        }
+        candidate["global_path"] = os.path.join(candidate["settings_dir"], _GLOBAL_FILE)
+        if _is_dir_writable(candidate["settings_dir"]) and _is_dir_writable(
+            candidate["topics_dir"]
+        ):
+            paths = candidate
+            if not os.path.isfile(paths["global_path"]):
+                # 一次性迁移：旧单文件（内部或 sdcard 旧位置）拆分成 per-topic 存储。
+                legacy = _read_json_file(legacy_path) or _empty_config()
+                _save_durable_config(_apply_effective_aliyun(legacy), paths)
+    _STATE["durable_paths"] = paths
+    if paths is not None:
+        _STATE["settings_backend"] = "durable"
+        _STATE["config_path"] = paths["global_path"]
+    else:
+        _STATE["settings_backend"] = "legacy"
+        _STATE["config_path"] = legacy_path
+        if not os.path.isfile(legacy_path):
+            _atomic_write_json(legacy_path, _empty_config())
+
+
+def settings_storage_info():
+    """供设置页显示设置实际存放位置（是否随卸载保留）。"""
+    paths = _STATE.get("durable_paths")
+    return json.dumps({
+        "backend": _STATE.get("settings_backend", "legacy"),
+        "external": bool(paths),
+        "root": (paths or {}).get("root"),
+        "settings_dir": (paths or {}).get("settings_dir"),
+        "topics_dir": (paths or {}).get("topics_dir"),
+        "legacy_path": _STATE.get("legacy_config_path"),
+    }, ensure_ascii=False)
+
+
+def _apply_effective_aliyun(config):
+    """aliyun 生效值：当前选中 topic 私有配置优先，全局配置兜底。"""
+    devices = [item for item in config.get("devices", []) if isinstance(item, dict)]
+    selected_id = config.get("selected_device_id") or _STATE.get("selected_device_id")
+    selected = next(
+        (item for item in devices if item.get("id") == selected_id),
+        None,
+    )
+    if selected is None:
+        selected_topic = _STATE.get("selected_topic")
+        selected = next(
+            (item for item in devices if item.get("request_topic") == selected_topic),
+            devices[0] if devices else None,
+        )
+    topic_aliyun = selected.get("aliyun") if isinstance(selected, dict) else None
+    if isinstance(topic_aliyun, dict) and topic_aliyun:
+        config["aliyun"] = topic_aliyun
+    elif not isinstance(config.get("aliyun"), dict):
+        config["aliyun"] = {}
+    topic_draft = selected.get("aliyun_json_draft") if isinstance(selected, dict) else None
+    if topic_draft is not None:
+        config["aliyun_json_draft"] = topic_draft
+    return config
 
 
 def _normalize_url_root(value):
@@ -640,38 +878,55 @@ def install_builtin_feature(script_root, filename, retries=4, timeout=15):
 
 def initialize(files_dir):
     _STATE["files_dir"] = str(files_dir)
-    path = os.path.join(_STATE["files_dir"], _CONFIG_NAME)
-    _STATE["config_path"] = path
-    if not os.path.isfile(path):
-        save_config({"devices": [_DEFAULT_DEVICE.copy()], "scan_limit": 100, "remote_root": "/data/data"})
+    # 选择设置后端：外置 /sdcard 优先（卸载不丢），不可用时回退 App 私有单文件；
+    # 首次启用外置存储会自动迁移旧 client_mqtt.json。
+    _configure_storage(_STATE["files_dir"])
+    durable = _STATE.get("settings_backend") == "durable"
     with _STATE["lock"]:
         config = load_config()
         devices = [item for item in config.get("devices", []) if isinstance(item, dict)]
         if not devices:
             devices = [_DEFAULT_DEVICE.copy()]
-        aliyun = config.get("aliyun")
-        if not isinstance(aliyun, dict):
-            aliyun = next((
-                device.get("aliyun") for device in devices
-                if isinstance(device.get("aliyun"), dict) and device.get("aliyun")
-            ), {})
-        aliyun_draft = config.get("aliyun_json_draft")
-        if not isinstance(aliyun_draft, str):
-            aliyun_draft = next((
-                device.get("aliyun_json_draft") for device in devices
-                if isinstance(device.get("aliyun_json_draft"), str)
-            ), None)
-        for device in devices:
-            device.setdefault("id", uuid.uuid4().hex)
-            device.setdefault("remote_root", config.get("remote_root", "/data/data"))
-            device.pop("aliyun", None)
-            device.pop("aliyun_json_draft", None)
-        config["devices"] = devices
-        config["aliyun"] = aliyun
+        if durable:
+            # per-topic 存储：aliyun/草稿留在各 device 文档里，不做全局提升。
+            for device in devices:
+                device.setdefault("id", uuid.uuid4().hex)
+                device.setdefault("remote_root", "/data/data")
+                if "aliyun" in device and not isinstance(device["aliyun"], dict):
+                    device.pop("aliyun", None)
+                if "aliyun_json_draft" in device and not isinstance(
+                    device["aliyun_json_draft"], str
+                ):
+                    device.pop("aliyun_json_draft", None)
+            config["devices"] = devices
+            if not isinstance(config.get("aliyun"), dict):
+                config["aliyun"] = {}
+        else:
+            # 旧单文件后端：历史上把 per-device aliyun 提升为全局共享配置，
+            # 保持老版本配置文件与既有单测的语义不变。
+            aliyun = config.get("aliyun")
+            if not isinstance(aliyun, dict):
+                aliyun = next((
+                    device.get("aliyun") for device in devices
+                    if isinstance(device.get("aliyun"), dict) and device.get("aliyun")
+                ), {})
+            aliyun_draft = config.get("aliyun_json_draft")
+            if not isinstance(aliyun_draft, str):
+                aliyun_draft = next((
+                    device.get("aliyun_json_draft") for device in devices
+                    if isinstance(device.get("aliyun_json_draft"), str)
+                ), None)
+            for device in devices:
+                device.setdefault("id", uuid.uuid4().hex)
+                device.setdefault("remote_root", config.get("remote_root", "/data/data"))
+                device.pop("aliyun", None)
+                device.pop("aliyun_json_draft", None)
+            config["devices"] = devices
+            config["aliyun"] = aliyun
+            if aliyun_draft is not None:
+                config["aliyun_json_draft"] = aliyun_draft
         config.setdefault("online_probe_enabled", True)
         config.setdefault("online_probe_interval", 30)
-        if aliyun_draft is not None:
-            config["aliyun_json_draft"] = aliyun_draft
         config.pop("remote_root", None)
         saved_selected_id = config.get("selected_device_id")
         selected_device = next(
@@ -681,12 +936,16 @@ def initialize(files_dir):
         if selected_device is None:
             selected_device = devices[0]
             config["selected_device_id"] = selected_device["id"]
+        _STATE["selected_device_id"] = selected_device["id"]
+        _STATE["selected_topic"] = selected_device.get(
+            "request_topic", _DEFAULT_DEVICE["request_topic"]
+        )
+        # 选中 topic 决定 aliyun 生效值，必须在 _apply_known_features/save 前算好。
+        _apply_effective_aliyun(config)
         # APK 升级带来的新内置 feature（或新 push 的脚本）对自定义白名单
         # 目标默认可见；用户主动勾掉的既有项不会被加回。
         _apply_known_features(config)
         save_config(config)
-        _STATE["selected_device_id"] = selected_device["id"]
-        _STATE["selected_topic"] = selected_device.get("request_topic", _DEFAULT_DEVICE["request_topic"])
     return {"ok": True, "files_dir": _STATE["files_dir"]}
 
 
@@ -725,34 +984,62 @@ def update_general_settings(values):
     return general_settings()
 
 
-def aliyun_settings():
+def aliyun_settings(device=None):
+    """aliyun 配置：durable 后端按 topic 私有存放（读当前/指定 topic），
+    topic 没存过就回退全局；legacy 单文件后端只有全局一份。"""
     config = load_config()
+    aliyun, draft = config.get("aliyun"), config.get("aliyun_json_draft")
+    if _STATE.get("settings_backend") == "durable":
+        selected = _device_config(device)
+        topic_aliyun = selected.get("aliyun")
+        if isinstance(topic_aliyun, dict) and topic_aliyun:
+            aliyun = topic_aliyun
+        if selected.get("aliyun_json_draft") is not None:
+            draft = selected.get("aliyun_json_draft")
     return json.dumps({
-        "aliyun": config.get("aliyun") if isinstance(config.get("aliyun"), dict) else {},
-        "aliyun_json_draft": config.get("aliyun_json_draft"),
+        "aliyun": aliyun if isinstance(aliyun, dict) else {},
+        "aliyun_json_draft": draft,
     }, ensure_ascii=False)
 
 
-def update_aliyun_settings(values):
+def update_aliyun_settings(values, device=None):
     if isinstance(values, str):
         values = json.loads(values)
     if not isinstance(values, dict):
         raise ValueError("Aliyun settings must be a JSON object")
-    config = load_config()
     aliyun = values.get("aliyun")
     draft = values.get("aliyun_json_draft")
-    if aliyun is not None:
-        if not isinstance(aliyun, dict):
-            raise ValueError("aliyun must be a JSON object")
-        config["aliyun"] = aliyun
-    if draft is None:
-        config.pop("aliyun_json_draft", None)
-    elif isinstance(draft, str):
-        config["aliyun_json_draft"] = draft
-    else:
+    if aliyun is not None and not isinstance(aliyun, dict):
+        raise ValueError("aliyun must be a JSON object")
+    if draft is not None and not isinstance(draft, str):
         raise ValueError("aliyun_json_draft must be a string")
+    config = load_config()
+    if _STATE.get("settings_backend") == "durable":
+        # 落进当前 topic 的 device.json；不影响其它 topic。
+        selected = _device_config(device)
+        target = next(
+            (item for item in config.get("devices", [])
+             if item.get("id") == selected.get("id")
+             or item.get("request_topic") == selected.get("request_topic")),
+            None,
+        )
+        if target is None:
+            raise ValueError("selected topic not found")
+        if aliyun is not None:
+            target["aliyun"] = aliyun
+        if draft is None:
+            target.pop("aliyun_json_draft", None)
+        else:
+            target["aliyun_json_draft"] = draft
+    else:
+        if aliyun is not None:
+            config["aliyun"] = aliyun
+        if draft is None:
+            config.pop("aliyun_json_draft", None)
+        else:
+            config["aliyun_json_draft"] = draft
     save_config(config)
-    return aliyun_settings()
+    return aliyun_settings(device)
 
 
 def device_catalog():
@@ -1046,7 +1333,6 @@ def probe_online(device=None, timeout=PROBE_TIMEOUT, topic=None):
         "ok": False,
         "topic": topic,
         "timeout": effective_timeout,
-        "elapsed_ms": None,
         "node": "",
         "machine": "",
         "release": "",
@@ -1055,7 +1341,6 @@ def probe_online(device=None, timeout=PROBE_TIMEOUT, topic=None):
         "raw": None,
     }
     _record_request_start(selected, effective_timeout)
-    started = time.perf_counter()
     try:
         mqtt_client = _mqtt_client_module()
         response = mqtt_client.rpc(
@@ -1068,13 +1353,11 @@ def probe_online(device=None, timeout=PROBE_TIMEOUT, topic=None):
             ),
         )
     except BaseException as error:  # noqa: BLE001 - 探测入口必须返回结构化结果
-        result["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
         detail = f"{type(error).__name__}: {error}"
         result["error"] = detail
         _record_request_end(selected, "probe", False, detail)
         return result
 
-    result["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
     if not isinstance(response, dict) or response.get("r") is None:
         detail = ""
         if isinstance(response, dict):
@@ -1173,8 +1456,9 @@ def update_device_settings(existing_device, values):
     request_topic = str(values.get("request_topic", "")).strip()
     if not request_topic:
         raise ValueError("request_topic is required")
-    values.pop("aliyun", None)
-    values.pop("aliyun_json_draft", None)
+    # legacy 后端 aliyun 只走全局接口保存；durable 后端允许随 topic 一起存。
+    incoming_aliyun = values.pop("aliyun", None)
+    incoming_aliyun_draft = values.pop("aliyun_json_draft", None)
     timeout_draft = values.pop("timeout_draft", None)
     if timeout_draft is not None and not isinstance(timeout_draft, str):
         raise ValueError("timeout_draft must be a string")
@@ -1210,43 +1494,50 @@ def update_device_settings(existing_device, values):
             selected.pop("timeout_draft", None)
         else:
             selected["timeout_draft"] = timeout_draft
+        if _STATE.get("settings_backend") == "durable":
+            if incoming_aliyun is not None and isinstance(incoming_aliyun, dict):
+                selected["aliyun"] = incoming_aliyun
+            if incoming_aliyun_draft is not None:
+                selected["aliyun_json_draft"] = str(incoming_aliyun_draft)
         config["devices"] = devices
         config["selected_device_id"] = selected["id"]
-        save_config(config)
         _STATE["selected_device_id"] = selected["id"]
         _STATE["selected_topic"] = request_topic
+        _apply_effective_aliyun(config)
+        save_config(config)
         return json.dumps(selected, ensure_ascii=False)
 
 
 def load_config():
-    path = _STATE.get("config_path")
-    if not path or not os.path.isfile(path):
-        return {"devices": [_DEFAULT_DEVICE.copy()], "scan_limit": 100, "remote_root": "/data/data"}
     with _STATE["lock"]:
         try:
-            with open(path, "r", encoding="utf-8") as config_file:
-                value = json.load(config_file)
-            if isinstance(value, dict):
-                _STATE["last_config"] = copy.deepcopy(value)
-                return value
+            if _STATE.get("settings_backend") == "durable" and _STATE.get("durable_paths"):
+                value = _load_durable_config(_STATE["durable_paths"])
+            else:
+                path = _STATE.get("config_path")
+                if not path or not os.path.isfile(path):
+                    return _empty_config()
+                value = _read_json_file(path)
+                if not isinstance(value, dict):
+                    raise ValueError("bad config")
+            _STATE["last_config"] = copy.deepcopy(value)
+            return value
         except (OSError, ValueError):
             pass
         previous = _STATE.get("last_config")
         if isinstance(previous, dict):
             return copy.deepcopy(previous)
-        return {"devices": [_DEFAULT_DEVICE.copy()], "scan_limit": 100, "remote_root": "/data/data"}
+        return _empty_config()
 
 
 def save_config(value):
-    path = _STATE.get("config_path")
-    if not path:
+    if not _STATE.get("config_path"):
         return {"ok": False, "error": "service is not initialized"}
     with _STATE["lock"]:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        temporary = path + ".tmp"
-        with open(temporary, "w", encoding="utf-8") as config_file:
-            json.dump(value, config_file, ensure_ascii=False, indent=2)
-        os.replace(temporary, path)
+        if _STATE.get("settings_backend") == "durable" and _STATE.get("durable_paths"):
+            _save_durable_config(value, _STATE["durable_paths"])
+        else:
+            _atomic_write_json(_STATE["config_path"], value)
         _STATE["last_config"] = copy.deepcopy(value)
     return {"ok": True}
 
@@ -1271,11 +1562,14 @@ def rpc(code, device=None, timeout=None):
     timeout 缺省用目标设备配置的 timeout（默认值）；feature 可显式传秒数覆盖，
     范围裁剪到 [1, 600]。例如拍照/上传等慢操作传 timeout=45。
     """
-    request_id = uuid.uuid4().hex[:8]
-    started = time.perf_counter()
+    # 只用一个请求 id：与竞速客户端/目标端回包同一个 req_id（预生成后透传），
+    # 日志从发送前到回包后都能串起来，不再维护第二套本地 request_id。
+    req_id = None
     selected = None
     effective_timeout = None
     try:
+        client_mqtt = _mqtt_client_module()
+        req_id = client_mqtt.get_req_id(client_mqtt.utc_ms())
         selected = _device_config(device)
         if timeout is None:
             timeout = float(selected.get("timeout", 10))
@@ -1289,24 +1583,27 @@ def rpc(code, device=None, timeout=None):
         key_kind = _private_key_kind(private_key)
         reply_topic = "sys/device/response"
         _append_rpc_log(
-            f"INFO id={request_id} topic={topic} reply_topic={reply_topic} phase=loading-client "
+            f"INFO req_id={req_id} topic={topic} reply_topic={reply_topic} phase=loading-client "
             f"timeout={timeout:g}s private_key_configured={'yes' if private_key else 'no'} key_format={key_kind}"
         )
-        client_mqtt = _mqtt_client_module()
         if private_key:
             try:
                 normalized_key = client_mqtt.get_standard_pem_bytes(private_key)
             except BaseException as error:
                 _append_rpc_log(
-                    f"ERROR id={request_id} topic={topic} phase=key-normalization-failed "
+                    f"ERROR req_id={req_id} topic={topic} phase=key-normalization-failed "
                     f"key_configured=yes format={key_kind} exception_type={type(error).__name__}"
                 )
                 raise
             _append_rpc_log(
-                f"INFO id={request_id} topic={topic} phase=key-normalized "
+                f"INFO req_id={req_id} topic={topic} phase=key-normalized "
                 f"format={key_kind} normalized_bytes={len(normalized_key) if normalized_key else 0}"
             )
-        aliyun = json.dumps(load_config().get("aliyun") or {}, ensure_ascii=False)
+        # aliyun 凭据按 topic 私有优先（durable 后端），全局配置兜底。
+        aliyun_obj = selected.get("aliyun")
+        if not isinstance(aliyun_obj, dict) or not aliyun_obj:
+            aliyun_obj = load_config().get("aliyun") or {}
+        aliyun = json.dumps(aliyun_obj, ensure_ascii=False)
         code = (
             "import sys\n"
             f"sys.__dict__.setdefault('_qgb_dict', {{}}).setdefault('aliyun_git', {{}}).update({aliyun})\n"
@@ -1314,16 +1611,17 @@ def rpc(code, device=None, timeout=None):
         )
         safe_code = _redact_rpc_content(code, selected)
         _append_rpc_log(
-            f"REQUEST CODE id={request_id} topic={topic} chars={len(code)}"
+            f"REQUEST CODE req_id={req_id} topic={topic} chars={len(code)}"
             f"\n--- begin request code ---\n{safe_code}\n--- end request code ---"
         )
-        _append_rpc_log(f"INFO id={request_id} topic={topic} phase=request-sent")
+        _append_rpc_log(f"INFO req_id={req_id} topic={topic} phase=request-sent")
         response = client_mqtt.rpc(
             code,
             request_topic=topic,
             timeout=timeout,
             client_private_key_bytes=private_key,
             allow_no_server_pubkey_response=bool(selected.get("allow_no_server_pubkey_response", False)),
+            req_id=req_id,
         )
     except BaseException as error:
         failure = f"{type(error).__name__}: {error}"
@@ -1332,20 +1630,17 @@ def rpc(code, device=None, timeout=None):
         # 不再把在线状态留在上一次成功的旧值上。
         _mark_unreachable(selected, failure)
         topic = selected.get("request_topic", "unknown") if selected else "unknown"
-        elapsed = round((time.perf_counter() - started) * 1000, 2)
         detail = f"{type(error).__name__}: {error}"[:300]
         _append_rpc_log(
-            f"ERROR id={request_id} topic={topic} phase=exception elapsed_ms={elapsed} "
+            f"ERROR req_id={req_id} topic={topic} phase=exception "
             f"exception_type={type(error).__name__}"
         )
         return {
             "ok": False,
             "error": detail,
-            "request_id": request_id,
+            "req_id": req_id,
             "topic": topic,
-            "elapsed_ms": elapsed,
         }
-    elapsed = round((time.perf_counter() - started) * 1000, 2)
     if response is None:
         # 真正的超时（完全无应答）——这是"feature 超时却还显示 online"的根因点：
         # 旧代码此前也记 False，但任意后续业务 RPC 的应答又会把探针状态刷回 True。
@@ -1363,20 +1658,17 @@ def rpc(code, device=None, timeout=None):
             states.append(f"{host}:{state}")
         broker_state = ",".join(states) or "no broker clients"
         _append_rpc_log(
-            f"WARN id={request_id} topic={topic} phase=timeout elapsed_ms={elapsed} "
+            f"WARN req_id={req_id} topic={topic} phase=timeout "
             f"timeout={timeout:g}s brokers=[{broker_state}]"
         )
-        _append_rpc_log(f"MQTT RESPONSE id={request_id}: <no response before timeout>")
+        _append_rpc_log(f"MQTT RESPONSE req_id={req_id}: <no response before timeout>")
         return {
             "ok": False,
             "error": "RPC timeout",
-            "request_id": request_id,
+            "req_id": req_id,
             "topic": topic,
-            "elapsed_ms": elapsed,
             "broker_states": states,
         }
-    response["elapsed_ms"] = elapsed
-    response["request_id"] = request_id
     # 有应答 = 链路可达；但远程代码可能抛错（ok=False），这属于"在线但执行失败"，
     # 只登记业务结果，绝不据此改写在线状态（在线由 2s 轻探针单独判定）。
     rpc_ok = bool(response.get("ok", True))
@@ -1388,40 +1680,40 @@ def rpc(code, device=None, timeout=None):
         json.dumps(response, ensure_ascii=False, indent=2, default=str),
         selected,
     )
-    _append_rpc_log(f"MQTT RESPONSE ENVELOPE id={request_id}\n{response_detail}")
+    _append_rpc_log(f"MQTT RESPONSE ENVELOPE req_id={req_id}\n{response_detail}")
     # 目标 Python 的 stdout/stderr 原始打印值，单独成段原样展示，
     # 只做密钥/Aliyun 脱敏，不做任何重排或 repr 加工。
     remote_stdout = response.get("stdout")
     if isinstance(remote_stdout, str) and remote_stdout:
         _append_rpc_log(
-            f"REMOTE STDOUT id={request_id} topic={topic} chars={len(remote_stdout)}"
+            f"REMOTE STDOUT req_id={req_id} topic={topic} chars={len(remote_stdout)}"
             f"\n--- begin remote stdout ---\n{_redact_rpc_content(remote_stdout, selected)}"
             f"\n--- end remote stdout ---"
         )
     remote_stderr = response.get("stderr")
     if isinstance(remote_stderr, str) and remote_stderr:
         _append_rpc_log(
-            f"REMOTE STDERR id={request_id} topic={topic} chars={len(remote_stderr)}"
+            f"REMOTE STDERR req_id={req_id} topic={topic} chars={len(remote_stderr)}"
             f"\n--- begin remote stderr ---\n{_redact_rpc_content(remote_stderr, selected)}"
             f"\n--- end remote stderr ---"
         )
     if isinstance(response, dict) and not response.get("ok", True) and response.get("error"):
         _append_rpc_log(
-            f"REMOTE ERROR RAW id={request_id} topic={topic}"
+            f"REMOTE ERROR RAW req_id={req_id} topic={topic}"
             f"\n--- begin remote error ---\n{_redact_rpc_content(response.get('error'), selected)}"
             f"\n--- end remote error ---"
         )
     remote_error = _remote_rpc_error(response, selected)
     if remote_error:
         _append_rpc_log(
-            f"ERROR id={request_id} req_id={response.get('req_id', 'unknown')} topic={topic} "
+            f"ERROR req_id={req_id} topic={topic} "
             f"phase=target-error server={response.get('server_from', 'unknown')} "
             f"remote_error={remote_error}"
         )
     else:
         _append_rpc_log(
-            f"INFO id={request_id} req_id={response.get('req_id', 'unknown')} topic={topic} "
-            f"phase=response elapsed_ms={elapsed} server_time={response.get('server_time', 'unknown')} "
+            f"INFO req_id={req_id} topic={topic} "
+            f"phase=response server_time={response.get('server_time', 'unknown')} "
             f"server={response.get('server_from', 'unknown')} client={response.get('client_from', 'unknown')} "
             f"remote_latency_ms={response.get('latency_ms', 'unknown')}"
         )
@@ -1436,133 +1728,159 @@ def online(device=None):
 
 
 # ---------------------------------------------------------------------------
-# 远程 feature 目录扫描
+# 下载服务器（设置里的 ghfast/raw URL root）feature 文件列表
 #
-# 本地 feature 列表本来就由 bootstrap 按目录自动发现（feature_catalog），
-# "刷新本地"没有意义；设置页的 Refresh 要的是【目标端】有哪些 feature 文件。
-# 下面这段代码在目标端自包含执行（裸 multi_mqtt 也能跑，不 import bootstrap）：
-# 1) 由 multi_mqtt 包位置反推出 AssetFinder/app 内置目录；
-# 2) 加上内/外部 py_updates 热更目录；
-# 3) ast 静态解析 FEATURE manifest（不 import，避免副作用），
-#    同名文件 py_updates 遮蔽 builtin。
-# 末行必须是给 r 赋值的表达式（rpc 执行器按 r 回传）。
+# 设置页的 Refresh 刷的是【下载服务器上有哪些 feature_*.py】，不是本机目录
+# （本机由 bootstrap 自动监控），也不是目标端。列表来源按顺序尝试：
+# 1) GitHub Contents API（raw URL 自动反推 owner/repo/branch/path）；
+# 2) GitHub tree HTML（走 ghfast 代理）；
+# 3) 直接 GET root（兼容 nginx/apache/python -m http.server 这类目录索引页）。
+# 全部只展示文件名，一行一个。
 # ---------------------------------------------------------------------------
-REMOTE_FEATURE_SCAN_CODE = r'''
-import ast, glob, json, os, sys
-candidate_dirs, seen_dirs = [], set()
-def _add_dir(d):
-    if not d:
-        return
-    d = os.path.abspath(str(d))
-    if d not in seen_dirs and os.path.isdir(d):
-        seen_dirs.add(d)
-        candidate_dirs.append(d)
-app_dir = ""
-try:
-    import multi_mqtt
-    # multi_mqtt 是无 __init__.py 的命名空间包，__file__ 为 None，
-    # 必须用 __path__（普通包则退回 __file__）。
-    _pkg_paths = [str(p) for p in (getattr(multi_mqtt, "__path__", None) or []) if p]
-    if not _pkg_paths and getattr(multi_mqtt, "__file__", None):
-        _pkg_paths = [os.path.dirname(os.path.abspath(multi_mqtt.__file__))]
-    if _pkg_paths:
-        app_dir = os.path.dirname(os.path.abspath(_pkg_paths[0]))
-        _add_dir(app_dir)
-except Exception:
-    pass
-for _p in list(sys.path):
-    if _p and os.path.isfile(os.path.join(_p, "multi_mqtt", "rpc_executor.py")):
-        _add_dir(os.path.abspath(_p))
-_add_dir("/sdcard/apm/client_mqtt/py_updates")
-if app_dir:
-    _parts = app_dir.split(os.sep)
-    if "chaquopy" in _parts:
-        _i = len(_parts) - 1 - _parts[::-1].index("chaquopy")
-        _files_dir = os.sep.join(_parts[:_i])
-        if _files_dir:
-            _add_dir(os.path.join(_files_dir, "client_mqtt", "py_updates"))
-for _p in os.environ.get("QGB_EXTRA_FEATURE_DIRS", "").split(os.pathsep):
-    _add_dir(_p)
-def _manifest(path):
-    info = {"version": None, "actions": [], "icon": "", "ui": "", "title": "", "error": ""}
+_FEATURE_FILE_RE = re.compile(r"feature_[A-Za-z0-9_-]+\.py")
+_FEATURE_FILE_FULL_RE = re.compile(r"^feature_[A-Za-z0-9_-]+\.py$")
+
+
+def _split_proxied_url(root):
+    """ghfast 形态 '<proxy-base>/https://real/...' → (proxy_base, real_url)。"""
+    match = re.match(r"^(https?://[^/]+)/(https?://.*)$", str(root or "").strip())
+    if match:
+        return match.group(1), match.group(2)
+    return "", str(root or "").strip()
+
+
+def _github_parts(real_url):
+    """从 raw/github 下载 URL 反推 (owner, repo, branch, subpath)，非 GitHub 返回 None。"""
+    parsed = urllib.parse.urlsplit(real_url)
+    parts = [segment for segment in parsed.path.split("/") if segment]
+    if parsed.netloc == "raw.githubusercontent.com":
+        if len(parts) >= 5 and parts[2] == "refs" and parts[3] == "heads":
+            return parts[0], parts[1], parts[4], "/".join(parts[5:])
+        if len(parts) >= 3:
+            return parts[0], parts[1], parts[2], "/".join(parts[3:])
+    if parsed.netloc == "github.com":
+        match = re.match(
+            r"^/([^/]+)/([^/]+)/raw/(?:refs/heads/)?([^/]+)/(.*)$", parsed.path
+        )
+        if match:
+            return match.group(1), match.group(2), match.group(3), match.group(4)
+    return None
+
+
+def _server_listing_urls(root):
+    proxy, real = _split_proxied_url(root)
+    urls = []
+
+    def add(url):
+        if url and url not in urls:
+            urls.append(url)
+
+    parts = _github_parts(real)
+    if parts:
+        owner, repo, branch, subpath = parts
+        subpath = subpath.rstrip("/")
+        api_url = (
+            "https://api.github.com/repos/%s/%s/contents/%s?ref=%s"
+            % (owner, repo, subpath, branch)
+        )
+        tree_url = "https://github.com/%s/%s/tree/%s/%s" % (
+            owner, repo, branch, subpath
+        )
+        if proxy:
+            # 列表必须拿最新：直连 Contents API 优先；ghfast 对 API/tree 返回
+            # 403（只代理 raw 文件下载），代理 URL 只作快速失败的兜底。
+            add(api_url)
+            add(tree_url)
+            add("%s/%s" % (proxy, api_url))
+            add("%s/%s" % (proxy, tree_url))
+        else:
+            add(api_url)
+            add(tree_url)
+    add(root)
+    return urls
+
+
+def _parse_feature_listing(text, root):
+    """GitHub API 返回 JSON 数组；其它任意文本（HTML 索引页等）正则提取文件名。"""
     try:
-        with open(path, "r", encoding="utf-8") as _f:
-            _tree = ast.parse(_f.read(), path)
-        for _node in _tree.body:
-            if isinstance(_node, ast.Assign):
-                for _t in _node.targets:
-                    if isinstance(_t, ast.Name) and _t.id == "FEATURE":
-                        _data = ast.literal_eval(_node.value)
-                        if isinstance(_data, dict):
-                            info["version"] = _data.get("version")
-                            info["actions"] = [str(a) for a in (_data.get("actions") or [])]
-                            info["icon"] = str(_data.get("icon") or "")
-                            info["ui"] = str(_data.get("ui") or "")
-                            info["title"] = str(_data.get("title") or "")
-    except Exception as _e:
-        info["error"] = "%s: %s" % (type(_e).__name__, _e)
-    return info
-_features = {}
-for _d in candidate_dirs:
-    _source = "py_updates" if os.path.basename(_d.rstrip(os.sep)) == "py_updates" else "builtin"
-    for _path in sorted(glob.glob(os.path.join(_d, "feature_*.py"))):
-        _name = os.path.basename(_path)[8:-3]
-        if not _name.isidentifier():
-            continue
-        _st = os.stat(_path)
-        _loc = {"dir": _d, "source": _source, "file": _path,
-                "size": int(_st.st_size), "mtime_ms": int(_st.st_mtime * 1000)}
-        _loc.update(_manifest(_path))
-        _features.setdefault(_name, {"name": _name, "sources": []})["sources"].append(_loc)
-for _name, _entry in _features.items():
-    _entry["active"] = next(
-        (s for s in _entry["sources"] if s["source"] == "py_updates"),
-        _entry["sources"][0],
-    )
-r = json.dumps({"ok": True, "candidate_dirs": candidate_dirs,
-                "features": [_features[k] for k in sorted(_features)]}, ensure_ascii=False)
-'''.lstrip()
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        data = None
+    if isinstance(data, list):
+        files = []
+        for item in data:
+            if not isinstance(item, dict) or item.get("type") != "file":
+                continue
+            name = str(item.get("name") or "")
+            if _FEATURE_FILE_FULL_RE.match(name):
+                files.append({
+                    "name": name,
+                    "size": item.get("size"),
+                    "download_url": item.get("download_url") or (root + name),
+                })
+        if files:
+            return files
+    if isinstance(data, dict) and data.get("message"):
+        raise ValueError(str(data["message"])[:200])
+    return [
+        {"name": name, "size": None, "download_url": root + name}
+        for name in sorted(set(_FEATURE_FILE_RE.findall(text)))
+    ]
 
 
-def remote_feature_catalog(device=None, timeout=10):
-    """扫描【当前选中目标】上的 feature_*.py（内置 AssetFinder + py_updates）。
+def download_server_feature_files(timeout=15):
+    """一次性列出下载 URL root 下最新的 feature_*.py。
 
-    返回 JSON：{ok, topic, elapsed_ms, candidate_dirs, features:[
-      {name, active:{source,dir,file,version,actions,icon,ui,title,error}, sources:[...]}, ...
-    ]}。目标离线/超时时 ok=False 并带 error，UI 直接呈现，不拿本地列表冒充。
+    GitHub（含 ghfast 代理形态的 raw URL）：反推出 owner/repo/branch 后走
+    Contents API，直连优先（ghfast 对 API 返回 403，只放行 raw 文件下载）；
+    普通 HTTP 文件服务（nginx/apache/python -m http.server 等）：直接 GET root，
+    解析目录索引页里的文件名——服务器上新增文件后下次刷新立刻可见。
     """
     try:
-        effective_timeout = min(max(float(timeout or 10), 1.0), 60.0)
+        timeout_seconds = min(max(float(timeout or 15), 1.0), 60.0)
     except (TypeError, ValueError):
-        effective_timeout = 10.0
-    result = rpc(REMOTE_FEATURE_SCAN_CODE, device, timeout=effective_timeout)
-    topic = result.get("topic") if isinstance(result, dict) else None
-    elapsed = result.get("elapsed_ms") if isinstance(result, dict) else None
-    if not isinstance(result, dict):
-        return json.dumps({"ok": False, "topic": topic, "error": "no RPC response"},
-                          ensure_ascii=False)
-    if result.get("r") is None:
-        return json.dumps(
-            {"ok": False, "topic": topic, "elapsed_ms": elapsed,
-             "error": result.get("error") or "no result (target offline?)",
-             "broker_states": result.get("broker_states")},
-            ensure_ascii=False,
-        )
-    try:
-        payload = json.loads(result["r"])
-    except (TypeError, ValueError) as error:
-        return json.dumps(
-            {"ok": False, "topic": topic, "elapsed_ms": elapsed,
-             "error": "bad remote catalog JSON: %s" % error, "raw": str(result.get("r"))[:500]},
-            ensure_ascii=False,
-        )
-    if not isinstance(payload, dict):
-        return json.dumps({"ok": False, "topic": topic, "error": "remote payload is not an object"},
-                          ensure_ascii=False)
-    payload["ok"] = True
-    payload["topic"] = topic
-    payload["elapsed_ms"] = elapsed
-    return json.dumps(payload, ensure_ascii=False)
+        timeout_seconds = 15.0
+    root = feature_url_root()
+    attempts, files, source_url = [], None, None
+    for url in _server_listing_urls(root):
+        meta = {"url": url}
+        try:
+            request = urllib.request.Request(url, headers={
+                "User-Agent": "ClientMqtt/1.0",
+                "Accept": "application/vnd.github+json, text/html;q=0.9, */*;q=0.8",
+            })
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                meta["http_status"] = getattr(response, "status", 200)
+                body = response.read(5_000_000)
+            parsed = _parse_feature_listing(body.decode("utf-8", "replace"), root)
+            if parsed:
+                files, source_url = parsed, url
+                meta["found"] = len(parsed)
+                attempts.append(meta)
+                break
+            meta["error"] = "no feature_*.py entries"
+        except urllib.error.HTTPError as error:
+            meta["http_status"] = error.code
+            meta["error"] = "HTTP %d" % error.code
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            meta["error"] = "%s: %s" % (type(error).__name__, error)
+        attempts.append(meta)
+    if files:
+        return json.dumps({
+            "ok": True,
+            "root": root,
+            "source_url": source_url,
+            "files": files,
+            "attempts": attempts,
+        }, ensure_ascii=False)
+    last_error = next((item["error"] for item in reversed(attempts) if item.get("error")),
+                      "no feature files found")
+    return json.dumps({
+        "ok": False,
+        "root": root,
+        "error": last_error,
+        "attempts": attempts,
+    }, ensure_ascii=False)
 
 
 def _set_aliyun_config(config):
@@ -1686,7 +2004,7 @@ def parse_json_result(response):
                 "result": result,
             }
         metadata_fields = (
-            "req_id", "request_id", "server_time", "server_from", "latency_ms", "client_from", "elapsed_ms",
+            "req_id", "server_time", "server_from", "latency_ms", "client_from",
         )
         metadata = {key: response[key] for key in metadata_fields if key in response}
         if metadata and isinstance(result, dict):

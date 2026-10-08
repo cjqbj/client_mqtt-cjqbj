@@ -37,7 +37,33 @@ MAX_FEATURE_SIZE = 2 * 1024 * 1024
 _FEATURE_LOCK = threading.RLock()
 _RPC_SERVER_STARTED = False
 
+# 历史改名遗留：py_updates 里的旧文件 feature_call.py 会和新内置
+# feature_dialer.py 并存，feature 列表冒出两个名字（Dialer / call）。
+# 新名字已内置时，启动即清掉旧覆盖文件。
+_RENAMED_FEATURES = {"call": "dialer"}
+
 import client_service
+
+def cleanup_legacy_updates():
+    """删除改名前遗留在 py_updates 的旧 feature 覆盖文件，返回清掉的旧名列表。"""
+    if not _UPDATE_DIR or not os.path.isdir(_UPDATE_DIR):
+        return []
+    removed = []
+    for old_name, new_name in _RENAMED_FEATURES.items():
+        if new_name not in BUILTIN_FEATURES:
+            continue
+        module_name = "feature_%s" % old_name
+        old_file = os.path.join(_UPDATE_DIR, module_name + ".py")
+        if os.path.isfile(old_file):
+            try:
+                os.unlink(old_file)
+                _purge_feature_pyc(module_name)
+                sys.modules.pop(module_name, None)
+                removed.append(old_name)
+            except OSError:
+                pass
+    return removed
+
 
 def init_env(update_dir):
     global _UPDATE_DIR, ghs, _RPC_SERVER_STARTED
@@ -56,6 +82,10 @@ def init_env(update_dir):
 
     _UPDATE_DIR = os.path.abspath(str(update_dir))
     os.makedirs(_UPDATE_DIR, exist_ok=True)
+    # 必须在 py_updates 进 sys.path 之前清理，避免旧模块（feature_call）被导入。
+    stale = cleanup_legacy_updates()
+    if stale:
+        print("removed legacy feature overrides: %s" % ",".join(stale))
     if _UPDATE_DIR in sys.path:
         sys.path.remove(_UPDATE_DIR)
     sys.path.insert(0, _UPDATE_DIR)

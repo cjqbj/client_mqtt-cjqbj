@@ -63,7 +63,6 @@ def eval(code=None, timeout=DEFAULT_TIMEOUT):
     payload = {
         "ok": bool(result.get("ok", False)),
         "topic": result.get("topic"),
-        "elapsed_ms": result.get("elapsed_ms"),
         "timeout": timeout,
         "r": result.get("r"),
         "stdout": result.get("stdout") if isinstance(result.get("stdout"), str) else "",
@@ -77,10 +76,8 @@ def _format(payload):
     if not isinstance(payload, dict):
         return repr(payload)
     parts = []
-    elapsed = payload.get("elapsed_ms")
-    head = "ok=%s  elapsed=%s  timeout=%ss  topic=%s" % (
+    head = "ok=%s  timeout=%ss  topic=%s" % (
         payload.get("ok"),
-        ("%sms" % elapsed) if elapsed is not None else "n/a",
         payload.get("timeout"),
         payload.get("topic"),
     )

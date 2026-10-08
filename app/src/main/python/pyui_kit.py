@@ -335,13 +335,18 @@ class Page:
         # 避免文件列表很长时状态被滚走看不到（feature 用 set_subtitle 更新）。
         self.subtitle_view = None
         if subtitle:
-            self.subtitle_view = make_text(context, subtitle, size=13, color=MUTED)
+            # 副标题行会被 feature 复用为长任务状态/日志行（如文件上传进度），
+            # 统一允许长按选择复制。
+            self.subtitle_view = make_text(
+                context, subtitle, size=13, color=MUTED, selectable=True
+            )
             params = LinearLayout.LayoutParams(_match(), _wrap())
             params.topMargin = dp(context, 2)
             self.root.addView(self.subtitle_view, params)
 
         # 当前目标 topic 行：由 watch_target 实时刷新（切目标立刻跟着变）。
         self.target_line = TextView(context)
+        self.target_line.setTextIsSelectable(True)
         self.target_line.setTextSize(12)
         self.target_line.setTextColor(Color.parseColor(MUTED))
         target_params = LinearLayout.LayoutParams(_match(), _wrap())

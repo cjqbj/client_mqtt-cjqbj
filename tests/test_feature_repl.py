@@ -23,7 +23,6 @@ class ReplEvalTests(unittest.TestCase):
         envelope = {
             "ok": True,
             "topic": "sys/device/k12",
-            "elapsed_ms": 42.0,
             "r": "[1, 2, 3]",
             "stdout": "hello\n",
             "stderr": "",
@@ -52,7 +51,7 @@ class ReplEvalTests(unittest.TestCase):
             self.assertEqual(rpc.call_args.kwargs["timeout"], feature_repl.DEFAULT_TIMEOUT)
 
     def test_timeout_envelope_fields_pass_through(self):
-        envelope = {"ok": False, "error": "RPC timeout", "elapsed_ms": 10000.0,
+        envelope = {"ok": False, "error": "RPC timeout",
                     "topic": "sys/device/k12"}
         with mock.patch.object(feature_repl.client_service, "rpc", return_value=envelope):
             result = json.loads(feature_repl.eval("while True: pass", "10"))
@@ -62,13 +61,15 @@ class ReplEvalTests(unittest.TestCase):
 
     def test_format_includes_sections(self):
         text = feature_repl._format({
-            "ok": True, "elapsed_ms": 12.5, "timeout": 10, "topic": "q",
+            "ok": True, "timeout": 10, "topic": "q",
             "stdout": "out", "stderr": "warn", "error": "", "r": "42",
         })
         self.assertIn("ok=True", text)
+        self.assertIn("timeout=10s", text)
         self.assertIn("--- stdout ---\nout", text)
         self.assertIn("--- stderr ---\nwarn", text)
         self.assertIn("r = 42", text)
+        self.assertNotIn("elapsed", text)
 
     def test_manifest_uses_filename_naming_and_python_ui(self):
         self.assertEqual(feature_repl.FEATURE["ui"], "python")

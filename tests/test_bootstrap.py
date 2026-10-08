@@ -149,6 +149,25 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bootstrap.load_feature("../unsafe")
 
+    def test_init_env_removes_legacy_call_override(self):
+        # dialer 改名前遗留的 py_updates/feature_call.py 会让列表出现两个名字，
+        # init_env 必须删掉它；无关的自定义 feature 保留。
+        previous_update_dir = bootstrap._UPDATE_DIR
+        previous_path = list(sys.path)
+        with tempfile.TemporaryDirectory() as directory:
+            stale = Path(directory) / "feature_call.py"
+            stale.write_text("FEATURE = {'title': 'Dialer'}\n", encoding="utf-8")
+            custom = Path(directory) / "feature_keepme.py"
+            custom.write_text("FEATURE = {}\n", encoding="utf-8")
+            try:
+                bootstrap.init_env(directory)
+                self.assertFalse(stale.is_file())
+                self.assertTrue(custom.is_file())
+                self.assertEqual(bootstrap.cleanup_legacy_updates(), [])
+            finally:
+                bootstrap._UPDATE_DIR = previous_update_dir
+                sys.path[:] = previous_path
+
     def test_all_builtin_features_render_with_python_ui(self):
         # 所有内置 feature 界面都必须由脚本自绘（ui=python + build_view），
         # APK 端不再保留任何 Compose 专属页面。

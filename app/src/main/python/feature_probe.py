@@ -50,11 +50,9 @@ def _format(payload):
             payload.get("error", "unknown error"),
             payload.get("topic"), payload.get("timeout"),
         )
-    elapsed_ms = payload.get("elapsed_ms")
     return "\n".join([
-        "target online  (topic=%s, %.0fs, elapsed=%s)" % (
+        "target online  (topic=%s, %.0fs)" % (
             payload.get("topic"), float(payload.get("timeout") or 0),
-            ("%sms" % elapsed_ms) if elapsed_ms is not None else "n/a",
         ),
         "node       : %s" % payload.get("node"),
         "machine    : %s" % payload.get("machine"),

@@ -55,7 +55,7 @@ class ProbeRunTests(unittest.TestCase):
     def test_run_success_reports_platform_fields(self):
         raw_repr = "('/data/data/com.qgb.client/files/python/bin/python', 'angler', 'aarch64', '3.10.108')"
         config_patch, mqtt_patch, fake_mqtt = self._patch_rpc(
-            {"ok": True, "r": raw_repr, "elapsed_ms": 128}
+            {"ok": True, "r": raw_repr}
         )
         with config_patch as device_config, mqtt_patch:
             # 显式传 topic 仍可覆盖默认目标。
@@ -64,9 +64,8 @@ class ProbeRunTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["topic"], "q")
         self.assertEqual(result["timeout"], 2.0)
-        # elapsed_ms 由探测入口实测（不再透传目标自报值），应为非负毫秒数。
-        self.assertIsInstance(result["elapsed_ms"], (int, float))
-        self.assertGreaterEqual(result["elapsed_ms"], 0)
+        # 耗时不再展示给 UI（需要时在 adb 侧动态插桩）。
+        self.assertNotIn("elapsed_ms", result)
         self.assertEqual(result["raw"], raw_repr)
         self.assertEqual(result["executable"], "/data/data/com.qgb.client/files/python/bin/python")
         self.assertEqual(result["node"], "angler")
@@ -81,7 +80,7 @@ class ProbeRunTests(unittest.TestCase):
     def test_run_without_topic_follows_selected_target(self):
         raw_repr = "('/usr/bin/python3', 'k12', 'x86_64', '5.15.0')"
         config_patch, mqtt_patch, fake_mqtt = self._patch_rpc(
-            {"ok": True, "r": raw_repr, "elapsed_ms": 88}
+            {"ok": True, "r": raw_repr}
         )
         with config_patch, mqtt_patch:
             result = json.loads(feature_probe.run())
@@ -91,7 +90,7 @@ class ProbeRunTests(unittest.TestCase):
         self.assertEqual(fake_mqtt.rpc.call_args.kwargs["request_topic"], self.SELECTED_TOPIC)
 
     def test_run_timeout_returns_structured_offline_error(self):
-        config_patch, mqtt_patch, _ = self._patch_rpc({"r": None, "elapsed_ms": 2000})
+        config_patch, mqtt_patch, _ = self._patch_rpc({"r": None})
         with config_patch, mqtt_patch:
             result = json.loads(feature_probe.run())
         self.assertFalse(result["ok"])

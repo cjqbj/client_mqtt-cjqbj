@@ -1,8 +1,12 @@
 import ast
+import functools
+import http.server
 import json
 import os
+import socketserver
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -209,7 +213,7 @@ class ClientServiceTests(unittest.TestCase):
         self.assertTrue(pem.startswith("-----BEGIN EC PRIVATE KEY-----"))
         self.assertTrue(pem.rstrip().endswith("-----END EC PRIVATE KEY-----"))
 
-    def test_rpc_timeout_logs_topic_elapsed_and_broker_state_without_secrets(self):
+    def test_rpc_timeout_logs_topic_and_broker_state_without_secrets(self):
         previous_state = client_service._STATE.copy()
         with tempfile.TemporaryDirectory() as files_dir:
             try:
@@ -240,6 +244,9 @@ class ClientServiceTests(unittest.TestCase):
                 self.assertIn("key_format=raw-text", logs)
                 self.assertIn("normalized_bytes=40", logs)
                 self.assertNotIn("DO_NOT_LOG_THIS_KEY", logs)
+                self.assertNotIn("elapsed_ms", logs)
+                self.assertNotIn("request_id", logs)
+                self.assertNotIn("elapsed_ms", result)
             finally:
                 client_service._STATE.clear()
                 client_service._STATE.update(previous_state)
@@ -389,74 +396,222 @@ class ClientServiceTests(unittest.TestCase):
             finally:
                 client_service._STATE["rpc_health"].pop(key, None)
 
-    def test_remote_feature_catalog_success(self):
-        remote_payload = json.dumps({
-            "ok": True,
-            "candidate_dirs": ["/asset/app", "/sdcard/apm/client_mqtt/py_updates"],
-            "features": [
-                {"name": "repl", "active": {"source": "py_updates", "dir": "/upd",
-                                            "file": "feature_repl.py", "version": 9,
-                                            "actions": ["eval"], "ui": "python"},
-                 "sources": [{"source": "builtin"}, {"source": "py_updates"}]},
-            ],
-        })
-        with mock.patch.object(client_service, "rpc",
-                               return_value={"r": remote_payload, "topic": "sys/device/k12",
-                                             "elapsed_ms": 42}):
-            result = json.loads(client_service.remote_feature_catalog())
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["topic"], "sys/device/k12")
-        self.assertEqual(result["elapsed_ms"], 42)
-        self.assertEqual(len(result["candidate_dirs"]), 2)
-        self.assertEqual(result["features"][0]["name"], "repl")
-        self.assertEqual(result["features"][0]["active"]["source"], "py_updates")
+    # -- 持久化设置：/sdcard 按 topic 分目录，卸载/重装不丢 -------------------
 
-    def test_remote_feature_catalog_timeout_returns_error_not_local_list(self):
-        with mock.patch.object(client_service, "rpc",
-                               return_value={"r": None, "topic": "sys/device/k12",
-                                             "elapsed_ms": 2000, "error": "RPC timeout"}):
-            result = json.loads(client_service.remote_feature_catalog())
-        self.assertFalse(result["ok"])
-        self.assertIn("RPC timeout", result["error"])
-        self.assertNotIn("features", result)
+    def _use_durable_root(self, durable_root):
+        self._previous_env = os.environ.get("QGB_SETTINGS_ROOT")
+        os.environ["QGB_SETTINGS_ROOT"] = durable_root
 
-    def test_remote_feature_catalog_bad_json(self):
-        with mock.patch.object(client_service, "rpc",
-                               return_value={"r": "not-json{{", "topic": "t"}):
-            result = json.loads(client_service.remote_feature_catalog())
-        self.assertFalse(result["ok"])
-        self.assertIn("bad remote catalog JSON", result["error"])
+    def _restore_durable_root(self):
+        if self._previous_env is None:
+            os.environ.pop("QGB_SETTINGS_ROOT", None)
+        else:
+            os.environ["QGB_SETTINGS_ROOT"] = self._previous_env
 
-    def test_remote_scan_code_runs_standalone_and_shadows_builtin(self):
-        # 目标端脚本必须自包含可 exec：在临时 py_updates 放覆盖版 repl +
-        # 新 feature，断言发现、遮蔽与元数据解析。
-        tmp_root = tempfile.mkdtemp()
-        updates_dir = os.path.join(tmp_root, "py_updates")
-        os.makedirs(updates_dir)
-        with open(os.path.join(updates_dir, "feature_repl.py"), "w", encoding="utf-8") as handle:
-            handle.write("FEATURE = {'version': 9999, 'actions': ['eval'], 'ui': 'python'}\n")
-        with open(os.path.join(updates_dir, "feature_tempone.py"), "w", encoding="utf-8") as handle:
-            handle.write("FEATURE = {'version': 1, 'actions': ['run'], 'ui': 'compose'}\n")
-        previous_env = os.environ.get("QGB_EXTRA_FEATURE_DIRS")
-        os.environ["QGB_EXTRA_FEATURE_DIRS"] = updates_dir
+    def test_durable_settings_survive_reinstall_in_per_topic_folders(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as durable_root, \
+                tempfile.TemporaryDirectory() as install_a, \
+                tempfile.TemporaryDirectory() as install_b:
+            self._use_durable_root(durable_root)
+            try:
+                client_service.initialize(install_a)
+                client_service.update_device_settings("sys/device/request", {
+                    "request_topic": "sys/device/k12", "name": "k12",
+                })
+                client_service.update_aliyun_settings(
+                    {"aliyun": {"token": "sek"}}, "sys/device/k12"
+                )
+                topic_file = (Path(durable_root) / "settings" / "topics"
+                              / "sys_device_k12" / "device.json")
+                self.assertTrue(topic_file.is_file())
+                doc = json.loads(topic_file.read_text(encoding="utf-8"))
+                self.assertEqual(doc["request_topic"], "sys/device/k12")
+                self.assertEqual(doc["aliyun"], {"token": "sek"})
+                self.assertTrue(
+                    (Path(durable_root) / "settings" / "global.json").is_file()
+                )
+
+                # 模拟卸载重装：全新 App 私有目录，外置设置必须原样恢复。
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+                client_service.initialize(install_b)
+                self.assertEqual(
+                    client_service._STATE["settings_backend"], "durable"
+                )
+                topics = [d["request_topic"]
+                          for d in json.loads(client_service.device_catalog())]
+                self.assertIn("sys/device/k12", topics)
+                settings = json.loads(
+                    client_service.aliyun_settings("sys/device/k12")
+                )
+                self.assertEqual(settings["aliyun"], {"token": "sek"})
+            finally:
+                self._restore_durable_root()
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_durable_topic_rename_moves_folder_and_aliyun_is_isolated(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as durable_root, \
+                tempfile.TemporaryDirectory() as files_dir:
+            self._use_durable_root(durable_root)
+            try:
+                client_service.initialize(files_dir)
+                created = json.loads(client_service.update_device_settings(
+                    "sys/device/request", {"request_topic": "sys/device/old"}
+                ))
+                client_service.update_aliyun_settings(
+                    {"aliyun": {"bucket": "old-only"}}, "sys/device/old"
+                )
+                old_folder = Path(durable_root) / "settings" / "topics" / "sys_device_old"
+                new_folder = Path(durable_root) / "settings" / "topics" / "sys_device_new"
+                self.assertTrue(old_folder.is_dir())
+
+                client_service.update_device_settings(created["id"], {
+                    "request_topic": "sys/device/new",
+                })
+                self.assertTrue(new_folder.is_dir())
+                self.assertFalse(old_folder.is_dir())
+
+                # 第二个 topic 的 aliyun 与第一个互不干扰。
+                client_service.update_device_settings("", {
+                    "request_topic": "sys/device/two",
+                })
+                client_service.update_aliyun_settings(
+                    {"aliyun": {"bucket": "two-only"}}, "sys/device/two"
+                )
+                self.assertEqual(
+                    json.loads(client_service.aliyun_settings("sys/device/new"))["aliyun"],
+                    {"bucket": "old-only"},
+                )
+                self.assertEqual(
+                    json.loads(client_service.aliyun_settings("sys/device/two"))["aliyun"],
+                    {"bucket": "two-only"},
+                )
+            finally:
+                self._restore_durable_root()
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_legacy_backend_used_without_external_root(self):
+        # 桌面/无外置存储：仍是单文件后端，老路径/老语义不变。
+        previous_state = client_service._STATE.copy()
+        previous_env = os.environ.get("QGB_SETTINGS_ROOT")
+        os.environ.pop("QGB_SETTINGS_ROOT", None)
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                self.assertEqual(client_service._STATE["settings_backend"], "legacy")
+                self.assertTrue(Path(files_dir, "client_mqtt.json").is_file())
+            finally:
+                if previous_env is not None:
+                    os.environ["QGB_SETTINGS_ROOT"] = previous_env
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    # -- 下载服务器 feature 列表 -------------------------------------------
+
+    def test_github_listing_urls_derived_from_ghfast_raw_root(self):
+        proxy, real = client_service._split_proxied_url(client_service.DEFAULT_FEATURE_URL_ROOT)
+        self.assertEqual(proxy, "https://ghfast.top")
+        parts = client_service._github_parts(real)
+        self.assertEqual(parts, ("cjqbj", "client_mqtt-cjqbj", "main",
+                                 "app/src/main/python"))
+        urls = client_service._server_listing_urls(client_service.DEFAULT_FEATURE_URL_ROOT)
+        # 列表要最新：直连 Contents API 优先，代理兜底，root（文件服务索引）最后。
+        self.assertEqual(
+            urls[0],
+            "https://api.github.com/repos/cjqbj/client_mqtt-cjqbj/contents/app/src/main/python?ref=main",
+        )
+        self.assertIn(
+            "https://ghfast.top/https://api.github.com/repos/cjqbj/client_mqtt-cjqbj/contents/app/src/main/python?ref=main",
+            urls,
+        )
+        self.assertIn(
+            "https://ghfast.top/https://github.com/cjqbj/client_mqtt-cjqbj/tree/main/app/src/main/python",
+            urls,
+        )
+        self.assertEqual(urls[-1], client_service.DEFAULT_FEATURE_URL_ROOT)
+        # 自定义静态服务器：只 GET root，不乱加 GitHub API。
+        self.assertEqual(
+            client_service._server_listing_urls("http://10.0.0.1/files/"),
+            ["http://10.0.0.1/files/"],
+        )
+
+    def test_parse_feature_listing_accepts_github_api_json(self):
+        payload = json.dumps([
+            {"type": "file", "name": "feature_audio.py", "size": 123,
+             "download_url": "https://x/feature_audio.py"},
+            {"type": "dir", "name": "feature_nope"},
+            {"type": "file", "name": "README.md", "size": 9},
+        ])
+        files = client_service._parse_feature_listing(payload, "http://x/")
+        self.assertEqual([item["name"] for item in files], ["feature_audio.py"])
+        self.assertEqual(files[0]["size"], 123)
+
+    def test_download_server_feature_files_lists_latest_http_index(self):
+        # 普通 HTTP 文件服务：GET root 解析目录索引；服务器新增文件后再刷即见。
+        state = {"extra": False}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                links = [
+                    "<a href=\"feature_audio.py\">feature_audio.py</a>",
+                    "<a href=\"feature_dialer.py\">feature_dialer.py</a>",
+                    "<a href=\"README.md\">README.md</a>",
+                ]
+                if state["extra"]:
+                    links.append(
+                        "<a href=\"feature_newly_uploaded.py\">feature_newly_uploaded.py</a>"
+                    )
+                body = ("<html><body>%s</body></html>" % "".join(links)).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        previous_state = client_service._STATE.copy()
         try:
-            namespace = {"__name__": "<rpc>"}
-            exec(compile(client_service.REMOTE_FEATURE_SCAN_CODE, "<remote_scan>", "exec"),
-                 namespace)
-            payload = json.loads(namespace["r"])
+            root = "http://127.0.0.1:%d/" % server.server_address[1]
+            with tempfile.TemporaryDirectory() as files_dir:
+                client_service.initialize(files_dir)
+                client_service.update_feature_download_settings(
+                    {"feature_url_root": root}
+                )
+                result = json.loads(
+                    client_service.download_server_feature_files(timeout=5)
+                )
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["source_url"], root)
+                self.assertEqual(
+                    [item["name"] for item in result["files"]],
+                    ["feature_audio.py", "feature_dialer.py"],
+                )
+
+                # 模拟往文件服务上传新 feature：再次刷新必须拿到最新列表。
+                state["extra"] = True
+                result = json.loads(
+                    client_service.download_server_feature_files(timeout=5)
+                )
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(
+                    [item["name"] for item in result["files"]],
+                    ["feature_audio.py", "feature_dialer.py",
+                     "feature_newly_uploaded.py"],
+                )
         finally:
-            if previous_env is None:
-                os.environ.pop("QGB_EXTRA_FEATURE_DIRS", None)
-            else:
-                os.environ["QGB_EXTRA_FEATURE_DIRS"] = previous_env
-        self.assertTrue(payload["ok"])
-        names = {item["name"] for item in payload["features"]}
-        self.assertIn("repl", names)
-        self.assertIn("tempone", names)
-        repl = next(item for item in payload["features"] if item["name"] == "repl")
-        self.assertEqual(repl["active"]["source"], "py_updates")
-        self.assertEqual(repl["active"]["version"], 9999)
-        self.assertGreaterEqual(len(repl["sources"]), 2)
+            server.shutdown()
+            server.server_close()
+            client_service._STATE.clear()
+            client_service._STATE.update(previous_state)
 
     def test_rpc_success_log_shows_request_source_and_response_metadata(self):
         previous_state = client_service._STATE.copy()
@@ -467,6 +622,8 @@ class ClientServiceTests(unittest.TestCase):
                     "request_topic": "sys/device/k12",
                 })
                 mqtt_module = mock.Mock()
+                mqtt_module.utc_ms.return_value = 1790421445000
+                mqtt_module.get_req_id.return_value = "client-req-1"
                 mqtt_module.rpc.return_value = {
                     "ok": True,
                     "r": "{}",
@@ -479,17 +636,25 @@ class ClientServiceTests(unittest.TestCase):
                 with mock.patch.object(client_service, "_mqtt_client_module", return_value=mqtt_module):
                     response = client_service.rpc("DO_NOT_LOG_RPC_SOURCE")
 
+                # 只有一套请求 id：发送前日志用的 req_id 必须原样透传给竞速客户端。
+                self.assertEqual(
+                    mqtt_module.rpc.call_args.kwargs["req_id"], "client-req-1"
+                )
                 logs = "\n".join(json.loads(client_service.rpc_logs()))
+                self.assertIn("req_id=client-req-1", logs)
                 self.assertIn("topic=sys/device/k12", logs)
                 self.assertIn("phase=response", logs)
                 self.assertIn("MQTT RESPONSE ENVELOPE", logs)
                 self.assertIn('"r": "{}"', logs)
-                self.assertIn("req_id=server-req-1", logs)
+                self.assertIn('"req_id": "server-req-1"', logs)
                 self.assertIn("server_time=1790421445203", logs)
                 self.assertIn("server=server-broker", logs)
                 self.assertIn("client=client-broker", logs)
                 self.assertIn("REQUEST CODE", logs)
                 self.assertIn("DO_NOT_LOG_RPC_SOURCE", logs)
+                # 不再展示内部 request_id / 耗时（需要时走 adb 动态插桩）。
+                self.assertNotIn("request_id", logs)
+                self.assertNotIn("elapsed_ms", logs)
                 parsed = client_service.parse_json_result(response)
                 self.assertEqual(parsed["_rpc"]["req_id"], "server-req-1")
                 health = json.loads(client_service.target_health("sys/device/k12"))
@@ -615,11 +780,14 @@ class ClientServiceTests(unittest.TestCase):
         self.assertEqual(result, timeout)
 
     def test_parse_json_result_preserves_structured_rpc_errors(self):
-        response = {"ok": False, "error": "RPC timeout", "elapsed_ms": 5000}
+        response = {"ok": False, "error": "RPC timeout", "req_id": "req-42"}
         result = client_service.parse_json_result(response)
         self.assertEqual(result["ok"], False)
         self.assertEqual(result["error"], "RPC timeout")
-        self.assertEqual(result["_rpc"]["elapsed_ms"], 5000)
+        self.assertEqual(result["_rpc"]["req_id"], "req-42")
+        # 内部计时/重复请求 id 不再透传给 feature UI。
+        self.assertNotIn("elapsed_ms", result["_rpc"])
+        self.assertNotIn("request_id", result["_rpc"])
 
     def test_server_python_traceback_is_summarized_and_key_redacted(self):
         previous_state = client_service._STATE.copy()

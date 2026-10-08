@@ -119,7 +119,9 @@ def build_view(context):
     preview = pyui_kit.make_zoom_image(context, height_dp=240)
     page.add(preview, top=6)
 
-    root_line = pyui_kit.make_text(context, "", size=12, color=pyui_kit.MUTED)
+    root_line = pyui_kit.make_text(
+        context, "", size=12, color=pyui_kit.MUTED, selectable=True
+    )
     page.add(root_line, top=4)
 
     rows_box = LinearLayout(context)
