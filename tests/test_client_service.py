@@ -769,51 +769,51 @@ class ClientServiceTests(unittest.TestCase):
                     progress(f"{filename}: installed for test")
                     return {"filename": filename, "ok": True}
 
+                builtin_count = len(bootstrap.BUILTIN_FEATURES)
                 with mock.patch.object(bootstrap, "install_feature", side_effect=install) as download, \
                         mock.patch.object(bootstrap, "_purge_feature_pyc") as purge:
                     result = json.loads(client_service.install_builtin_features(script_root))
                     self.assertTrue(result["ok"])
                     self.assertFalse(result["force"])
-                    self.assertEqual(len(result["results"]), 5)
+                    self.assertEqual(len(result["results"]), builtin_count)
                     self.assertTrue(all(item["ok"] for item in result["results"]))
                     self.assertTrue(any("installed for test" in item for item in result["logs"]))
-                    self.assertEqual(download.call_count, 5)
+                    self.assertEqual(download.call_count, builtin_count)
                     # 非 force：已存在文件直接跳过，不重新下载、不清缓存。
                     purge.assert_not_called()
 
                     second = json.loads(client_service.install_builtin_features(script_root))
                     self.assertTrue(all(item.get("skipped") for item in second["results"]))
-                    self.assertEqual(download.call_count, 5)
+                    self.assertEqual(download.call_count, builtin_count)
 
                     single = json.loads(
                         client_service.install_builtin_feature(script_root, "feature_audio.py")
                     )
                     self.assertTrue(single["ok"])
                     self.assertEqual(single["result"]["filename"], "feature_audio.py")
-                    self.assertEqual(download.call_count, 6)
+                    self.assertEqual(download.call_count, builtin_count + 1)
 
                     invalid = json.loads(
                         client_service.install_builtin_feature(script_root, "feature_unknown.py")
                     )
                     self.assertFalse(invalid["ok"])
                     self.assertIn("unknown built-in feature file", invalid["result"]["error"])
-                    self.assertEqual(download.call_count, 6)
+                    self.assertEqual(download.call_count, builtin_count + 1)
 
-                    # force（一键全部重新下载）：不跳过任何文件，全部重下（计数 6→11），
+                    # force（一键全部重新下载）：不跳过任何文件，全部重下，
                     # 每个成功项都弹出模块缓存并清 pyc，reinstall_ 入口等价于 force=True。
                     forced = json.loads(client_service.reinstall_builtin_features(script_root))
                     self.assertTrue(forced["ok"])
                     self.assertTrue(forced["force"])
-                    self.assertEqual(len(forced["results"]), 5)
+                    self.assertEqual(len(forced["results"]), builtin_count)
                     self.assertTrue(all(not item.get("skipped") for item in forced["results"]))
                     self.assertTrue(all(item.get("reloaded") for item in forced["results"]))
-                    self.assertEqual(download.call_count, 11)
-                    self.assertEqual(purge.call_count, 5)
+                    self.assertEqual(download.call_count, 2 * builtin_count + 1)
+                    self.assertEqual(purge.call_count, builtin_count)
                     purged = {call.args[0] for call in purge.call_args_list}
                     self.assertEqual(
                         purged,
-                        {"feature_files", "feature_camera", "feature_wifi",
-                         "feature_audio", "feature_probe"},
+                        {f"feature_{name}" for name in bootstrap.BUILTIN_FEATURES},
                     )
             finally:
                 client_service._STATE.clear()
@@ -1103,6 +1103,89 @@ class ClientServiceTests(unittest.TestCase):
         self.assertFalse(client_service.handle_feature_back("camera"))
         client_service.set_feature_back_handler("files", None)
         self.assertFalse(client_service.handle_feature_back("files"))
+
+    def test_new_features_adopt_into_custom_whitelists_without_reviving_disabled(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                config = client_service.load_config()
+                # 模拟老用户：两个目标，一个白名单、一个全选。
+                config["devices"][0]["enabled_features"] = ["files", "camera"]
+                config["devices"][0]["request_topic"] = "sys/device/a"
+                config["devices"][0]["id"] = "dev-a"
+                config["devices"].append(dict(client_service._DEFAULT_DEVICE))
+                config["devices"][1].update({
+                    "id": "dev-b", "request_topic": "sys/device/b",
+                    "enabled_features": None,
+                })
+                # 首次登记：只记录当前已知集合，不改动白名单。
+                config["known_features"] = ["files", "camera"]
+                client_service.save_config(config)
+
+                # 新出现 dialer（APK 升级带来的新内置）+ 手动 push 的脚本。
+                with mock.patch("bootstrap.list_features",
+                                return_value=["files", "camera", "dialer"]):
+                    client_service._sync_known_features()
+
+                saved = client_service.load_config()
+                self.assertEqual(
+                    saved["devices"][0]["enabled_features"],
+                    ["files", "camera", "dialer"],
+                )
+                # 全选目标保持 null，不会被落成列表。
+                self.assertIsNone(saved["devices"][1]["enabled_features"])
+                self.assertEqual(saved["known_features"], ["files", "camera", "dialer"])
+
+                # 用户随后把 camera 勾掉；已知集合不变，再同步不会复活 camera。
+                saved["devices"][0]["enabled_features"] = ["files", "dialer"]
+                client_service.save_config(saved)
+                with mock.patch("bootstrap.list_features",
+                                return_value=["files", "camera", "dialer"]):
+                    client_service._sync_known_features()
+                again = client_service.load_config()
+                self.assertEqual(again["devices"][0]["enabled_features"], ["files", "dialer"])
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_delete_runtime_feature_removes_override_and_rejects_escape(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                with tempfile.TemporaryDirectory() as script_root:
+                    update_dir = Path(script_root) / "py_updates"
+                    update_dir.mkdir()
+                    # 一个纯运行时 feature（无内置同名），一个内置同名覆盖。
+                    (update_dir / "feature_extra.py").write_text("FEATURE={}\n", encoding="utf-8")
+                    (update_dir / "feature_files.py").write_text(
+                        "FEATURE={'name': 'files'}\n", encoding="utf-8"
+                    )
+                    removed = json.loads(
+                        client_service.delete_runtime_feature(script_root, "extra")
+                    )
+                    self.assertTrue(removed["ok"])
+                    self.assertTrue(removed["removed_file"])
+                    self.assertFalse(removed["falls_back_to_builtin"])
+                    self.assertFalse((update_dir / "feature_extra.py").exists())
+
+                    fell_back = json.loads(
+                        client_service.delete_runtime_feature(script_root, "feature_files.py")
+                    )
+                    self.assertTrue(fell_back["ok"])
+                    self.assertTrue(fell_back["falls_back_to_builtin"])
+                    self.assertFalse((update_dir / "feature_files.py").exists())
+
+                    # 路径穿越/非法名拒绝。
+                    bad = json.loads(
+                        client_service.delete_runtime_feature(script_root, "../evil")
+                    )
+                    # ../evil 规范化后 isidentifier 不合法 -> invalid name
+                    self.assertFalse(bad["ok"])
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
 
     def test_unnamed_target_stops_displaying_legacy_default_name(self):
         previous_state = client_service._STATE.copy()

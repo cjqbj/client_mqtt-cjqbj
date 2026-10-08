@@ -11,7 +11,28 @@ from urllib.error import URLError
 import urllib.request
 
 _UPDATE_DIR = None
-BUILTIN_FEATURES = ("files", "camera", "wifi", "audio", "probe")
+
+
+def _scan_builtin_features():
+    """内建 feature 不再硬编码：编译打包进来的每个 feature_*.py 自动算内建。
+
+    名字取文件名 feature_<name>.py 的 <name> 段，与 py_updates 热更文件
+    使用同一套命名规则；FEATURE manifest 里无需再写 name/title。
+    """
+    root = os.path.dirname(os.path.abspath(__file__))
+    names = set()
+    try:
+        for filename in os.listdir(root):
+            if filename.startswith("feature_") and filename.endswith(".py"):
+                name = filename[8:-3]
+                if name.isidentifier():
+                    names.add(name)
+    except OSError:
+        pass
+    return tuple(sorted(names))
+
+
+BUILTIN_FEATURES = _scan_builtin_features()
 MAX_FEATURE_SIZE = 2 * 1024 * 1024
 _FEATURE_LOCK = threading.RLock()
 _RPC_SERVER_STARTED = False
@@ -155,9 +176,12 @@ def describe_features():
             module = load_feature(name)
             manifest = getattr(module, "FEATURE", {})
             icon = manifest.get("icon")
+            # 名字永远以文件名为准（manifest.name 被忽略，避免两边不一致）；
+            # title 缺省直接美化文件名：dialer -> Dialer。
+            default_title = name[:1].upper() + name[1:]
             result.append({
                 "name": name,
-                "title": str(manifest.get("title") or name),
+                "title": str(manifest.get("title") or default_title),
                 "version": manifest.get("version", 1),
                 "actions": list(manifest.get("actions") or ["run"]),
                 # ui=python 表示界面由 feature 脚本用 Chaquopy 自绘，

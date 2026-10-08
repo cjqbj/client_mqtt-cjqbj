@@ -48,6 +48,7 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.BugReport
+import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.CameraAlt
 import androidx.compose.material.icons.outlined.Extension
 import androidx.compose.material.icons.outlined.Folder
@@ -118,7 +119,9 @@ private data class FeatureDescriptor(
     val source: String = "",
     // ui=python 时界面由 feature 脚本经 Chaquopy 自绘（PythonViewPage 宿主），
     // 其余走 Compose 通用动作页。
-    val ui: String = "compose"
+    val ui: String = "compose",
+    // 脚本导入/加载失败时 Python 端给的错误（设置页列表标红提示）。
+    val error: String? = null
 )
 
 private fun featureIcon(feature: FeatureDescriptor) = when (feature.icon?.lowercase()) {
@@ -128,12 +131,14 @@ private fun featureIcon(feature: FeatureDescriptor) = when (feature.icon?.lowerc
     "audio", "sound", "speaker", "play" -> Icons.Outlined.PlayArrow
     "terminal", "shell", "console" -> Icons.Outlined.Terminal
     "bug", "debug" -> Icons.Outlined.BugReport
+    "phone", "dial", "dialer", "call", "telephone" -> Icons.Outlined.Call
     "info", "about" -> Icons.Outlined.Info
     "settings", "config", "tune" -> Icons.Outlined.Settings
     else -> when (feature.name) {
         "files" -> Icons.Outlined.Folder
         "camera" -> Icons.Outlined.CameraAlt
         "wifi" -> Icons.Outlined.NetworkWifi
+        "dialer" -> Icons.Outlined.Call
         else -> Icons.Outlined.Extension
     }
 }
@@ -250,6 +255,7 @@ private fun ClientMqttScreen() {
                     moduleFile = item.optString("module_file"),
                     source = item.optString("source"),
                     ui = item.optString("ui", "compose").ifBlank { "compose" },
+                    error = item.optString("error").ifBlank { null },
                 ))
             }
         }
@@ -1111,6 +1117,9 @@ private fun SettingsPage(
     var downloading by remember { mutableStateOf(false) }
     var scriptRevision by remember { mutableStateOf(0) }
     var builtinFeatureFiles by remember { mutableStateOf(listOf<String>()) }
+    // 实际扫描到的 feature 全量列表（内置 + py_updates，含加载失败条目）。
+    var featureList by remember { mutableStateOf(listOf<FeatureDescriptor>()) }
+    var featureListBusy by remember { mutableStateOf(false) }
     // feature 下载根 URL：Python 端有默认值（ghfast 代理 GitHub main），
     // 加载完成前输入框显示占位，绝不能把空串回写覆盖默认配置。
     var featureUrlRoot by remember { mutableStateOf("") }
@@ -1139,6 +1148,46 @@ private fun SettingsPage(
             builtinFeatureFiles = buildList {
                 for (index in 0 until array.length()) add(array.optString(index))
             }
+        }
+    }
+
+    fun parseFeatureCatalog(raw: String) = buildList {
+        val array = org.json.JSONArray(raw)
+        for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+            val actions = item.optJSONArray("actions") ?: org.json.JSONArray()
+            add(FeatureDescriptor(
+                name = item.optString("name"),
+                title = item.optString("title", item.optString("name")),
+                actions = buildList {
+                    for (actionIndex in 0 until actions.length()) add(actions.optString(actionIndex))
+                },
+                icon = if (item.isNull("icon")) null else item.optString("icon").ifBlank { null },
+                moduleFile = item.optString("module_file"),
+                source = item.optString("source"),
+                ui = item.optString("ui", "compose").ifBlank { "compose" },
+                error = item.optString("error").ifBlank { null },
+            ))
+        }
+    }
+
+    // 重扫 py_updates（Python 端同时把新 feature 收养进目标白名单），
+    // 返回最新全量列表；rescan 本身就返回 catalog，不必再发一次请求。
+    suspend fun rescanFeatureList() {
+        featureListBusy = true
+        try {
+            val raw = withContext(Dispatchers.IO) { service.callAttr("rescan_features").toString() }
+            featureList = parseFeatureCatalog(raw)
+            scriptRevision++
+        } finally {
+            featureListBusy = false
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        runCatching {
+            val raw = withContext(Dispatchers.IO) { service.callAttr("feature_catalog").toString() }
+            featureList = parseFeatureCatalog(raw)
         }
     }
 
@@ -1375,20 +1424,128 @@ private fun SettingsPage(
                     )
                 }
                 OutlinedButton(
-                    enabled = !downloading,
+                    enabled = !downloading && !featureListBusy,
                     onClick = {
-                        // 立即让 Python 重扫 py_updates，然后刷新外层底栏列表。
+                        // 立即让 Python 重扫 py_updates（同时收养新 feature 进
+                        // 目标白名单），然后刷新本页列表和外层底栏。
                         scope.launch {
-                            runCatching {
-                                withContext(Dispatchers.IO) { service.callAttr("rescan_features") }
-                            }
-                            scriptRevision++
+                            runCatching { rescanFeatureList() }
                             onRefreshFeatureList()
                         }
                     }
                 ) {
                     Icon(Icons.Outlined.Refresh, contentDescription = null)
-                    Text("Refresh feature list")
+                    Text(if (featureListBusy) "Scanning..." else "Refresh feature list")
+                }
+            }
+            // 实际扫描到的 feature 全量列表（文件名即 feature 名）：
+            // 来源、加载错误、Reload、py_updates 覆盖删除都在这里操作。
+            Text("Features on this device", style = MaterialTheme.typography.labelLarge)
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp, max = 260.dp)
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .verticalScroll(rememberScrollState())
+                    .padding(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (featureList.isEmpty()) {
+                    Text(
+                        "No features discovered yet. Tap \"Refresh feature list\".",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                featureList.forEach { descriptor ->
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "${descriptor.title}  (${descriptor.name})",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Text(
+                                when (descriptor.source) {
+                                    "py_updates" -> "py_updates override"
+                                    "builtin" -> "built-in"
+                                    else -> descriptor.source.ifBlank { "not loaded" }
+                                },
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            descriptor.error?.let { message ->
+                                Text(
+                                    "error: $message",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            }
+                        }
+                        if (descriptor.source == "py_updates") {
+                            OutlinedButton(
+                                enabled = !downloading,
+                                onClick = {
+                                    downloading = true
+                                    downloadStatus = "Removing feature_${descriptor.name}.py ..."
+                                    scope.launch {
+                                        try {
+                                            val response = withContext(Dispatchers.IO) {
+                                                service.callAttr(
+                                                    "delete_runtime_feature",
+                                                    scriptRoot,
+                                                    descriptor.name
+                                                ).toString()
+                                            }
+                                            val result = JSONObject(response)
+                                            downloadStatus = if (result.optBoolean("ok")) {
+                                                if (result.optBoolean("falls_back_to_builtin")) {
+                                                    "feature_${descriptor.name}.py removed; built-in version is active again."
+                                                } else {
+                                                    "feature_${descriptor.name}.py removed."
+                                                }
+                                            } else {
+                                                "Remove failed: ${result.optString("error", "unknown error")}"
+                                            }
+                                        } catch (error: Exception) {
+                                            downloadStatus = "Remove failed: ${error.message}"
+                                        } finally {
+                                            downloading = false
+                                            runCatching { rescanFeatureList() }
+                                            onRefreshFeatureList()
+                                        }
+                                    }
+                                }
+                            ) { Text("Delete") }
+                        }
+                        OutlinedButton(
+                            enabled = !downloading,
+                            onClick = {
+                                downloading = true
+                                downloadStatus = "Reloading feature_${descriptor.name}.py ..."
+                                scope.launch {
+                                    try {
+                                        val response = withContext(Dispatchers.IO) {
+                                            service.callAttr("reload_feature", descriptor.name).toString()
+                                        }
+                                        val result = JSONObject(response)
+                                        downloadStatus = if (result.optBoolean("ok")) {
+                                            "${descriptor.title} reloaded."
+                                        } else {
+                                            "Reload failed: ${result.optString("error", "unknown error")}"
+                                        }
+                                    } catch (error: Exception) {
+                                        downloadStatus = "Reload failed: ${error.message}"
+                                    } finally {
+                                        downloading = false
+                                        runCatching { rescanFeatureList() }
+                                        onRefreshFeatureList()
+                                    }
+                                }
+                            }
+                        ) { Text("Reload") }
+                    }
                 }
             }
             OutlinedTextField(
@@ -1436,6 +1593,7 @@ private fun SettingsPage(
                         runCatching { refreshDownloadLogs() }
                         downloading = false
                         scriptRevision++
+                        runCatching { rescanFeatureList() }
                         onRefreshFeatureList()
                     }
                 }
@@ -1496,6 +1654,7 @@ private fun SettingsPage(
                                     runCatching { refreshDownloadLogs() }
                                     downloading = false
                                     scriptRevision++
+                                    runCatching { rescanFeatureList() }
                                     onRefreshFeatureList()
                                 }
                             }
@@ -1548,6 +1707,7 @@ private fun SettingsPage(
                                 runCatching { refreshDownloadLogs() }
                                 downloading = false
                                 scriptRevision++
+                                runCatching { rescanFeatureList() }
                                 onRefreshFeatureList()
                             }
                         }

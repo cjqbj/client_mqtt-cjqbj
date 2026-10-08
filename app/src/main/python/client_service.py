@@ -465,6 +465,8 @@ def install_named_feature(script_root, filename, retries=4, timeout=20):
         sys.modules.pop(module_name, None)
         bootstrap._purge_feature_pyc(module_name)
         result["reloaded"] = True
+        # 自定义白名单的目标自动收养新 feature，否则"成功却看不到条目"。
+        result["adopted_whitelists"] = _adopt_feature_into_whitelists(name[8:-3])
     except Exception as error:
         detail = f"{type(error).__name__}: {error}"[:300]
         _append_operation_log(f"{name}: failed: {detail}")
@@ -477,6 +479,103 @@ def install_named_feature(script_root, filename, retries=4, timeout=20):
         "update_dir": update_dir,
         "result": result,
         "logs": json.loads(operation_logs()),
+    }, ensure_ascii=False)
+
+
+def _adopt_feature_into_whitelists(name):
+    """显式安装的 feature 并入所有"自定义白名单"目标（等同重新启用）。
+
+    enabled_features=None 的目标默认全选，无需改动；显式白名单里没有的
+    新 feature 否则在 UI 上不可见（用户反馈"添加成功却没有条目"的根因）。
+    """
+    name = _normalize_feature_name(name)
+    config = load_config()
+    changed = False
+    for device in config.get("devices") or []:
+        allowed = _normalize_enabled_features(device.get("enabled_features"))
+        if allowed is not None and name not in allowed:
+            device["enabled_features"] = allowed + [name]
+            changed = True
+    if changed:
+        save_config(config)
+    return changed
+
+
+def _apply_known_features(config):
+    """把"新出现"的 feature 并入 config 内自定义白名单（纯内存，不做 IO）。
+
+    与显式安装不同，只收养相对 config["known_features"] 的差集，
+    用户主动勾掉的既有 feature 不会被加回来；首次运行只登记不收容。
+    返回是否改动了白名单。
+    """
+    import bootstrap
+
+    current = list(bootstrap.list_features())
+    known = config.get("known_features")
+    changed = False
+    if isinstance(known, list):
+        known_set = set(known)
+        new_names = [name for name in current if name not in known_set]
+        for device in config.get("devices") or []:
+            allowed = _normalize_enabled_features(device.get("enabled_features"))
+            if allowed is None:
+                continue
+            additions = [name for name in new_names if name not in allowed]
+            if additions:
+                device["enabled_features"] = allowed + additions
+                changed = True
+    config["known_features"] = current
+    return changed
+
+
+def _sync_known_features():
+    """load -> 收养差集 -> save 的磁盘包装（rescan 用）。"""
+    config = load_config()
+    if _apply_known_features(config):
+        save_config(config)
+        return True
+    # known_features 登记本身也要落盘（即使白名单没动）。
+    save_config(config)
+    return False
+
+
+def delete_runtime_feature(script_root, filename):
+    """删除 py_updates 里的 feature_<name>.py 热更覆盖文件（设置页列表用）。
+
+    只允许删 py_updates 目录内的文件；APK 内置文件不可删。删同名覆盖后
+    模块回退内置版本；内置不存在时该 feature 条目消失。
+    """
+    import bootstrap
+
+    name = str(filename or "").strip()
+    if not name.endswith(".py"):
+        name += ".py"
+    if not name.startswith("feature_"):
+        name = "feature_" + name
+    bare_name = name[8:-3]
+    if not bare_name.isidentifier():
+        return json.dumps({"ok": False, "error": "invalid feature name"}, ensure_ascii=False)
+
+    update_dir = os.path.join(os.path.abspath(str(script_root)), "py_updates")
+    target = os.path.abspath(os.path.join(update_dir, name))
+    if os.path.commonpath([target, os.path.abspath(update_dir)]) != os.path.abspath(update_dir):
+        return json.dumps({"ok": False, "error": "path escapes py_updates"}, ensure_ascii=False)
+
+    removed_file = False
+    if os.path.isfile(target):
+        os.unlink(target)
+        removed_file = True
+    module_name = "feature_" + bare_name
+    sys.modules.pop(module_name, None)
+    bootstrap._purge_feature_pyc(module_name)
+    importlib.invalidate_caches()
+    builtin = bare_name in bootstrap.BUILTIN_FEATURES
+    return json.dumps({
+        "ok": True,
+        "name": bare_name,
+        "removed_file": removed_file,
+        # 同名内置还在：条目保留但已回退内置实现；否则条目随扫描消失。
+        "falls_back_to_builtin": builtin,
     }, ensure_ascii=False)
 
 
@@ -504,6 +603,9 @@ def rescan_features():
         ):
             bootstrap._purge_feature_pyc(module_name)
             sys.modules.pop(module_name, None)
+    # 新出现的 feature（含 APK 升级带来的新内置、手动 push 的脚本）
+    # 自动并入自定义白名单；用户主动勾掉的既有项不受影响。
+    _sync_known_features()
     return feature_catalog()
 
 
@@ -578,6 +680,9 @@ def initialize(files_dir):
         if selected_device is None:
             selected_device = devices[0]
             config["selected_device_id"] = selected_device["id"]
+        # APK 升级带来的新内置 feature（或新 push 的脚本）对自定义白名单
+        # 目标默认可见；用户主动勾掉的既有项不会被加回。
+        _apply_known_features(config)
         save_config(config)
         _STATE["selected_device_id"] = selected_device["id"]
         _STATE["selected_topic"] = selected_device.get("request_topic", _DEFAULT_DEVICE["request_topic"])

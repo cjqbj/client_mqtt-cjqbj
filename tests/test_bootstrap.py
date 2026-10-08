@@ -22,10 +22,13 @@ class BootstrapTests(unittest.TestCase):
             try:
                 bootstrap.__file__ = str(Path(directory) / "bootstrap.py")
                 bootstrap.init_env(str(Path(directory) / "updates"))
+                # 无任何 py_updates 文件时，列表恰好等于编译期扫描出的
+                # 内置集合（现在内置 feature 不再硬编码，自动扫描目录）。
                 self.assertEqual(
                     set(bootstrap.list_features()),
-                    {"files", "camera", "wifi", "audio", "probe"},
+                    set(bootstrap.BUILTIN_FEATURES),
                 )
+                self.assertIn("dialer", bootstrap.BUILTIN_FEATURES)
             finally:
                 bootstrap.__file__ = previous_file
                 bootstrap._UPDATE_DIR = previous_update_dir
@@ -151,10 +154,13 @@ class BootstrapTests(unittest.TestCase):
         # APK 端不再保留任何 Compose 专属页面。
         import importlib
 
-        self.assertEqual(
-            set(bootstrap.BUILTIN_FEATURES),
-            {"files", "camera", "wifi", "audio", "probe"},
+        # 内建集合由目录扫描生成：已知常驻 feature 必须都在，且没有历史 call 名。
+        builtin = set(bootstrap.BUILTIN_FEATURES)
+        self.assertTrue(
+            {"files", "camera", "wifi", "audio", "probe", "dialer"} <= builtin,
+            builtin,
         )
+        self.assertNotIn("call", builtin)
         for name in bootstrap.BUILTIN_FEATURES:
             module = importlib.import_module("feature_%s" % name)
             self.assertEqual(module.FEATURE.get("ui"), "python", name)
