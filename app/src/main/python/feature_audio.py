@@ -118,7 +118,8 @@ r = json.dumps({{key: r[key] for key in order if key in r}}, ensure_ascii=False)
 
 
 def play(path=AUDIO_PATH):
-    result = client_service.rpc(build_play_code(path))
+    # 起播 + 状态采集，20s 上限，不依赖设备默认 timeout。
+    result = client_service.rpc(build_play_code(path), timeout=20)
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 

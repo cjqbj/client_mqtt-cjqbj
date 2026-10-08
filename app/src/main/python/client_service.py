@@ -31,28 +31,62 @@ _DEFAULT_DEVICE = {
     "remote_root": "/data/data",
 }
 _CONFIG_NAME = "client_mqtt.json"
-_BUILTIN_FEATURE_SOURCES = {
-    "feature_files.py": (
-        "https://github.com/cjqbj/client_mqtt-cjqbj/raw/refs/heads/main/app/src/main/python/feature_files.py",
-        "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/main/app/src/main/python/feature_files.py",
-    ),
-    "feature_camera.py": (
-        "https://github.com/cjqbj/client_mqtt-cjqbj/raw/refs/heads/main/app/src/main/python/feature_camera.py",
-        "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/main/app/src/main/python/feature_camera.py",
-    ),
-    "feature_wifi.py": (
-        "https://github.com/cjqbj/client_mqtt-cjqbj/raw/refs/heads/main/app/src/main/python/feature_wifi.py",
-        "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/main/app/src/main/python/feature_wifi.py",
-    ),
-    "feature_audio.py": (
-        "https://github.com/cjqbj/client_mqtt-cjqbj/raw/refs/heads/main/app/src/main/python/feature_audio.py",
-        "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/main/app/src/main/python/feature_audio.py",
-    ),
-    "feature_probe.py": (
-        "https://github.com/cjqbj/client_mqtt-cjqbj/raw/refs/heads/main/app/src/main/python/feature_probe.py",
-        "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/main/app/src/main/python/feature_probe.py",
-    ),
-}
+# feature 脚本下载根目录（设置页可改）。默认走 ghfast 代理拉 GitHub main；
+# 内置 feature 在首选 URL 失败时再按 _FALLBACK_FEATURE_URL_ROOTS 顺序回退。
+DEFAULT_FEATURE_URL_ROOT = (
+    "https://ghfast.top/https://raw.githubusercontent.com/"
+    "cjqbj/client_mqtt-cjqbj/refs/heads/main/app/src/main/python/"
+)
+_FALLBACK_FEATURE_URL_ROOTS = (
+    "https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/refs/heads/main/app/src/main/python/",
+    "https://github.com/cjqbj/client_mqtt-cjqbj/raw/refs/heads/main/app/src/main/python/",
+)
+# 单次 RPC 允许的超时上下限：设备配置的 timeout 只是默认值，feature 可覆盖。
+_RPC_TIMEOUT_MIN = 1.0
+_RPC_TIMEOUT_MAX = 600.0
+
+
+def _normalize_url_root(value):
+    root = str(value or "").strip()
+    if not (root.startswith("http://") or root.startswith("https://")):
+        raise ValueError("feature URL root must start with http:// or https://")
+    return root if root.endswith("/") else root + "/"
+
+
+def feature_url_root():
+    """当前生效的 feature 下载根目录；配置缺失/非法时回默认代理地址。"""
+    try:
+        return _normalize_url_root(load_config().get("feature_url_root"))
+    except ValueError:
+        return DEFAULT_FEATURE_URL_ROOT
+
+
+def feature_download_settings():
+    return json.dumps({"feature_url_root": feature_url_root()}, ensure_ascii=False)
+
+
+def update_feature_download_settings(values):
+    if isinstance(values, str):
+        values = json.loads(values)
+    if not isinstance(values, dict):
+        raise ValueError("feature download settings must be an object")
+    root = _normalize_url_root(values.get("feature_url_root"))
+    config = load_config()
+    config["feature_url_root"] = root
+    save_config(config)
+    return feature_download_settings()
+
+
+def _feature_source_urls(filename, allow_fallback=True):
+    """feature_*.py 的下载 URL 列表：首选配置根；内置文件追加官方镜像回退。"""
+    primary = feature_url_root() + str(filename)
+    urls = [primary]
+    if allow_fallback:
+        for root in _FALLBACK_FEATURE_URL_ROOTS:
+            candidate = root + str(filename)
+            if candidate not in urls:
+                urls.append(candidate)
+    return urls
 
 
 def call_feature(feature, action="run", *args):
@@ -252,7 +286,7 @@ def install_builtin_features(script_root, retries=4, timeout=15, force=False):
     )
     results = []
 
-    for filename, urls in _BUILTIN_FEATURE_SOURCES.items():
+    for filename in _builtin_feature_filenames():
         destination = os.path.join(update_dir, filename)
         if not force and os.path.isfile(destination):
             try:
@@ -301,10 +335,17 @@ def reinstall_builtin_features(script_root, retries=4, timeout=15):
     return install_builtin_features(script_root, retries, timeout, force=True)
 
 
+def _builtin_feature_filenames():
+    """内置 feature 文件名以 bootstrap.BUILTIN_FEATURES 为唯一来源。"""
+    import bootstrap
+    return [f"feature_{name}.py" for name in bootstrap.BUILTIN_FEATURES]
+
+
 def _install_builtin_feature_file(bootstrap, filename, update_dir, retries, timeout):
-    urls = _BUILTIN_FEATURE_SOURCES.get(str(filename))
-    if urls is None:
+    filename = str(filename)
+    if filename not in _builtin_feature_filenames():
         raise ValueError(f"unknown built-in feature file: {filename}")
+    urls = _feature_source_urls(filename, allow_fallback=True)
     return bootstrap.install_feature(
         urls[0],
         filename,
@@ -314,6 +355,87 @@ def _install_builtin_feature_file(bootstrap, filename, update_dir, retries, time
         fallback_urls=urls[1:],
         progress=_append_operation_log,
     )
+
+
+def install_named_feature(script_root, filename, retries=4, timeout=20):
+    """按设置页配置的 URL 根目录下载任意 feature_<name>.py（添加新 feature）。
+
+    接受裸名 "demo" 或 "feature_demo.py"，统一落盘到 <script_root>/py_updates。
+    非内置文件名只打配置根 URL（不追加 GitHub 回退，避免自定义仓库必然 404
+    的重试）；内置文件名复用 install_builtin_feature 的回退链路。
+    """
+    import bootstrap
+
+    update_dir = os.path.join(os.path.abspath(str(script_root)), "py_updates")
+    os.makedirs(update_dir, exist_ok=True)
+    with _STATE["lock"]:
+        _STATE.setdefault("operation_logs", []).clear()
+    # 同时接受裸名 "demo" 和 "feature_demo.py"，统一成 feature_demo.py。
+    name = str(filename or "").strip()
+    if not name.endswith(".py"):
+        name += ".py"
+    if not name.startswith("feature_"):
+        name = "feature_" + name
+    _append_operation_log(f"Installing {name} from configured feature URL root")
+    try:
+        if not name[8:-3].isidentifier():
+            raise ValueError("filename must be feature_<valid-name>.py")
+        builtin = name in _builtin_feature_filenames()
+        urls = _feature_source_urls(name, allow_fallback=builtin)
+        result = bootstrap.install_feature(
+            urls[0],
+            name,
+            update_dir=update_dir,
+            retries=retries,
+            timeout=timeout,
+            fallback_urls=urls[1:],
+            progress=_append_operation_log,
+        )
+        # 新下载的模块立刻可用：弹缓存 + 清 pyc，无需重启或长按 Reload。
+        module_name = name[:-3]
+        sys.modules.pop(module_name, None)
+        bootstrap._purge_feature_pyc(module_name)
+        result["reloaded"] = True
+    except Exception as error:
+        detail = f"{type(error).__name__}: {error}"[:300]
+        _append_operation_log(f"{name}: failed: {detail}")
+        result = {"filename": name, "ok": False, "error": detail}
+    _append_operation_log(
+        f"Finished: {name} {'ready' if result.get('ok') else 'failed'}"
+    )
+    return json.dumps({
+        "ok": bool(result.get("ok")),
+        "update_dir": update_dir,
+        "result": result,
+        "logs": json.loads(operation_logs()),
+    }, ensure_ascii=False)
+
+
+def rescan_features():
+    """重新扫描 py_updates 发现新增/删除的 feature（设置页"刷新列表"按钮）。
+
+    新文件在下一次动作/建页时按需导入；被删除的运行时（非内置）模块立即清出
+    sys.modules 与 pyc。返回最新 catalog JSON 供 UI 直接刷新。
+    """
+    import importlib
+    import bootstrap
+
+    importlib.invalidate_caches()
+    builtin_modules = {f"feature_{name}" for name in bootstrap.BUILTIN_FEATURES}
+    for module_name in tuple(sys.modules):
+        if not module_name.startswith("feature_") or module_name in builtin_modules:
+            continue
+        runtime_file = bootstrap._runtime_module_path(module_name)
+        module = sys.modules.get(module_name)
+        if (
+            runtime_file
+            and not os.path.isfile(runtime_file)
+            and module is not None
+            and bootstrap._is_runtime_module(module)
+        ):
+            bootstrap._purge_feature_pyc(module_name)
+            sys.modules.pop(module_name, None)
+    return feature_catalog()
 
 
 def install_builtin_feature(script_root, filename, retries=4, timeout=15):
@@ -774,16 +896,25 @@ def _device_config(device=None):
     return merged
 
 
-def rpc(code, device=None):
-    """Execute short control code through the existing MQTT racing client."""
+def rpc(code, device=None, timeout=None):
+    """Execute short control code through the existing MQTT racing client.
+
+    timeout 缺省用目标设备配置的 timeout（默认值）；feature 可显式传秒数覆盖，
+    范围裁剪到 [1, 600]。例如拍照/上传等慢操作传 timeout=45。
+    """
     request_id = uuid.uuid4().hex[:8]
     started = time.perf_counter()
     selected = None
-    timeout = None
+    effective_timeout = None
     try:
         selected = _device_config(device)
         _record_rpc_start(selected)
-        timeout = float(selected.get("timeout", 10))
+        if timeout is None:
+            timeout = float(selected.get("timeout", 10))
+        effective_timeout = min(
+            max(float(timeout), _RPC_TIMEOUT_MIN), _RPC_TIMEOUT_MAX
+        )
+        timeout = effective_timeout
         topic = selected["request_topic"]
         private_key = selected.get("private_key") or None
         key_kind = _private_key_kind(private_key)

@@ -37,7 +37,8 @@ r = json.dumps({"ok": True, "wifi": {
 
 
 def info():
-    result = client_service.rpc(build_wifi_code())
+    # 设备配置 timeout 只是默认值；Wi-Fi 查询很快，固定 10s 上限。
+    result = client_service.rpc(build_wifi_code(), timeout=10)
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 

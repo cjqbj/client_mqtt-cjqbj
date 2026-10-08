@@ -69,6 +69,7 @@ import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -607,7 +608,12 @@ private fun ClientMqttScreen() {
                         SettingsPage(
                             modifier = Modifier.padding(padding),
                             onBack = { settings = false },
-                            onPermissions = { permissions = true }
+                            onPermissions = { permissions = true },
+                            // 设置页"刷新列表"/下载完成后立刻重扫 catalog，
+                            // 不必等外层 3s 轮询，新增 feature 当场出现在底栏。
+                            onRefreshFeatureList = {
+                                scope.launch { runCatching { refreshFeatures() } }
+                            }
                         )
                     }
                 }
@@ -922,7 +928,8 @@ private fun TargetSettingsPage(
 private fun SettingsPage(
     modifier: Modifier = Modifier,
     onBack: () -> Unit,
-    onPermissions: () -> Unit
+    onPermissions: () -> Unit,
+    onRefreshFeatureList: () -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var useExternal by remember {
@@ -943,6 +950,13 @@ private fun SettingsPage(
     var downloading by remember { mutableStateOf(false) }
     var scriptRevision by remember { mutableStateOf(0) }
     var builtinFeatureFiles by remember { mutableStateOf(listOf<String>()) }
+    // feature 下载根 URL：Python 端有默认值（ghfast 代理 GitHub main），
+    // 加载完成前输入框显示占位，绝不能把空串回写覆盖默认配置。
+    var featureUrlRoot by remember { mutableStateOf("") }
+    var featureUrlLoaded by remember { mutableStateOf(false) }
+    var featureUrlLastEdit by remember { mutableStateOf(0L) }
+    var featureUrlStatus by remember { mutableStateOf("") }
+    var newFeatureName by remember { mutableStateOf("") }
     val externalAllowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
     val scriptRoot = if (useExternal && externalAllowed) "/sdcard/apm/client_mqtt" else "${context.filesDir}/client_mqtt"
     val featureDirectory = File(scriptRoot, "py_updates")
@@ -1074,6 +1088,39 @@ private fun SettingsPage(
         }.onFailure { probeSettingsStatus = "Probe settings save failed: ${it.message}" }
     }
 
+    // feature 下载根 URL：1s 轮询回填（停顿 1.2s 后），编辑 300ms 防抖后保存。
+    LaunchedEffect(Unit) {
+        while (true) {
+            runCatching {
+                val config = withContext(Dispatchers.IO) {
+                    JSONObject(service.callAttr("feature_download_settings").toString())
+                }
+                if (System.currentTimeMillis() - featureUrlLastEdit >= 1_200L) {
+                    val incoming = config.optString("feature_url_root")
+                    if (incoming.isNotBlank() && incoming != featureUrlRoot) {
+                        featureUrlRoot = incoming
+                    }
+                    featureUrlLoaded = true
+                }
+            }.onFailure { featureUrlStatus = "Unable to load feature URL root: ${it.message}" }
+            delay(1_000)
+        }
+    }
+
+    LaunchedEffect(featureUrlRoot, featureUrlLoaded) {
+        if (!featureUrlLoaded || featureUrlRoot.isBlank()) return@LaunchedEffect
+        delay(300)
+        runCatching {
+            withContext(Dispatchers.IO) {
+                service.callAttr(
+                    "update_feature_download_settings",
+                    JSONObject().put("feature_url_root", featureUrlRoot).toString()
+                )
+            }
+            featureUrlStatus = "Feature URL root saved"
+        }.onFailure { featureUrlStatus = "Feature URL root invalid: ${it.message}" }
+    }
+
     Column(
         modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -1147,14 +1194,59 @@ private fun SettingsPage(
         if (useExternal && externalAllowed) {
             HorizontalDivider()
             Text("External feature scripts", style = MaterialTheme.typography.titleMedium)
-            Text(
-                when {
-                    builtinFeatureFiles.isEmpty() -> "Checking built-in feature files..."
-                    missingFeatures.isEmpty() -> "All ${builtinFeatureFiles.size} built-in feature files are present"
-                    else -> "${missingFeatures.size} of ${builtinFeatureFiles.size} feature files are missing: ${missingFeatures.joinToString()}"
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        when {
+                            builtinFeatureFiles.isEmpty() -> "Checking built-in feature files..."
+                            missingFeatures.isEmpty() -> "All ${builtinFeatureFiles.size} built-in feature files are present"
+                            else -> "${missingFeatures.size} of ${builtinFeatureFiles.size} feature files are missing: ${missingFeatures.joinToString()}"
+                        },
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        "Put feature_*.py into py_updates manually, then tap refresh to discover it.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                OutlinedButton(
+                    enabled = !downloading,
+                    onClick = {
+                        // 立即让 Python 重扫 py_updates，然后刷新外层底栏列表。
+                        scope.launch {
+                            runCatching {
+                                withContext(Dispatchers.IO) { service.callAttr("rescan_features") }
+                            }
+                            scriptRevision++
+                            onRefreshFeatureList()
+                        }
+                    }
+                ) {
+                    Icon(Icons.Outlined.Refresh, contentDescription = null)
+                    Text("Refresh feature list")
+                }
+            }
+            OutlinedTextField(
+                value = featureUrlRoot,
+                onValueChange = {
+                    featureUrlRoot = it
+                    featureUrlLastEdit = System.currentTimeMillis()
                 },
-                style = MaterialTheme.typography.bodySmall
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("Feature download URL root") },
+                placeholder = {
+                    Text("https://host/path/app/src/main/python/")
+                },
+                supportingText = {
+                    Text("New and built-in feature_*.py files are fetched from <root>feature_<name>.py; built-ins then fall back to GitHub.")
+                }
             )
+            Text(featureUrlStatus, style = MaterialTheme.typography.bodySmall)
             // force=false 只补缺失；force=true 无条件重下全部并清模块/pyc 缓存，
             // 下一次 call_feature 立刻用新脚本，无需重启。
             fun startBuiltinDownload(force: Boolean) {
@@ -1183,6 +1275,7 @@ private fun SettingsPage(
                         runCatching { refreshDownloadLogs() }
                         downloading = false
                         scriptRevision++
+                        onRefreshFeatureList()
                     }
                 }
             }
@@ -1242,12 +1335,64 @@ private fun SettingsPage(
                                     runCatching { refreshDownloadLogs() }
                                     downloading = false
                                     scriptRevision++
+                                    onRefreshFeatureList()
                                 }
                             }
                         }
                     ) {
                         Text(if (installed) "Download again" else "Download")
                     }
+                }
+            }
+            // 添加新 feature：输入裸名（demo -> feature_demo.py），从配置的 URL
+            // 根下载到 py_updates，完成即刷新列表。文件名只允许标识符字符。
+            Text("Add a feature from the URL root", style = MaterialTheme.typography.labelLarge)
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = newFeatureName,
+                    onValueChange = {
+                        newFeatureName = it.trim().removePrefix("feature_").removeSuffix(".py")
+                            .filter { ch -> ch.isLetterOrDigit() || ch == '_' }
+                    },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                    label = { Text("feature_<name>.py") },
+                    placeholder = { Text("name") }
+                )
+                Button(
+                    enabled = !downloading && newFeatureName.isNotBlank(),
+                    onClick = {
+                        val name = newFeatureName.trim()
+                        downloading = true
+                        downloadStatus = "Downloading feature_$name.py..."
+                        downloadLogs = emptyList()
+                        scope.launch {
+                            try {
+                                val response = withContext(Dispatchers.IO) {
+                                    service.callAttr("install_named_feature", scriptRoot, name, 4, 20).toString()
+                                }
+                                val result = JSONObject(response)
+                                downloadStatus = if (result.optBoolean("ok")) {
+                                    "feature_$name.py downloaded and ready."
+                                } else {
+                                    "feature_$name.py download failed. Check the download log."
+                                }
+                            } catch (error: Exception) {
+                                downloadStatus = "feature_$name.py download failed: ${error.message}"
+                            } finally {
+                                runCatching { refreshDownloadLogs() }
+                                downloading = false
+                                scriptRevision++
+                                onRefreshFeatureList()
+                            }
+                        }
+                    }
+                ) {
+                    Text(if (downloading) "Adding..." else "Add feature")
                 }
             }
             if (downloadStatus.isNotBlank()) Text(downloadStatus, style = MaterialTheme.typography.bodySmall)

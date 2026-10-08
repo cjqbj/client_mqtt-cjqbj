@@ -69,7 +69,8 @@ finally:
 
 
 def capture(facing=0):
-    result = client_service.rpc(build_photo_code(int(facing)))
+    # 拍照 + JPEG 经 OpenAPI 上传约 5~30s，固定 45s 超时（设备默认值可能更短）。
+    result = client_service.rpc(build_photo_code(int(facing)), timeout=45)
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 

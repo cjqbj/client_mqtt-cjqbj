@@ -1,100 +1,95 @@
-# Feature Script Development
+# Feature 开发约定（给人和 AI）
 
-## File location
+## 1. 文件与命名
 
-A feature is a Python file named `feature_<name>.py`.
+- 一个 feature = 一个 `feature_<name>.py`，`<name>` 必须是合法标识符。
+- 内置：`app/src/main/python/feature_<name>.py`，名字注册进 [bootstrap.py](app/src/main/python/bootstrap.py) 的 `BUILTIN_FEATURES`。
+- 运行时：`<script-root>/py_updates/feature_<name>.py`，同名遮蔽内置。script-root 默认应用内存储；授权并开启外置后为 `/sdcard/apm/client_mqtt/`。
+- 下载有原子写、compile 校验、2MB 上限；只接受 `feature_*.py`。
+- **残留的旧 py_updates 文件会遮蔽内置新代码**，排查"代码没生效"先查这里（含 `__pycache__`）。
 
-- Bundled feature: `app/src/main/python/feature_<name>.py`
-- Runtime feature: `<script-root>/py_updates/feature_<name>.py`
-- Runtime feature files override bundled files with the same name.
-- The selected script root is internal app storage by default, or `/sdcard/apm/client_mqtt/` after the user authorizes external storage and enables it in Settings.
-
-## Required manifest
+## 2. FEATURE 清单（模块顶层）
 
 ```python
 FEATURE = {
-    "name": "demo",
-    "title": "Demo",
+    "name": "demo",          # 必填，与文件名一致
+    "title": "Demo",         # 底栏/侧栏显示名，缺省用 name
     "version": 1,
-    "actions": ["run"],
-    "icon": "terminal",  # optional
+    "actions": ["run"],      # ui=compose 时生成动作按钮；ui=python 可留空
+    "icon": "terminal",      # 可选
+    "ui": "python",          # 缺省 "compose"
 }
 ```
 
-The `title` appears in the script drawer, the bottom navigation bar, and the feature page. If omitted, the filename name is used. `actions` controls the buttons shown on the generic page. Optional `icon` selects the navigation icon (`folder`/`files`, `camera`/`photo`, `wifi`/`network`, `terminal`/`shell`, `bug`/`debug`, `info`, `settings`); unknown values fall back to a generic extension icon.
+## 3. 两种 UI 模式
 
-## Action API
-
-Each action is a top-level function with positional arguments:
+**compose（默认）**：顶层函数即动作，参数只接受位置参数，返回 JSON 字符串：
 
 ```python
-import json
-
+import json, client_service
 
 def run():
-    return json.dumps({"ok": True, "message": "hello"}, ensure_ascii=False)
+    return json.dumps({"ok": True}, ensure_ascii=False)
 ```
 
-The main app calls the stable Python bridge:
+**python（自绘）**：必须实现 `build_view(context)`，在主线程同步返回一个 Android `View`。网络/RPC 一律用 `pyui_kit.run_async(...)`，禁止阻塞主线程。参考 feature_wifi / feature_camera / feature_files。
 
-```text
-client_service.call_feature(feature_name, action_name, *args)
-```
+## 4. pyui_kit 铁律（违反必崩）
 
-A feature must not import Compose or Android Activity classes. It owns its domain-specific code generator and action, uses the generic `client_service.rpc(code)` bridge, and returns JSON for the UI. Long files and images use the target-side Aliyun flow and return short metadata; never return large bytes through MQTT.
+Chaquopy 对同一个 Java 接口，全进程只能建**一个** `dynamic_proxy` 代理类；重复建类第二次调用必崩 `_chaquopyGetType is abstract`。
 
-`client_service.call_feature` converts feature Python exceptions, including `SystemExit`, into JSON with `ok`, `feature`, `action`, and `error`. A broken downloadable Python feature therefore reports an action failure instead of propagating the Python exception into the Android Activity. This cannot catch native/JVM process crashes or forced process termination.
+- 回调**只许**用 pyui_kit 现成封装：`pyui_kit.click(view, fn)`、`pyui_kit.run_async(...)`、`pyui_kit.watch_target(anchor, on_change)`、`pyui_kit._post(fn)`。
+- **禁止**在 feature 里自己 `dynamic_proxy(View.OnClickListener)` 之类重复建类；同类回调多实例共享单例类。
+- 组件只用：`Page`、`make_text/make_button/make_edit/make_hrow`、`copy_text`、`render_result/pretty`。
+- 跨实例状态（相机回调对象等）挂 `sys` 全局缓存，仿 feature_camera 的 `sys._qgb_photo_cb_cls`。
 
-## Shared services
+## 5. import 规则
 
-- `client_service.rpc(code, device=None)` sends short target control code through the selected target's request topic, or an explicitly supplied device.
-- `client_service.device_catalog()`, `device_settings(topic)`, `select_device(topic)`, and `update_device_settings(topic, values)` manage per-topic target configuration.
-- `client_service.aliyun_settings()` and `update_aliyun_settings(values)` read and write the single shared Aliyun configuration.
-- `client_service.install_builtin_features(script_root, retries, timeout)` installs the built-in feature scripts (filenames from `bootstrap.BUILTIN_FEATURES`) into the selected root's `py_updates/` directory.
-- `client_service.install_builtin_feature(script_root, filename, retries, timeout)` downloads or refreshes one selected built-in feature script; the Settings page exposes this per-file alongside the download-missing action.
-- `client_service.builtin_feature_files()` returns the built-in `feature_*.py` filenames; the settings page derives its missing-files list from it instead of hardcoding names.
-- `client_service.reload_feature(name)` force-reloads one cached feature module (long-press menu); returns the refreshed descriptor or structured JSON error.
-- `client_service.operation_logs()` returns the rolling downloader log for UI display.
-- `client_service.rpc_logs()` and `clear_rpc_logs()` expose and clear the redacted RPC diagnostic ring buffer.
-- `client_service.standardize_private_key(value)` normalizes key expressions and PEM/OpenSSH inputs through upstream `get_standard_pem_bytes`.
-- `client_service.general_settings()` and `update_general_settings(values)` manage the app-wide online probe toggle and interval.
-- `client_service.target_health(device_ref)` returns per-target last RPC/probe state and in-flight count.
-- `client_service.selected_feature(device_ref=None)` and `select_feature(name, device_ref=None)` read/persist the last visible feature tab per target (plain feature name, `""` when unset).
-- `client_service.feature_settings(name, device_ref=None)` and `update_feature_settings(name, values, device_ref=None)` read and shallow-merge an opaque per-target JSON settings object owned by the feature.
-- Successful feature results retain transport fields such as request ID, server time, responding brokers, latency, and elapsed time in `_rpc`; Compose can display or copy them.
-- `feature_files.scan(...)` generates and sends bounded target scanning code.
-- `feature_files.upload(path)` generates and sends target-side Aliyun upload code.
-- `feature_wifi.info()` builds the Wi-Fi query code in `feature_wifi.py` and sends it through the generic RPC bridge.
-- `feature_camera.capture(facing)` builds capture code in `feature_camera.py`; Compose downloads and displays the returned photo URL.
-- `feature_audio.play(path)` builds playback code in `feature_audio.py` and starts target-side playback through `MediaPlayer`.
-- `client_service.download_transfer(url, config, save_to)` downloads outside MQTT.
-- `client_service.update_settings(...)` persists app-level configuration beside the active script root; use `update_device_settings(...)` for target-specific values.
+- `android.*`、`java.*` 及任何 Chaquopy/JVM 相关 import **只许写在函数体内**，禁止模块顶层 import（桌面单测与非安卓环境要能 import 模块）。
+- 顶层只 import `json`、`client_service`、标准库。
+- 禁改 `app/src/main/python/multi_mqtt/`；feature 不直接依赖另一个 feature 的代码生成器。
 
-Each target record has a stable `id` and its own `request_topic`, `remote_root`, private key, timeout, and server-signature fallback option. Aliyun JSON is global and stored once at the root of `client_mqtt.json`, not in target records. Both forms automatically write edits after a short debounce and poll the file once per second for external changes. Invalid in-progress Aliyun JSON is retained as a draft while the last valid object remains active. Before executing feature code, the RPC bridge initializes the target-side Aliyun configuration from the global setting. Private-key strings are passed unchanged to `multi_mqtt.get_standard_pem_bytes`; it supports integer expressions, including the configured value `233`, and key-file/PEM inputs.
-
-Each feature should be independently callable through `client_service.call_feature` and must not rely on another feature's code generator. Keep Android pages limited to presentation and dispatch; do not duplicate Wi-Fi, scan, upload, or camera RPC code in the Activity or generic service. The settings page downloads missing scripts through Python with per-request timeouts, alternating GitHub URLs, up to four attempts, and progress messages shown in the download log.
-
-## Per-target memory
-
-The app shell automatically persists two kinds of per-target UI state in `client_mqtt.json`, keyed by the target's stable `id` (topic renames do not lose it):
-
-- `selected_feature`: the last visible feature tab of each target. The shell writes it on every page switch and restores it once per target on cold start or target switch — feature authors get tab memory for free, nothing to implement.
-- `feature_settings`: an opaque JSON object per `(target, feature)` for settings the feature owns. Compose pages read it on launch and write back on user edits; Python feature code running under the currently selected target can read the same object with `client_service.feature_settings(name)` (`device_ref=None` selects the current target).
-
-Feature authors must not read or write `client_mqtt.json` themselves; call the two helpers above. Values are shallow-merged, so store flat preference keys (example: the camera feature stores `{"lens_facing": 0}` for the back/front choice, rendered as two explicit choice chips in its page). Do not store secrets or large blobs in feature settings.
-
-## Runtime installation
-
-A downloaded module is installed atomically and optionally verified:
+## 6. RPC 与超时
 
 ```python
-client_service.install_feature(url, "feature_demo.py", sha256)
+client_service.rpc(code, device=None, timeout=None)
 ```
 
-Only `feature_*.py` filenames are accepted. The module is discovered on the next catalog refresh (three seconds) and imported on its next action call. Loaded feature modules stay cached: rewriting a `py_updates/feature_*.py` does not take effect until the user long-presses the feature (drawer entry or bottom navigation icon) and confirms the reload dialog, which calls `client_service.reload_feature(name)` (pop `sys.modules`, purge pyc, re-import). The only automatic reload is the one-time takeover when a `py_updates` file newly shadows an already imported built-in module. Do not execute untrusted scripts without verifying the SHA-256 digest and transport authentication.
+- `timeout=None`：用目标设备配置的 timeout（默认 10s），**它只是默认值**。
+- feature 按操作显式传秒数覆盖，范围裁剪到 [1, 600]：如 wifi=10、scan=20、拍照=45、上传=120。新照此约定。
+- 需要更底层控制（如 probe 的 2s 自定义）可直调 `client_service._mqtt_client_module().rpc(...)`，自带 `request_topic/timeout/client_private_key_bytes` 参数。
+- 大数据走目标端 Aliyun 上传/下载，MQTT 只传短元数据，禁止传大字节。
+- 返回给 UI 必须是 JSON 字符串（`json.dumps(..., ensure_ascii=False)`），不能返回 dict（执行器会 repr 成单引号）。
+- 未捕获异常（含 SystemExit）由 `call_feature` 转成 `{ok:false, error}` JSON，崩不了 Activity；但 native 崩溃兜不住。
 
-## UI communication
+## 7. 下载分发与 URL 根
 
-The UI never imports feature modules directly. It polls `client_service.feature_catalog()`, creates one bottom-navigation entry and pager page per descriptor (both rendered from the same state), and invokes actions through `client_service.call_feature`. This keeps the Android APK stable while allowing feature scripts to evolve independently.
+- 设置页可配置 feature 下载根目录，持久化在 `client_mqtt.json` 的 `feature_url_root`。
+- 默认根（ghfast 代理 GitHub main，国内直连慢才加的代理）：
 
-Successful MQTT envelopes are preserved under the feature result's `_rpc` key with request ID, server time, broker names, latency, and elapsed time. Raw target output is preserved verbatim under `_stdout` and `_stderr` when present, and raw envelope errors under `_remote_error`; the UI renders these strings as-is (monospace, selectable) instead of reformatting them in Kotlin. The RPC diagnostics page shows and copies the full submitted code, the response envelope/raw `r`, dedicated raw stdout/stderr/error sections, after redacting configured key and Aliyun values. Use this metadata and the diagnostics page to inspect target traceback/error details and transport behavior. The periodic online probe is shared-configurable and is deferred after any successful RPC for that target.
+```text
+https://ghfast.top/https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/refs/heads/main/app/src/main/python/
+```
+
+- 下载 URL = `<root>feature_<name>.py`（根自动补尾斜杠，只接受 http/https）。
+- 内置 feature 首选失败再回退 raw.githubusercontent.com → github.com；**自定义新 feature 不做 GitHub 回退**（必然 404，无意义重试）。
+- Python API：
+  - `feature_download_settings()` / `update_feature_download_settings({"feature_url_root": ...})`
+  - `install_named_feature(script_root, "demo", retries=4, timeout=20)`：接受裸名或全名，下到 py_updates 并立刻弹模块缓存+清 pyc。
+  - `install_builtin_features(script_root, 4, 15)`（补缺失）/ `reinstall_builtin_features(...)`（force 全重下）/ `install_builtin_feature(script_root, filename, 4, 15)`。
+- **发现机制**：catalog 合并 `BUILTIN_FEATURES` + 扫描两个目录，每 3 秒自动轮询；设置页"Refresh feature list"调 `rescan_features()` 立即重扫。手动放进 py_updates 的文件刷新后即出现，下次动作按需 import；删除文件重扫后运行时模块清出 sys.modules。
+- 已加载模块常驻缓存：线上改文件后让用户长按 feature → reload（`reload_feature(name)`）；唯一自动重载是 py_updates 文件首次遮蔽内置模块。
+
+## 8. 每目标持久化（不要自己读写 client_mqtt.json）
+
+- `client_service.feature_settings(name)` / `update_feature_settings(name, values)`：按当前选中目标存 feature 自己的扁平 JSON（浅合并，别放秘钥/大 blob）。
+- 当前选中目标 tab 由外壳自动记忆（`selected_feature`），feature 不用管。
+- 当前目标配置：`client_service.selected_config()`（pyui_kit 内同名便捷封装）。
+
+## 9. 自检
+
+- 新 feature 至少能被桌面 import 并走通 `bootstrap.describe_features()`；测试放仓库 `tests/`，本地：
+
+```powershell
+$env:PYTHONPATH="."; python -m unittest discover -s tests   # cwd=app/src/main/python
+```

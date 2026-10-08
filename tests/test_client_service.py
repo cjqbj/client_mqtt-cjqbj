@@ -794,6 +794,184 @@ class ClientServiceTests(unittest.TestCase):
                 client_service._STATE.clear()
                 client_service._STATE.update(previous_state)
 
+    def test_feature_download_settings_default_persist_normalize_and_reject(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                # 缺省即 ghfast 代理 GitHub main 根目录，结尾必须带 /。
+                settings = json.loads(client_service.feature_download_settings())
+                self.assertEqual(
+                    settings["feature_url_root"],
+                    client_service.DEFAULT_FEATURE_URL_ROOT,
+                )
+                self.assertTrue(settings["feature_url_root"].endswith("/"))
+
+                # 自定义根：自动补尾斜杠并持久化。
+                saved = json.loads(
+                    client_service.update_feature_download_settings(
+                        {"feature_url_root": "https://example.com/repo/python"}
+                    )
+                )
+                self.assertEqual(
+                    saved["feature_url_root"], "https://example.com/repo/python/"
+                )
+                self.assertEqual(
+                    json.loads(client_service.feature_download_settings())["feature_url_root"],
+                    "https://example.com/repo/python/",
+                )
+                with self.assertRaises(ValueError):
+                    client_service.update_feature_download_settings(
+                        {"feature_url_root": "not-a-url"}
+                    )
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_feature_source_urls_use_configured_root_and_builtin_fallback(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                client_service.update_feature_download_settings(
+                    {"feature_url_root": "https://mirror.test/py/"}
+                )
+                # 内置文件：配置根首选，追加官方镜像回退，列表无重复。
+                urls = client_service._feature_source_urls("feature_wifi.py")
+                self.assertEqual(urls[0], "https://mirror.test/py/feature_wifi.py")
+                self.assertTrue(any(
+                    item.startswith("https://raw.githubusercontent.com/") for item in urls
+                ))
+                self.assertEqual(len(set(urls)), len(urls))
+
+                # 非内置自定义 feature：只有配置根，不做必然 404 的 GitHub 回退。
+                custom = client_service._feature_source_urls(
+                    "feature_mytool.py", allow_fallback=False
+                )
+                self.assertEqual(custom, ["https://mirror.test/py/feature_mytool.py"])
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_rpc_timeout_override_beats_device_default_and_clamps(self):
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                client_service.initialize(files_dir)
+                client_service.update_device_settings("sys/device/request", {
+                    "request_topic": "sys/device/to",
+                    "private_key": "233",
+                    "timeout": 5,
+                })
+                mqtt_module = mock.Mock()
+                mqtt_module.get_standard_pem_bytes.return_value = b"-----BEGIN EC PRIVATE KEY-----"
+                mqtt_module.rpc.return_value = {"ok": True, "r": "{}"}
+                with mock.patch.object(client_service, "_mqtt_client_module", return_value=mqtt_module):
+                    client_service.rpc("r={}")
+                    self.assertEqual(mqtt_module.rpc.call_args.kwargs["timeout"], 5)
+                    # feature 显式传秒数覆盖设备默认值。
+                    client_service.rpc("r={}", timeout=45)
+                    self.assertEqual(mqtt_module.rpc.call_args.kwargs["timeout"], 45)
+                    # 裁剪到 [1, 600]。
+                    client_service.rpc("r={}", timeout=0)
+                    self.assertEqual(mqtt_module.rpc.call_args.kwargs["timeout"], 1.0)
+                    client_service.rpc("r={}", timeout=9999)
+                    self.assertEqual(mqtt_module.rpc.call_args.kwargs["timeout"], 600.0)
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_install_named_feature_uses_configured_root_without_github_fallback(self):
+        previous_state = client_service._STATE.copy()
+        previous_wifi = sys.modules.get("feature_wifi")
+        with tempfile.TemporaryDirectory() as files_dir, \
+                tempfile.TemporaryDirectory() as script_root:
+            try:
+                import bootstrap
+
+                client_service.initialize(files_dir)
+                client_service.update_feature_download_settings(
+                    {"feature_url_root": "https://mirror.test/py/"}
+                )
+                calls = []
+
+                def install(url, filename, update_dir, progress, **kwargs):
+                    calls.append((url, filename, list(kwargs.get("fallback_urls") or [])))
+                    Path(update_dir, filename).write_text(
+                        "FEATURE = {'name': 'mytool'}\ndef run():\n    return 'ok'\n",
+                        encoding="utf-8",
+                    )
+                    return {"filename": filename, "ok": True}
+
+                with mock.patch.object(bootstrap, "install_feature", side_effect=install) as download, \
+                        mock.patch.object(bootstrap, "_purge_feature_pyc") as purge:
+                    # 裸名自动补 feature_ 前缀/.py 后缀；非内置只打配置根，无回退。
+                    result = json.loads(
+                        client_service.install_named_feature(script_root, "mytool")
+                    )
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(download.call_count, 1)
+                    self.assertEqual(calls[0][0], "https://mirror.test/py/feature_mytool.py")
+                    self.assertEqual(calls[0][2], [])
+                    self.assertTrue(result["result"].get("reloaded"))
+                    purge.assert_called_with("feature_mytool")
+                    self.assertEqual(
+                        result["update_dir"], str(Path(script_root, "py_updates"))
+                    )
+
+                    # 非法名返回 ok=false，不触发下载。
+                    bad = json.loads(
+                        client_service.install_named_feature(script_root, "bad-name!")
+                    )
+                    self.assertFalse(bad["ok"])
+                    self.assertEqual(download.call_count, 1)
+
+                    # 内置名允许走官方镜像回退。
+                    client_service.install_named_feature(script_root, "wifi")
+                    self.assertEqual(calls[-1][0], "https://mirror.test/py/feature_wifi.py")
+                    self.assertTrue(calls[-1][2])
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+                sys.modules.pop("feature_mytool", None)
+                if previous_wifi is not None:
+                    sys.modules["feature_wifi"] = previous_wifi
+
+    def test_rescan_features_discovers_new_file_and_drops_deleted_runtime(self):
+        import bootstrap
+
+        previous_update_dir = bootstrap._UPDATE_DIR
+        previous_path = list(sys.path)
+        previous_module = sys.modules.get("feature_newscan")
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                bootstrap.init_env(directory)
+                feature_file = Path(directory, "feature_newscan.py")
+                feature_file.write_text(
+                    "FEATURE = {'name': 'newscan', 'title': 'New', 'actions': ['run']}\n"
+                    "def run():\n    return 'scan-ok'\n",
+                    encoding="utf-8",
+                )
+                catalog = json.loads(client_service.rescan_features())
+                self.assertIn("newscan", {item["name"] for item in catalog})
+                # 新文件按需导入立即可用。
+                self.assertEqual(client_service.call_feature("newscan"), "scan-ok")
+                self.assertIn("feature_newscan", sys.modules)
+
+                # 删除运行时文件后重扫：该模块清出缓存；内置 feature 始终保留。
+                feature_file.unlink()
+                catalog_after = json.loads(client_service.rescan_features())
+                names_after = {item["name"] for item in catalog_after}
+                self.assertNotIn("newscan", names_after)
+                self.assertNotIn("feature_newscan", sys.modules)
+                self.assertIn("wifi", names_after)
+            finally:
+                bootstrap._UPDATE_DIR = previous_update_dir
+                sys.path[:] = previous_path
+                sys.modules.pop("feature_newscan", None)
+                if previous_module is not None:
+                    sys.modules["feature_newscan"] = previous_module
+
 
 if __name__ == "__main__":
     unittest.main()

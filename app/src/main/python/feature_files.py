@@ -77,12 +77,14 @@ except Exception as exc:
 
 
 def scan(root, offset=0, limit=100):
-    result = client_service.rpc(build_scan_code(root, offset, limit))
+    # 目录遍历按 limit 有界，20s 足够；显式超时，不吃设备默认值。
+    result = client_service.rpc(build_scan_code(root, offset, limit), timeout=20)
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 
 def upload(remote_path):
-    result = client_service.rpc(build_upload_code(remote_path))
+    # 上传走目标端 OpenAPI，大文件慢，给 120s；设备默认 timeout 不应掐断它。
+    result = client_service.rpc(build_upload_code(remote_path), timeout=120)
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 
