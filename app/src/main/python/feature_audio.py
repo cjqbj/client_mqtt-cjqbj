@@ -131,7 +131,7 @@ def build_view(context):
     page = pyui_kit.Page(
         context, "Audio", "Play %s on the target phone speaker" % AUDIO_PATH
     )
-    result = pyui_kit.make_text(context, "Ready")
+    result = pyui_kit.make_text(context, "Ready", selectable=True)
     page.add(result)
     play = pyui_kit.make_button(context, "Play", lambda: None)
 

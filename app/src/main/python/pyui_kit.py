@@ -243,7 +243,7 @@ def make_button(context, label, fn):
     return button
 
 
-def make_text(context, text="", size=14, color=SUB, bold=False):
+def make_text(context, text="", size=14, color=SUB, bold=False, selectable=False):
     from android.graphics import Typeface
     from android.widget import TextView
     view = TextView(context)
@@ -253,6 +253,31 @@ def make_text(context, text="", size=14, color=SUB, bold=False):
     view.setLineSpacing(dp(context, 2), 1.0)
     if bold:
         view.setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+    # 结果/日志类文本允许长按选择复制；列表行内文本不要开（会和整行点击抢手势）。
+    if selectable:
+        view.setTextIsSelectable(True)
+    return view
+
+
+def make_code_edit(context, text="", lines=6):
+    """多行等宽代码输入框（REPL 用）：等宽字体、允许换行、竖向可滚动。"""
+    from android.graphics import Typeface
+    from android.text import InputType
+    from android.view import Gravity
+    from android.widget import EditText
+    view = EditText(context)
+    view.setText(str(text))
+    view.setInputType(
+        InputType.TYPE_CLASS_TEXT
+        | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+    )
+    view.setGravity(Gravity.TOP)
+    view.setMinLines(lines)
+    view.setMaxLines(lines * 2)
+    view.setTypeface(Typeface.MONOSPACE)
+    view.setHorizontallyScrolling(False)
+    view.setPadding(dp(context, 10), dp(context, 8), dp(context, 10), dp(context, 8))
     return view
 
 

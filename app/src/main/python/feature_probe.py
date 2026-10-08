@@ -1,25 +1,22 @@
 """最小在线探针（feature）。
 
-向【当前选中目标】的 request topic 发一段最轻量的代码，2 秒超时，目标在线
-时返回：sys.executable / platform.node() / platform.machine() /
-platform.release()。
+在线探测的唯一实现是 client_service.probe_online()：向【当前选中目标】的
+request topic 发最轻量代码，2 秒超时，目标在线时返回
+sys.executable / platform.node() / platform.machine() / platform.release()。
 
-用途：
-- 在跑重 RPC 前快速判断目标在不在线、架构对不对；
+本 feature 只是 probe_online 的界面封装：
+- 设置页的周期在线探测、online()、本页面按钮全部走同一个入口，结果一致；
 - 不依赖任何业务模块，目标端是裸 multi_mqtt 也能应答。
 
-topic 不再写死：默认跟随当前选中目标（client_service 里的 request_topic），
+topic 不写死：默认跟随当前选中目标（client_service 里的 request_topic），
 切目标后探针自动打到新 topic；仍可显式传 topic 覆盖。超时固定 2s，
 不吃设备配置里可能很长的全局超时。
 """
-import ast
 import json
 
 import client_service
 
 FEATURE = {
-    "name": "probe",
-    "title": "Probe",
     "actions": ["run"],
     "icon": "bug",
     "version": 1,
@@ -27,13 +24,7 @@ FEATURE = {
     "ui": "python",
 }
 
-# 注意：末行必须是赋值给 r 的表达式。远端执行器取末尾表达式/ r 变量，
-# 经 repr 风格格式化后回传，这里用 ast.literal_eval 还原成 tuple。
-PROBE_CODE = (
-    "import platform,sys\n"
-    "r = (sys.executable, platform.node(), platform.machine(), platform.release())"
-)
-DEFAULT_TIMEOUT = 2.0
+DEFAULT_TIMEOUT = client_service.PROBE_TIMEOUT
 
 
 def current_topic():
@@ -41,78 +32,14 @@ def current_topic():
     return str(client_service._device_config(None).get("request_topic") or "")
 
 
-def _request(topic=None, timeout=DEFAULT_TIMEOUT):
-    """直接复用底层共享 MQTT 客户端，绕过全局超时。topic 默认跟选中目标。"""
-    selected = client_service._device_config(None)
-    topic = str(topic or selected.get("request_topic") or "")
-    mqtt_client = client_service._mqtt_client_module()
-    return mqtt_client.rpc(
-        PROBE_CODE,
-        request_topic=topic,
-        timeout=float(timeout or DEFAULT_TIMEOUT),
-        client_private_key_bytes=selected.get("private_key") or None,
-        allow_no_server_pubkey_response=bool(
-            selected.get("allow_no_server_pubkey_response", False)
-        ),
-    )
-
-
-def _parse_tuple(raw):
-    """远端回传的是 tuple 的 repr/pprint 文本，literal_eval 安全还原。"""
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    try:
-        value = ast.literal_eval(raw.strip())
-    except (SyntaxError, ValueError):
-        return None
-    return value if isinstance(value, tuple) else None
-
-
 def run(topic=None, timeout=DEFAULT_TIMEOUT):
-    """UI 动作入口；topic 缺省跟随当前选中目标。始终返回 JSON 字符串。"""
-    topic = str(topic or current_topic())
-    timeout = float(timeout or DEFAULT_TIMEOUT)
-    try:
-        response = _request(topic, timeout)
-    except Exception as error:
-        return json.dumps(
-            {"ok": False, "topic": topic, "timeout": timeout,
-             "error": f"{type(error).__name__}: {error}"},
-            ensure_ascii=False,
-        )
+    """UI 动作入口；topic 缺省跟随当前选中目标。始终返回 JSON 字符串。
 
-    if not isinstance(response, dict) or response.get("r") is None:
-        detail = ""
-        if isinstance(response, dict):
-            detail = str(response.get("error") or "").strip()
-        return json.dumps(
-            {"ok": False, "topic": topic, "timeout": timeout,
-             "elapsed_ms": response.get("elapsed_ms") if isinstance(response, dict) else None,
-             "error": detail or "no result before timeout (target offline?)"},
-            ensure_ascii=False,
-        )
-
-    raw = response.get("r")
-    result = {
-        "ok": bool(response.get("ok", True)),
-        "topic": topic,
-        "timeout": timeout,
-        "elapsed_ms": response.get("elapsed_ms"),
-        "raw": raw,
-    }
-    values = _parse_tuple(raw)
-    if values and len(values) >= 4:
-        result.update(
-            executable=values[0],
-            node=values[1],
-            machine=values[2],
-            release=values[3],
-        )
-    else:
-        # 目标有应答但回的不是约定 4-tuple：契约不符，整体按失败呈现（raw 保留备查）。
-        result["ok"] = False
-        result["error"] = "target answered but result is not a 4-tuple (see raw)"
-    return json.dumps(result, ensure_ascii=False)
+    直接委托 client_service.probe_online —— 在线探测只有这一份实现，
+    feature 页面、周期探测、手动 online() 不会再出现结论不一致。
+    """
+    payload = client_service.probe_online(None, timeout, topic=topic or None)
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _format(payload):
@@ -145,6 +72,7 @@ def build_view(context):
     result = pyui_kit.make_text(
         context,
         "点按钮向【当前选中目标】发送 2 秒最小探针；\n切换目标后按钮上的 topic 会自动跟着变。",
+        selectable=True,
     )
     page.add(result)
     button = pyui_kit.make_button(context, "PROBE", lambda: None)

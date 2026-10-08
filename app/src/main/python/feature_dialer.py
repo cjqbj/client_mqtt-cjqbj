@@ -194,7 +194,7 @@ def build_view(context):
     states = {}
     current = {"key": None, "topic": None}
 
-    status = pyui_kit.make_text(context, "Ready")
+    status = pyui_kit.make_text(context, "Ready", selectable=True)
     page.add(status)
 
     # §4 白名单：make_edit；退一步如果拿不到默认签名，用 EditText 也须 try 包

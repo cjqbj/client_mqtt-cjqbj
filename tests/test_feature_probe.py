@@ -7,28 +7,30 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app" / "src" / "main" / "python"))
 
+import client_service
 import feature_probe
 
 
 class ProbeParseTests(unittest.TestCase):
     def test_probe_code_compiles_to_tuple_assignment(self):
-        compile(feature_probe.PROBE_CODE, "remote_probe.py", "exec")
+        # PROBE_CODE 的唯一实现已收敛到 client_service（probe_online 用）。
+        compile(client_service.PROBE_CODE, "remote_probe.py", "exec")
         namespace = {}
         # 模拟目标执行：代码应能独立跑通并给 r 赋 4-tuple（本机平台无关字段）。
-        exec(feature_probe.PROBE_CODE, namespace)
+        exec(client_service.PROBE_CODE, namespace)
         self.assertIsInstance(namespace["r"], tuple)
         self.assertEqual(len(namespace["r"]), 4)
 
     def test_parse_tuple_accepts_repr_text(self):
-        values = feature_probe._parse_tuple("('/usr/bin/python3', 'node1', 'arm64', '5.10.0')")
+        values = client_service._parse_probe_tuple("('/usr/bin/python3', 'node1', 'arm64', '5.10.0')")
         self.assertEqual(values, ("/usr/bin/python3", "node1", "arm64", "5.10.0"))
 
     def test_parse_tuple_rejects_junk_and_non_tuple(self):
-        self.assertIsNone(feature_probe._parse_tuple(""))
-        self.assertIsNone(feature_probe._parse_tuple("   "))
-        self.assertIsNone(feature_probe._parse_tuple(None))
-        self.assertIsNone(feature_probe._parse_tuple("not a tuple"))
-        self.assertIsNone(feature_probe._parse_tuple("['a', 'b']"))
+        self.assertIsNone(client_service._parse_probe_tuple(""))
+        self.assertIsNone(client_service._parse_probe_tuple("   "))
+        self.assertIsNone(client_service._parse_probe_tuple(None))
+        self.assertIsNone(client_service._parse_probe_tuple("not a tuple"))
+        self.assertIsNone(client_service._parse_probe_tuple("['a', 'b']"))
 
 
 class ProbeRunTests(unittest.TestCase):
@@ -62,7 +64,9 @@ class ProbeRunTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["topic"], "q")
         self.assertEqual(result["timeout"], 2.0)
-        self.assertEqual(result["elapsed_ms"], 128)
+        # elapsed_ms 由探测入口实测（不再透传目标自报值），应为非负毫秒数。
+        self.assertIsInstance(result["elapsed_ms"], (int, float))
+        self.assertGreaterEqual(result["elapsed_ms"], 0)
         self.assertEqual(result["raw"], raw_repr)
         self.assertEqual(result["executable"], "/data/data/com.qgb.client/files/python/bin/python")
         self.assertEqual(result["node"], "angler")
@@ -108,6 +112,29 @@ class ProbeRunTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["raw"], "'plain string'")
         self.assertIn("4-tuple", result["error"])
+
+    def test_probe_success_writes_online_health(self):
+        raw_repr = "('/usr/bin/python3', 'k12', 'x86_64', '5.15.0')"
+        config_patch, mqtt_patch, _ = self._patch_rpc({"ok": True, "r": raw_repr})
+        with config_patch, mqtt_patch:
+            client_service.probe_online()
+            health = json.loads(client_service.target_health())
+        self.assertTrue(health["last_probe_ok"])
+        self.assertGreater(health["last_probe_at_ms"], 0)
+        self.assertEqual(health["node"], "k12")
+        self.assertEqual(health["machine"], "x86_64")
+        self.assertEqual(health["inflight_count"], 0)
+
+    def test_probe_timeout_marks_offline_with_long_error_but_keeps_timestamp(self):
+        config_patch, mqtt_patch, _ = self._patch_rpc(None)
+        with config_patch, mqtt_patch:
+            result = client_service.probe_online()
+            health = json.loads(client_service.target_health())
+        self.assertFalse(result["ok"])
+        self.assertFalse(health["last_probe_ok"])
+        # 探针自身的失败保留时间戳（按正常间隔复探），区别于业务超时的强制清零。
+        self.assertGreater(health["last_probe_at_ms"], 0)
+        self.assertEqual(health["inflight_count"], 0)
 
 
 if __name__ == "__main__":

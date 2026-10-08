@@ -101,7 +101,7 @@ def build_view(context):
     image = pyui_kit.make_zoom_image(context, height_dp=300)
     page.add(image, top=8)
 
-    status = pyui_kit.make_text(context, "Ready")
+    status = pyui_kit.make_text(context, "Ready", selectable=True)
     page.add(status, top=8)
 
     def new_state():

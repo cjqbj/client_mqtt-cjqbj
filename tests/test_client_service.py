@@ -243,6 +243,108 @@ class ClientServiceTests(unittest.TestCase):
                 client_service._STATE.clear()
                 client_service._STATE.update(previous_state)
 
+    def _init_k12(self, files_dir):
+        client_service.initialize(files_dir)
+        client_service.update_device_settings("sys/device/request", {
+            "request_topic": "sys/device/k12",
+            "private_key": "233",
+        })
+
+    def test_rpc_timeout_forces_immediate_reprobe_instead_of_stale_online(self):
+        # 回归：feature 执行超时后在线状态仍停在 online。
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                self._init_k12(files_dir)
+                # 先制造一次成功探针，目标处于 online。
+                probe_client = mock.Mock()
+                probe_client.rpc.return_value = {
+                    "r": "('/usr/bin/python3', 'k12', 'x86_64', '5.15')"
+                }
+                with mock.patch.object(client_service, "_mqtt_client_module",
+                                       return_value=probe_client):
+                    self.assertTrue(client_service.probe_online()["ok"])
+                health = json.loads(client_service.target_health())
+                self.assertTrue(health["last_probe_ok"])
+                self.assertGreater(health["last_probe_at_ms"], 0)
+
+                # 业务 RPC 完全超时：探针时间戳必须清零，逼 UI 立即复探。
+                broker_client = mock.Mock()
+                broker_client.is_connected.return_value = False
+                mqtt_module = mock.Mock()
+                mqtt_module.get_standard_pem_bytes.return_value = b"key"
+                mqtt_module.rpc.return_value = None
+                mqtt_module._default_client = mock.Mock(
+                    mqtt_net=mock.Mock(clients={"broker.example": broker_client})
+                )
+                with mock.patch.object(client_service, "_mqtt_client_module", return_value=mqtt_module):
+                    self.assertEqual(client_service.rpc("slow feature")["error"], "RPC timeout")
+                health = json.loads(client_service.target_health())
+                self.assertFalse(health["last_probe_ok"])
+                self.assertEqual(health["last_probe_at_ms"], 0)
+                self.assertFalse(health["last_rpc_ok"])
+                self.assertIn("RPC timeout", health["last_probe_error"])
+                self.assertEqual(health["inflight_count"], 0)
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_rpc_remote_traceback_keeps_probe_state(self):
+        # 目标应答了但代码抛错：在线但执行失败，探针状态不能被改成离线，
+        # 也不能被刷成"刚刚 probe 成功"（业务 RPC 与探针彻底解耦）。
+        previous_state = client_service._STATE.copy()
+        with tempfile.TemporaryDirectory() as files_dir:
+            try:
+                self._init_k12(files_dir)
+                probe_at_before = 1234567890
+                with client_service._STATE["lock"]:
+                    entry = client_service._health_entry(
+                        client_service._device_config("sys/device/k12")
+                    )
+                    entry["last_probe_at_ms"] = probe_at_before
+                    entry["last_probe_ok"] = True
+
+                mqtt_module = mock.Mock()
+                mqtt_module.get_standard_pem_bytes.return_value = b"key"
+                mqtt_module.rpc.return_value = {"ok": False, "error": "Traceback: boom"}
+                with mock.patch.object(client_service, "_mqtt_client_module", return_value=mqtt_module):
+                    response = client_service.rpc("1/0")
+                self.assertFalse(response["ok"])
+                health = json.loads(client_service.target_health())
+                self.assertFalse(health["last_rpc_ok"])
+                self.assertIn("boom", health["last_rpc_error"])
+                # 探针字段原封不动。
+                self.assertTrue(health["last_probe_ok"])
+                self.assertEqual(health["last_probe_at_ms"], probe_at_before)
+            finally:
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
+    def test_online_delegates_to_lightweight_probe(self):
+        with mock.patch.object(
+            client_service, "probe_online",
+            return_value={"ok": True, "topic": "sys/device/k12"},
+        ) as probe:
+            envelope = json.loads(client_service.online("sys/device/k12"))
+        probe.assert_called_once_with("sys/device/k12")
+        self.assertTrue(envelope["ok"])
+        self.assertEqual(envelope["result"]["topic"], "sys/device/k12")
+
+    def test_probe_online_never_raises_and_clamps_timeout(self):
+        probe_client = mock.Mock()
+        probe_client.rpc.side_effect = RuntimeError("broker down")
+        with mock.patch.object(client_service, "_device_config",
+                               return_value={"request_topic": "sys/device/k12"}), \
+             mock.patch.object(client_service, "_mqtt_client_module",
+                               return_value=probe_client):
+            result = client_service.probe_online(timeout=999)
+        self.assertFalse(result["ok"])
+        self.assertIn("RuntimeError", result["error"])
+        self.assertEqual(result["timeout"], client_service._PROBE_TIMEOUT_MAX)
+        health = json.loads(client_service.target_health())
+        self.assertFalse(health["last_probe_ok"])
+        self.assertEqual(health["inflight_count"], 0)
+
     def test_rpc_success_log_shows_request_source_and_response_metadata(self):
         previous_state = client_service._STATE.copy()
         with tempfile.TemporaryDirectory() as files_dir:
@@ -278,7 +380,11 @@ class ClientServiceTests(unittest.TestCase):
                 parsed = client_service.parse_json_result(response)
                 self.assertEqual(parsed["_rpc"]["req_id"], "server-req-1")
                 health = json.loads(client_service.target_health("sys/device/k12"))
-                self.assertTrue(health["last_probe_ok"])
+                # 业务 RPC 成功只登记 last_rpc_*，绝不再覆写专用探针字段。
+                self.assertTrue(health["last_rpc_ok"])
+                self.assertGreater(health["last_rpc_at_ms"], 0)
+                self.assertIsNone(health["last_probe_ok"])
+                self.assertEqual(health["last_probe_at_ms"], 0)
                 self.assertGreater(health["last_success_at_ms"], 0)
                 self.assertEqual(health["inflight_count"], 0)
             finally:

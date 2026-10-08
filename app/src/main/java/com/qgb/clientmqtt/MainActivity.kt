@@ -129,7 +129,7 @@ private fun featureIcon(feature: FeatureDescriptor) = when (feature.icon?.lowerc
     "camera", "photo", "image" -> Icons.Outlined.CameraAlt
     "wifi", "network", "wireless" -> Icons.Outlined.NetworkWifi
     "audio", "sound", "speaker", "play" -> Icons.Outlined.PlayArrow
-    "terminal", "shell", "console" -> Icons.Outlined.Terminal
+    "terminal", "shell", "console", "code", "repl", "python" -> Icons.Outlined.Terminal
     "bug", "debug" -> Icons.Outlined.BugReport
     "phone", "dial", "dialer", "call", "telephone" -> Icons.Outlined.Call
     "info", "about" -> Icons.Outlined.Info
@@ -139,6 +139,7 @@ private fun featureIcon(feature: FeatureDescriptor) = when (feature.icon?.lowerc
         "camera" -> Icons.Outlined.CameraAlt
         "wifi" -> Icons.Outlined.NetworkWifi
         "dialer" -> Icons.Outlined.Call
+        "repl" -> Icons.Outlined.Terminal
         else -> Icons.Outlined.Extension
     }
 }
@@ -829,7 +830,7 @@ private fun DiagnosticsPage(
             }
         }
         Text("Keys, Aliyun credentials, and RPC source code are excluded from this log.", style = MaterialTheme.typography.bodySmall)
-        if (status.isNotBlank()) Text(status, style = MaterialTheme.typography.bodySmall)
+        if (status.isNotBlank()) SelectionContainer { Text(status, style = MaterialTheme.typography.bodySmall) }
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize(),
@@ -1087,7 +1088,9 @@ private fun TargetSettingsPage(
                 }
             }
         }
-        Text(status, style = MaterialTheme.typography.bodySmall)
+        if (status.isNotBlank()) SelectionContainer {
+            Text(status, style = MaterialTheme.typography.bodySmall)
+        }
     }
 }
 
@@ -1476,11 +1479,13 @@ private fun SettingsPage(
                                 style = MaterialTheme.typography.bodySmall
                             )
                             descriptor.error?.let { message ->
-                                Text(
-                                    "error: $message",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.error
-                                )
+                                SelectionContainer {
+                                    Text(
+                                        "error: $message",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.error
+                                    )
+                                }
                             }
                         }
                         if (descriptor.source == "py_updates") {
@@ -1716,7 +1721,9 @@ private fun SettingsPage(
                     Text(if (downloading) "Adding..." else "Add feature")
                 }
             }
-            if (downloadStatus.isNotBlank()) Text(downloadStatus, style = MaterialTheme.typography.bodySmall)
+            if (downloadStatus.isNotBlank()) SelectionContainer {
+                Text(downloadStatus, style = MaterialTheme.typography.bodySmall)
+            }
             Text("Download log (long-press text to select/copy)", style = MaterialTheme.typography.labelLarge)
             // 下载日志可能含排查 URL/错误，长按可选择复制。
             SelectionContainer {
@@ -1737,7 +1744,7 @@ private fun SettingsPage(
                 }
             }
         }
-        if (status.isNotBlank()) Text(status, style = MaterialTheme.typography.bodySmall)
+        if (status.isNotBlank()) SelectionContainer { Text(status, style = MaterialTheme.typography.bodySmall) }
         Button(onClick = onPermissions) {
             Icon(Icons.TwoTone.Security, contentDescription = null)
             Text("All Android permissions")
@@ -1811,7 +1818,9 @@ private fun PermissionPage(onBack: () -> Unit) {
             }
         }
         Text("Script storage defaults to internal app storage. After all-files access is granted, enable external scripts in the previous page to use /sdcard/apm/client_mqtt/.", style = MaterialTheme.typography.bodySmall)
-        Text(status, style = MaterialTheme.typography.labelMedium)
+        if (status.isNotBlank()) SelectionContainer {
+            Text(status, style = MaterialTheme.typography.labelMedium)
+        }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             items(candidates) { permission ->
                 val granted = ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED

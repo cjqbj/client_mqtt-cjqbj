@@ -1,5 +1,6 @@
 """Client-side bridge for MQTT RPC and remote file operations."""
 
+import ast
 import json
 import base64
 import copy
@@ -867,39 +868,87 @@ def update_feature_settings(feature, values, device_ref=None):
     return json.dumps(settings, ensure_ascii=False)
 
 
+# ---------------------------------------------------------------------------
+# 在线探测 / 健康状态
+#
+# 历史问题：online() 以前走普通 rpc()（吃设备配置里可能很长的超时，还会注入
+# aliyun 配置），而任意业务 RPC 无论成败都会覆写 last_probe_*，于是 feature
+# 执行超时后仍可能被副作用刷成 online。现拆成两条互相独立的通道：
+#
+# 1) probe（专用轻探针）——在线状态的【唯一权威来源】。固定短超时（默认 2s），
+#    代码只取 sys/platform 四元组，不注入任何业务配置；feature_probe 与设置里
+#    的周期探测、手动 online() 全部收敛到 probe_online() 这一个入口。
+# 2) rpc（业务/feature 调用）——只登记 last_rpc_* 供诊断；只有在【完全收不到
+#    应答】（超时 None / 传输异常）时才把在线状态打成"待重探"：last_probe_at_ms
+#    清零，UI 立刻显示 checking 并在下一个轮询周期重新探针。目标有应答但代码
+#    报错（traceback）属于"在线但执行失败"，不动在线状态。
+# ---------------------------------------------------------------------------
+PROBE_CODE = (
+    "import platform,sys\n"
+    "r = (sys.executable, platform.node(), platform.machine(), platform.release())"
+)
+PROBE_TIMEOUT = 2.0
+_PROBE_TIMEOUT_MIN = 1.0
+_PROBE_TIMEOUT_MAX = 15.0
+
+
+def _health_defaults(selected):
+    return {
+        "device_id": selected.get("id") or selected.get("request_topic"),
+        "topic": selected.get("request_topic", "unknown"),
+        "inflight_count": 0,
+        # 专用探针（在线判定唯一依据）
+        "last_probe_at_ms": 0,
+        "last_probe_ok": None,
+        "last_probe_error": "",
+        "node": "",
+        "machine": "",
+        "release": "",
+        # 业务 RPC（仅诊断用）
+        "last_rpc_at_ms": 0,
+        "last_rpc_ok": None,
+        "last_rpc_error": "",
+        "last_success_at_ms": 0,
+    }
+
+
 def target_health(device_ref=None):
     selected = _device_config(device_ref)
     key = selected.get("id") or selected["request_topic"]
     with _STATE["lock"]:
         health = dict(_STATE.get("rpc_health", {}).get(key, {}))
-    health.setdefault("device_id", key)
-    health.setdefault("topic", selected["request_topic"])
-    health.setdefault("last_probe_at_ms", 0)
-    health.setdefault("last_probe_ok", None)
-    health.setdefault("last_success_at_ms", 0)
-    health.setdefault("inflight_count", 0)
-    return json.dumps(health, ensure_ascii=False)
+    defaults = _health_defaults(selected)
+    defaults.update(health)
+    defaults["device_id"] = key
+    defaults["topic"] = selected["request_topic"]
+    return json.dumps(defaults, ensure_ascii=False)
 
 
-def _record_rpc_start(selected):
+def _health_entry(selected):
+    """取/建目标健康条目；调用方须持有 _STATE["lock"]。"""
+    key = selected.get("id") or selected.get("request_topic")
+    table = _STATE.setdefault("rpc_health", {})
+    health = table.get(key)
+    if not isinstance(health, dict):
+        health = _health_defaults(selected)
+        table[key] = health
+    health["topic"] = selected.get("request_topic", health.get("topic", "unknown"))
+    return health
+
+
+def _record_request_start(selected):
     if not selected:
         return
     key = selected.get("id") or selected.get("request_topic")
     if not key:
         return
     with _STATE["lock"]:
-        health = _STATE.setdefault("rpc_health", {}).setdefault(key, {
-            "device_id": key,
-            "topic": selected.get("request_topic", "unknown"),
-            "last_success_at_ms": 0,
-            "last_probe_at_ms": 0,
-            "last_probe_ok": None,
-            "inflight_count": 0,
-        })
+        health = _health_entry(selected)
         health["inflight_count"] = health.get("inflight_count", 0) + 1
 
 
-def _record_rpc_health(selected, succeeded):
+def _record_request_end(selected, kind, ok, error=""):
+    """登记一次请求结束。kind="probe" 写在线字段；kind="rpc" 只写业务字段。"""
     if not selected:
         return
     key = selected.get("id") or selected.get("request_topic")
@@ -907,17 +956,120 @@ def _record_rpc_health(selected, succeeded):
         return
     now = int(time.time() * 1000)
     with _STATE["lock"]:
-        health = _STATE.setdefault("rpc_health", {}).setdefault(key, {
-            "device_id": key,
-            "topic": selected.get("request_topic", "unknown"),
-            "last_success_at_ms": 0,
-        })
-        health["topic"] = selected.get("request_topic", health.get("topic", "unknown"))
+        health = _health_entry(selected)
         health["inflight_count"] = max(0, health.get("inflight_count", 0) - 1)
-        health["last_probe_at_ms"] = now
-        health["last_probe_ok"] = bool(succeeded)
-        if succeeded:
+        health[f"last_{kind}_at_ms"] = now
+        health[f"last_{kind}_ok"] = bool(ok)
+        health[f"last_{kind}_error"] = str(error or "")[:300]
+        if ok:
             health["last_success_at_ms"] = now
+
+
+def _mark_unreachable(selected, error=""):
+    """业务 RPC 完全收不到应答：不直接下离线结论，清零探针时间戳，
+    迫使 UI 下一秒用 2s 轻探针重新判定，避免把网络抖动永久刷成离线。"""
+    if not selected:
+        return
+    key = selected.get("id") or selected.get("request_topic")
+    if not key:
+        return
+    with _STATE["lock"]:
+        health = _health_entry(selected)
+        health["last_probe_at_ms"] = 0
+        health["last_probe_ok"] = False
+        health["last_probe_error"] = str(error or "rpc unreachable")[:300]
+
+
+def _parse_probe_tuple(raw):
+    """远端回传的是 tuple 的 repr 文本，literal_eval 安全还原。"""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        value = ast.literal_eval(raw.strip())
+    except (SyntaxError, ValueError):
+        return None
+    return value if isinstance(value, tuple) else None
+
+
+def probe_online(device=None, timeout=PROBE_TIMEOUT, topic=None):
+    """在线探测的唯一入口（feature_probe / 周期探测 / online() 共用）。
+
+    向目标 request topic 发最轻量的 sys/platform 四元组代码，固定短超时，
+    直接走共享 MQTT 客户端，绕过业务 rpc() 的代码注入与设备长超时。
+    始终返回 dict（不抛异常），并据此写入 last_probe_* 健康字段。
+    device 可传设备 id 或 request_topic（_device_config 两种都认）；
+    topic 显式给定时按字面值发送（健康状态仍登记在 device 对应目标上）。
+    """
+    selected = _device_config(device)
+    topic = str(topic or selected["request_topic"])
+    try:
+        effective_timeout = min(
+            max(float(timeout or PROBE_TIMEOUT), _PROBE_TIMEOUT_MIN),
+            _PROBE_TIMEOUT_MAX,
+        )
+    except (TypeError, ValueError):
+        effective_timeout = PROBE_TIMEOUT
+
+    result = {
+        "ok": False,
+        "topic": topic,
+        "timeout": effective_timeout,
+        "elapsed_ms": None,
+        "node": "",
+        "machine": "",
+        "release": "",
+        "executable": "",
+        "error": "",
+        "raw": None,
+    }
+    _record_request_start(selected)
+    started = time.perf_counter()
+    try:
+        mqtt_client = _mqtt_client_module()
+        response = mqtt_client.rpc(
+            PROBE_CODE,
+            request_topic=topic,
+            timeout=effective_timeout,
+            client_private_key_bytes=selected.get("private_key") or None,
+            allow_no_server_pubkey_response=bool(
+                selected.get("allow_no_server_pubkey_response", False)
+            ),
+        )
+    except BaseException as error:  # noqa: BLE001 - 探测入口必须返回结构化结果
+        result["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
+        detail = f"{type(error).__name__}: {error}"
+        result["error"] = detail
+        _record_request_end(selected, "probe", False, detail)
+        return result
+
+    result["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
+    if not isinstance(response, dict) or response.get("r") is None:
+        detail = ""
+        if isinstance(response, dict):
+            detail = str(response.get("error") or "").strip()
+        result["error"] = detail or "no response before timeout (target offline?)"
+        _record_request_end(selected, "probe", False, result["error"])
+        return result
+
+    raw = response.get("r")
+    result["raw"] = raw
+    values = _parse_probe_tuple(raw)
+    if values and len(values) >= 4:
+        result["ok"] = True
+        result["executable"], result["node"], result["machine"], result["release"] = (
+            str(values[0]), str(values[1]), str(values[2]), str(values[3]),
+        )
+        with _STATE["lock"]:
+            health = _health_entry(selected)
+            health["node"], health["machine"], health["release"] = (
+                result["node"], result["machine"], result["release"],
+            )
+        _record_request_end(selected, "probe", True)
+    else:
+        # 有应答但不是约定 4-tuple：契约不符，按失败呈现（raw 保留备查）。
+        result["error"] = "target answered but result is not a 4-tuple (see raw)"
+        _record_request_end(selected, "probe", False, result["error"])
+    return result
 
 
 def _private_key_kind(value):
@@ -1093,7 +1245,7 @@ def rpc(code, device=None, timeout=None):
     effective_timeout = None
     try:
         selected = _device_config(device)
-        _record_rpc_start(selected)
+        _record_request_start(selected)
         if timeout is None:
             timeout = float(selected.get("timeout", 10))
         effective_timeout = min(
@@ -1142,7 +1294,11 @@ def rpc(code, device=None, timeout=None):
             allow_no_server_pubkey_response=bool(selected.get("allow_no_server_pubkey_response", False)),
         )
     except BaseException as error:
-        _record_rpc_health(selected, False)
+        failure = f"{type(error).__name__}: {error}"
+        _record_request_end(selected, "rpc", False, failure)
+        # 传输层异常（连不上 broker 等）按不可达处理：立刻进入重探，
+        # 不再把在线状态留在上一次成功的旧值上。
+        _mark_unreachable(selected, failure)
         topic = selected.get("request_topic", "unknown") if selected else "unknown"
         elapsed = round((time.perf_counter() - started) * 1000, 2)
         detail = f"{type(error).__name__}: {error}"[:300]
@@ -1159,7 +1315,11 @@ def rpc(code, device=None, timeout=None):
         }
     elapsed = round((time.perf_counter() - started) * 1000, 2)
     if response is None:
-        _record_rpc_health(selected, False)
+        # 真正的超时（完全无应答）——这是"feature 超时却还显示 online"的根因点：
+        # 旧代码此前也记 False，但任意后续业务 RPC 的应答又会把探针状态刷回 True。
+        # 现在业务 RPC 不再触碰探针字段，这里清零时间戳强制 2s 轻探针立即复判。
+        _record_request_end(selected, "rpc", False, "RPC timeout")
+        _mark_unreachable(selected, "RPC timeout")
         node = getattr(client_mqtt, "_default_client", None)
         clients = getattr(getattr(node, "mqtt_net", None), "clients", {})
         states = []
@@ -1185,7 +1345,13 @@ def rpc(code, device=None, timeout=None):
         }
     response["elapsed_ms"] = elapsed
     response["request_id"] = request_id
-    _record_rpc_health(selected, True)
+    # 有应答 = 链路可达；但远程代码可能抛错（ok=False），这属于"在线但执行失败"，
+    # 只登记业务结果，绝不据此改写在线状态（在线由 2s 轻探针单独判定）。
+    rpc_ok = bool(response.get("ok", True))
+    _record_request_end(
+        selected, "rpc", rpc_ok,
+        "" if rpc_ok else str(response.get("error") or "remote execution error"),
+    )
     response_detail = _redact_rpc_content(
         json.dumps(response, ensure_ascii=False, indent=2, default=str),
         selected,
@@ -1231,7 +1397,9 @@ def rpc(code, device=None, timeout=None):
 
 
 def online(device=None):
-    result = rpc("r = {'online': True}", device)
+    """周期/手动在线探测入口：固定 2s 轻探针，复用 probe_online，
+    不再走吃设备长超时的业务 rpc()。返回与历史调用方兼容的 {ok, result}。"""
+    result = probe_online(device)
     return json.dumps({"ok": bool(result.get("ok")), "result": result}, ensure_ascii=False)
 
 

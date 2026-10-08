@@ -48,7 +48,7 @@ def build_view(context):
     import pyui_kit
 
     page = pyui_kit.Page(context, "Wi-Fi", "Query target Wi-Fi connection info")
-    result = pyui_kit.make_text(context, "Waiting for target RPC")
+    result = pyui_kit.make_text(context, "Waiting for target RPC", selectable=True)
     page.add(result)
     copy_hint = pyui_kit.make_text(context, "", size=12, color=pyui_kit.MUTED)
     state = {"text": "Waiting for target RPC"}
