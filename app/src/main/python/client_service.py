@@ -115,6 +115,12 @@ _GLOBAL_FIELDS = (
     "online_probe_interval",
     "scan_limit",
     "selected_device_id",
+    # 以下三项此前漏在白名单外，durable 后端保存时被静默丢弃：
+    # feature_settings 各 feature 按目标的持久设置（拨号历史等）、
+    # selected_feature 各目标最后选中的标签、known_features 本机特性启用名单
+    "feature_settings",
+    "selected_feature",
+    "known_features",
 )
 
 
@@ -412,13 +418,27 @@ def build_feature_view(feature, context):
         logging.getLogger("error").exception(
             "build_feature_view failed feature=%s", feature
         )
-        from android.widget import TextView
+        import pyui_kit
+        from android.widget import ScrollView, TextView
+
         error_view = TextView(context)
+        # 错误文本必须能长按选择复制，方便把 traceback 发出来排查
+        error_view.setTextIsSelectable(True)
+        error_view.setPadding(
+            pyui_kit.dp(context, 16), pyui_kit.dp(context, 16),
+            pyui_kit.dp(context, 16), pyui_kit.dp(context, 16),
+        )
         error_view.setText(
             "Python UI failed for feature_%s.py:\n\n%s"
             % (feature, traceback.format_exc()[-1500:])
         )
-        return error_view
+        # traceback 常超过一屏，套一层可滚动容器
+        scroll = ScrollView(context)
+        scroll.addView(
+            error_view,
+            ScrollView.LayoutParams(pyui_kit.match(), pyui_kit.wrap()),
+        )
+        return scroll
 
 
 # feature 自绘页的返回键拦截登记表：feature 名 -> 无参回调。

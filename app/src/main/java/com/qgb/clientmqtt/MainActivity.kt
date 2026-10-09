@@ -776,6 +776,8 @@ private fun PythonViewPage(feature: FeatureDescriptor, service: PyObject) {
                 android.widget.TextView(context).apply {
                     text = "Python UI failed to build:\n${error.javaClass.simpleName}: ${error.message}"
                     setPadding(48, 48, 48, 48)
+                    // 兜底错误文本也允许长按选择复制
+                    setTextIsSelectable(true)
                 }
             }
         }

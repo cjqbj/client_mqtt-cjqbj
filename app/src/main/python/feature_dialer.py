@@ -1,7 +1,8 @@
 """In-memory remote dialer feature. Replaceable at runtime.
 
 远端动作: dial(number) / hangup() / state()
-UI: 号码输入 + Call / Hang up / Refresh；号码按 target 持久化。
+UI: 号码输入 + 拨打历史下拉（点击条目填回号码）+ Call / Hang up / Refresh；
+号码与历史按 target 持久化（磁盘）。
 
 命名约定：feature 名一律取文件名 feature_<name>.py 的 <name>，
 FEATURE 里不需要再写 name/title（title 缺省由宿主按文件名生成）。
@@ -25,6 +26,8 @@ HANGUP_TIMEOUT = 15
 STATE_TIMEOUT = 10
 # placeCall 后等 TelecomManager 状态刷新的秒数
 STATE_SETTLE = 2.0
+# 每目标最多保留的拨打历史条数
+HISTORY_MAX = 20
 
 
 def run():
@@ -176,6 +179,29 @@ def state():
 
 
 # ---------------------------------------------------------------------------
+# 历史工具（纯函数）
+# ---------------------------------------------------------------------------
+
+def history_push(history, number):
+    """新号码置顶、去重，截断到 HISTORY_MAX。"""
+    number = str(number)
+    items = [number] + [item for item in list(history) if str(item) != number]
+    return items[:HISTORY_MAX]
+
+
+def normalize_history(raw):
+    """磁盘数据归一化：只留非空字符串，去重保序，截断上限。"""
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for item in raw:
+        text = str(item).strip()
+        if text and text not in result:
+            result.append(text)
+    return result[:HISTORY_MAX]
+
+
+# ---------------------------------------------------------------------------
 # Chaquopy 自绘 UI（遵循 §4：组件只用 pyui_kit 白名单）
 # ---------------------------------------------------------------------------
 
@@ -183,16 +209,19 @@ def build_view(context):
     import bootstrap
     import pyui_kit
     from android.text import InputType
-    from android.widget import EditText
+    from android.view import View
+    from android.widget import EditText, LinearLayout
 
     page = pyui_kit.Page(
         context, "Dialer",
-        "Place / end calls on the target. Last number per target is remembered."
+        "Place / end calls on the target. Tap a history entry to reuse the number."
     )
 
-    # key -> {number, number_loaded, status, active}
+    # key -> {number, number_loaded, status, active, history, history_loaded}
     states = {}
     current = {"key": None, "topic": None}
+    # 下拉展开状态（同一时刻只有当前目标的列表可见）
+    history_open = {"on": False}
 
     status = pyui_kit.make_text(context, "Ready", selectable=True)
     page.add(status)
@@ -210,6 +239,15 @@ def build_view(context):
         pass
     page.add(number_input, top=8)
 
+    # 拨打历史：标题按钮展开/收起，条目在 history_box 里动态构建
+    history_btn = pyui_kit.make_button(context, "History (0) ▾", lambda: None)
+    page.add(history_btn, top=8)
+
+    history_box = LinearLayout(context)
+    history_box.setOrientation(LinearLayout.VERTICAL)
+    history_box.setVisibility(View.GONE)
+    page.add(history_box, top=4)
+
     dial_btn = pyui_kit.make_button(context, "Call", lambda: None)
     hangup_btn = pyui_kit.make_button(context, "Hang up", lambda: None)
     refresh_btn = pyui_kit.make_button(context, "Refresh", lambda: None)
@@ -217,52 +255,128 @@ def build_view(context):
 
     def new_state():
         return {"number": "", "number_loaded": False,
-                "status": "Ready", "active": False}
+                "status": "Ready", "active": False,
+                "history": [], "history_loaded": False}
 
     def state_for(key):
         return states.setdefault(key, new_state())
 
     def paint():
-        # 只刷非输入控件；输入框文本只在 load_number / on_target 时写入，
+        # 只刷非输入控件；输入框文本只在 load_saved / on_target / 选历史时写入，
         # 避免打断用户正在输入的内容（§4 精神）
         st = state_for(current["key"])
         status.setText(st["status"])
         hangup_btn.setEnabled(bool(st["active"]))
 
     # ------------------------------------------------------------------
-    # 号码持久化：惰性加载（参考 feature_camera 的 facing_loaded 模式）
+    # 历史下拉渲染（主线程）
     # ------------------------------------------------------------------
-    def load_number(key):
+    def make_history_row(number):
+        row = pyui_kit.make_text(context, number, size=14, color=pyui_kit.INK)
+        row.setPadding(
+            pyui_kit.dp(context, 12), pyui_kit.dp(context, 9),
+            pyui_kit.dp(context, 12), pyui_kit.dp(context, 9),
+        )
+        try:
+            row.setBackgroundColor(pyui_kit.parse_color("#FFFFFF"))
+        except Exception:
+            pass
+        # 列表行不开文本选择，避免和整行点击抢手势（见 make_text 注释）
+        pyui_kit.click(row, lambda n=number: pick_history(n))
+        return row
+
+    def render_history():
+        history_box.removeAllViews()
+        items = []
+        if current["key"]:
+            items = state_for(current["key"]).get("history", [])
+        if not items:
+            hint = pyui_kit.make_text(
+                context, "No dialed numbers yet",
+                size=12, color=pyui_kit.MUTED,
+            )
+            history_box.addView(
+                hint,
+                LinearLayout.LayoutParams(pyui_kit.match(), pyui_kit.wrap()),
+            )
+        else:
+            for number in items:
+                params = LinearLayout.LayoutParams(
+                    pyui_kit.match(), pyui_kit.wrap()
+                )
+                params.topMargin = pyui_kit.dp(context, 4)
+                history_box.addView(make_history_row(number), params)
+        history_btn.setText(
+            "History (%d) %s" % (len(items), "▴" if history_open["on"] else "▾")
+        )
+
+    def set_history_open(on):
+        history_open["on"] = bool(on)
+        history_box.setVisibility(View.VISIBLE if on else View.GONE)
+        render_history()
+
+    def pick_history(number):
+        # 点击历史条目：填回号码并收起下拉，由用户再按 Call 确认拨打
+        try:
+            number_input.setText(number)
+            number_input.setSelection(len(number))
+        except Exception:
+            pass
+        set_history_open(False)
+        key = current["key"]
+        if key:
+            st = state_for(key)
+            st["number"] = number
+            st["status"] = "Selected %s — press Call to dial" % number
+            paint()
+
+    def toggle_history():
+        set_history_open(not history_open["on"])
+
+    # ------------------------------------------------------------------
+    # 号码 + 历史持久化：惰性加载（参考 feature_camera 的 *_loaded 模式）
+    # ------------------------------------------------------------------
+    def load_saved(key):
         st = state_for(key)
         if st["number_loaded"]:
             return
         st["number_loaded"] = True
+        st["history_loaded"] = True
 
         def work():
             raw = client_service.feature_settings("dialer", key)
             try:
-                return str(json.loads(raw).get("number", ""))
+                doc = json.loads(raw)
             except (TypeError, ValueError):
-                return ""
+                doc = {}
+            number = str(doc.get("number", "") or "")
+            return number, normalize_history(doc.get("history"))
 
-        def apply_ok(value):
+        def apply_ok(payload):
+            value, history = payload
             st["number"] = value or ""
+            st["history"] = history
             if current["key"] == key:
                 try:
                     number_input.setText(st["number"])
                     number_input.setSelection(len(st["number"]))
                 except Exception:
                     pass
+                render_history()
                 paint()
 
         # run_async 的 on_ok 回主线程；异常由它兜（§4.1）
         pyui_kit.run_async(work, apply_ok)
 
-    def save_number(key, number):
+    def persist(key, number, history):
+        # 一次浅合并写入两个字段，避免号码/历史互相覆盖
+        payload = json.dumps(
+            {"number": number, "history": history}, ensure_ascii=False
+        )
+
         def work():
-            client_service.update_feature_settings(
-                "dialer", json.dumps({"number": number}), key
-            )
+            client_service.update_feature_settings("dialer", payload, key)
+
         pyui_kit.run_async(work)
 
     # ------------------------------------------------------------------
@@ -282,16 +396,17 @@ def build_view(context):
         st["number"] = number
         st["status"] = "Dialing %s ..." % number
         paint()
-        save_number(key, number)
+        # 先持久号码（网络失败也记住）；历史在确认下发成功后追加
+        persist(key, number, st["history"])
 
         def work():
             raw = bootstrap.call_feature("dialer", "dial", number)
             try:
                 dial_result = json.loads(raw)
             except Exception:
-                return (pyui_kit.render_result(raw), False)
+                return (pyui_kit.render_result(raw), False, None)
             if not dial_result.get("ok"):
-                return (pyui_kit.render_result(raw), False)
+                return (pyui_kit.render_result(raw), False, None)
 
             # placeCall 异步，等 TelecomManager 状态刷新再核对
             time.sleep(STATE_SETTLE)
@@ -302,14 +417,18 @@ def build_view(context):
                 state_result = {}
             active = state_result.get("state") in ("offhook", "ringing")
             if active:
-                return ("In call: %s" % number, True)
+                return ("In call: %s" % number, True, number)
             # 已下发但状态未刷新，如实显示，让用户按 Refresh 复核
             return ("Dispatched %s (state: %s)" % (
-                number, state_result.get("state", "unknown")), True)
+                number, state_result.get("state", "unknown")), True, number)
 
         def apply_ok(payload):
-            # payload 是 (status_text, active) 元组
-            st["status"], st["active"] = payload
+            # payload 是 (status_text, active, dialed_number) 元组
+            st["status"], st["active"], dialed = payload
+            if dialed and st["history_loaded"]:
+                st["history"] = history_push(st["history"], dialed)
+                persist(key, st["number"], st["history"])
+            render_history()
             paint()
 
         def apply_error(error):
@@ -392,6 +511,7 @@ def build_view(context):
             buttons=(dial_btn, hangup_btn, refresh_btn),
         )
 
+    pyui_kit.click(history_btn, toggle_history)
     pyui_kit.click(dial_btn, on_dial)
     pyui_kit.click(hangup_btn, on_hangup)
     pyui_kit.click(refresh_btn, on_refresh)
@@ -399,6 +519,9 @@ def build_view(context):
     page.bottom_add(refresh_btn)
     page.bottom_add(hangup_btn)
     page.bottom_add(dial_btn, weight=1.0)
+
+    # 初始空状态提示与按钮计数
+    render_history()
 
     # ------------------------------------------------------------------
     # 目标切换
@@ -408,6 +531,8 @@ def build_view(context):
         current["topic"] = topic
         page.set_target("target topic: " + topic)
         st = state_for(key)
+        # 切目标先收起下拉，按新目标历史重建条目
+        set_history_open(False)
         # 切目标时清空输入框，若本地已有号码则填回
         try:
             number_input.setText(st["number"] if st["number_loaded"] else "")
@@ -415,7 +540,8 @@ def build_view(context):
                 number_input.setSelection(len(st["number"]))
         except Exception:
             pass
-        load_number(key)
+        render_history()
+        load_saved(key)
         paint()
 
     pyui_kit.watch_target(page.root, on_target)

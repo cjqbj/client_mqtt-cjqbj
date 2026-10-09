@@ -1067,6 +1067,38 @@ class ClientServiceTests(unittest.TestCase):
                 client_service._STATE.clear()
                 client_service._STATE.update(previous_state)
 
+    def test_durable_backend_persists_global_feature_fields_across_restart(self):
+        # durable 后端按白名单保存全局键；feature_settings/selected_feature/
+        # known_features 曾漏在白名单外被静默丢弃，拨号历史因此重启即失。
+        previous_state = client_service._STATE.copy()
+        previous_env = os.environ.get("QGB_SETTINGS_ROOT")
+        with tempfile.TemporaryDirectory() as files_dir:
+            settings_root = os.path.join(files_dir, "sdcard")
+            os.environ["QGB_SETTINGS_ROOT"] = settings_root
+            try:
+                client_service.initialize(os.path.join(files_dir, "files"))
+                first_id = json.loads(client_service.device_settings())["id"]
+
+                client_service.update_feature_settings(
+                    "dialer", {"number": "10086", "history": ["10086"]}, first_id
+                )
+                client_service.select_feature("dialer", first_id)
+
+                # 模拟重启：重新 initialize 后 durable global.json 必须带回三项。
+                client_service.initialize(os.path.join(files_dir, "files"))
+                stored = json.loads(
+                    client_service.feature_settings("dialer", first_id)
+                )
+                self.assertEqual(stored["number"], "10086")
+                self.assertEqual(stored["history"], ["10086"])
+                self.assertEqual(client_service.selected_feature(first_id), "dialer")
+            finally:
+                os.environ.pop("QGB_SETTINGS_ROOT", None)
+                if previous_env is not None:
+                    os.environ["QGB_SETTINGS_ROOT"] = previous_env
+                client_service._STATE.clear()
+                client_service._STATE.update(previous_state)
+
     def test_parse_json_result_passes_raw_stdout_and_stderr_through(self):
         response = {
             "ok": True,

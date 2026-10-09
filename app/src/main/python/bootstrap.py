@@ -21,6 +21,7 @@ def _scan_builtin_features():
     """
     root = os.path.dirname(os.path.abspath(__file__))
     names = set()
+    # 源码/桌面布局：物理目录里就是 .py 文件，直接 os.listdir。
     try:
         for filename in os.listdir(root):
             if filename.startswith("feature_") and filename.endswith(".py"):
@@ -29,6 +30,21 @@ def _scan_builtin_features():
                     names.add(name)
     except OSError:
         pass
+    # APK 打包布局：.pyc 全部收在 app.imy 里，AssetFinder 物理目录
+    # os.listdir 看不到模块文件，必须经 Chaquopy AssetFinder.listdir
+    # 枚举（SourcelessAssetLoader.finder），否则内置 feature 列表为空。
+    if not names:
+        try:
+            loader = getattr(sys.modules.get(__name__), "__loader__", None)
+            finder = getattr(loader, "finder", None)
+            if finder is not None:
+                for filename in finder.listdir(""):
+                    if filename.startswith("feature_") and filename.endswith(".pyc"):
+                        name = filename[8:-4]
+                        if name.isidentifier():
+                            names.add(name)
+        except Exception:
+            pass
     return tuple(sorted(names))
 
 
