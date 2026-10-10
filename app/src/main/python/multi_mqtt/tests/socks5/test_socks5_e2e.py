@@ -41,6 +41,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
@@ -180,6 +181,19 @@ class BigSend(threading.Thread):
                 pass
 
 
+class _SockProxy:
+    """socket 透传代理：socket.socket 带 __slots__ 不能直接改实例属性。"""
+
+    def __init__(self, s):
+        object.__setattr__(self, "_s", s)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_s"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_s"), name, value)
+
+
 class RecvTarget(threading.Thread):
     """accept 后持续接收直到对端半关/关闭，记录收到的全部字节。"""
 
@@ -234,6 +248,8 @@ class ServerTemplateFixTests(unittest.TestCase):
     def setUp(self):
         FakeMgr.instances = []
         _FAKE_RC[0] = 0
+        # 类级可变状态显式登记恢复，不依赖"下个用例 setUp 顺手重置"
+        self.addCleanup(_FAKE_RC.__setitem__, 0, 0)
         self.net = FakeNet()
         self.gms = FakeGms(self.net)
         self.ns = {
@@ -263,12 +279,12 @@ class ServerTemplateFixTests(unittest.TestCase):
                 except OSError:
                     pass
 
-    def _start(self):
+    def _start(self, connect_timeout=2.0):
         payload = {
             "sid": self.sid, "in_topic": self.in_t,
             "out_topic": self.out_t, "frame_max": 16384,
             "ttl": 300, "heartbeat": self.HB,
-            "connect_timeout": 2.0, "gap_timeout": 15.0,
+            "connect_timeout": connect_timeout, "gap_timeout": 15.0,
         }
         resp = PythonExecutor(globals=self.ns).execute(
             scm.build_socks5_start_code(payload))
@@ -363,6 +379,8 @@ class ServerTemplateFixTests(unittest.TestCase):
     def test_t4_paho_rc_nonzero_is_accounted(self):
         # 主连接与 bulk 连接的 client 全部返回 rc=4（MQTT_ERR_NO_CONN）
         _FAKE_RC[0] = 4
+        # 显式 cleanup：类级可变状态不靠"下个用例 setUp 顺手重置"兜底
+        self.addCleanup(_FAKE_RC.__setitem__, 0, 0)
         self.net = FakeNet(clients={"badbroker": FakeClient(
             "badbroker", rc=4, connected=True)})
         self.gms = FakeGms(self.net)
@@ -371,12 +389,19 @@ class ServerTemplateFixTests(unittest.TestCase):
         self._start()
         cid = 3
         self._drive_big_frame(cid, send_ps=True, broker="badbroker")
+
+        def pub_err():
+            return self._closure_vars(
+                "_hb_loop", ("_pub_err", "_pub_last"))
+
         self.assertTrue(_wait_for(
-            lambda: self.ns.get("_cmq_s5_pub_err", 0) >= 2, timeout=8.0),
-            "paho rc!=0 静默失败未记账（bulk+回退至少两笔），实际 %r last=%r"
-            % (self.ns.get("_cmq_s5_pub_err"),
-               self.ns.get("_cmq_s5_pub_last")))
-        self.assertIn("paho rc=4", self.ns.get("_cmq_s5_pub_last", ""))
+            lambda: pub_err().get("_pub_err", 0) >= 2, timeout=8.0),
+            "paho rc!=0 静默失败未记账（bulk+回退至少两笔），实际 %r"
+            % (pub_err(),))
+        self.assertIn("paho rc=4", pub_err().get("_pub_last") or "")
+        # 会话私有计数不得回写 executor 全局（跨会话零干扰）
+        self.assertNotIn("_cmq_s5_pub_err", self.ns)
+        self.assertNotIn("_cmq_s5_pub_last", self.ns)
         # 记账随心跳 pe/pl 暴露给客户端
         self.assertTrue(_wait_for(
             lambda: any(d.get("pe", 0) >= 1
@@ -390,15 +415,16 @@ class ServerTemplateFixTests(unittest.TestCase):
         tgt = RecvTarget()
         tgt.start()
         gate = threading.Event()
-        orig_create = socket.create_connection
+        real_create = socket.create_connection
 
         def slow_create(addr, timeout=None):
             gate.wait(3.0)  # 把 connect 钉在建连阶段
-            return orig_create(addr, timeout=timeout)
+            return real_create(addr, timeout=timeout)
 
-        socket.create_connection = slow_create
         cid = 9
-        try:
+        # 进程级名字用上下文管理器打补丁：异常/并行收集器下也能自动还原，
+        # 不依赖手写 finally（失败时不会留下全局污染踩其它用例）。
+        with mock.patch.object(socket, "create_connection", slow_create):
             self._start()
             self._open_cid(cid, tgt.port)         # open seq=0，connect 卡住
             self.net.deliver(self.in_t, {
@@ -419,10 +445,8 @@ class ServerTemplateFixTests(unittest.TestCase):
                     and t.is_alive()
                     for t in threading.enumerate()), 5.0),
                 "连接线程未退出")
-        finally:
-            socket.create_connection = orig_create
-            gate.set()
-            tgt.shutdown()
+        gate.set()
+        tgt.shutdown()
 
     def test_t26_thread_start_failure_leaves_no_dangling_conn(self):
         # P2：系统线程耗尽（Thread.start 抛 RuntimeError）时，_c 已入
@@ -430,26 +454,24 @@ class ServerTemplateFixTests(unittest.TestCase):
         # 不能挂到会话结束；之后到达的数据帧应被静默忽略。
         self._start()
         cid = 11
-        orig_thread = threading.Thread
+        real_thread = threading.Thread
 
-        class FailThread(orig_thread):
+        class FailThread(real_thread):
             def start(self):
                 if self.name and self.name.startswith(
                         ("s5-conn-", "s5-wr-")):
                     raise RuntimeError("can't start new thread")
-                return orig_thread.start(self)
+                return real_thread.start(self)
 
-        # open 经 _inq 由 s5-in 线程异步处理：补丁必须保持到失败回包落地
-        threading.Thread = FailThread
-        try:
+        # open 经 _inq 由 s5-in 线程异步处理：补丁必须保持到失败回包落地。
+        # mock.patch.object 出作用域自动还原，避免线程类全局污染。
+        with mock.patch.object(threading, "Thread", FailThread):
             self._open_cid(cid, 1)
             self.assertTrue(_wait_for(lambda: any(
                 d.get("seq") == 0 and isinstance(d.get("opened"), dict)
                 and d["opened"].get("ok") is False
                 for d in self._cid_broadcast(cid)), 3.0),
                 "start 失败未回 opened(ok=False)")
-        finally:
-            threading.Thread = orig_thread
 
         bc = self._cid_broadcast(cid)
         self.assertTrue(any(d.get("closed") for d in bc),
@@ -468,6 +490,390 @@ class ServerTemplateFixTests(unittest.TestCase):
         time.sleep(0.2)
         self.assertEqual(len(self._cid_broadcast(cid)), n0,
                          "已摘除条目仍在产生回包")
+
+    # ---- T31：close 持锁占号后，recv 已返回的数据不得再占号倒序发送 ----
+
+    def test_t31_no_data_frame_after_close_seqs(self):
+        self._start()
+        self_test = self
+        cid = 12
+        tgt = BigSend(n=1, hold=5.0)   # accept 后只发 1 字节且不读
+        tgt.start()
+        self.big = tgt
+        real_create = socket.create_connection
+        state = {"fired": False}
+
+        def racing_create(addr, timeout=None, _st=state):
+            s = real_create(addr, timeout=timeout)
+            if addr[1] != tgt.port:
+                return s
+
+            class RacingSock(_SockProxy):
+                def recv(self, n):
+                    data = self._s.recv(n)
+                    # 钉死在"recv 已返回、尚未拿 seq_lock"的窗口里，先让
+                    # _close_conn 发完 closed(seq=N)，再放行这 1 字节。
+                    if data and not _st["fired"]:
+                        _st["fired"] = True
+                        # wq 上限 256：writer 排空进内核发送缓冲（~几十 KB）
+                        # 后会阻塞，每帧 4KiB × 258 = 1MiB 必把 wq 灌满，
+                        # 第 257 帧触发 _close_conn("backpressure")。
+                        for i in range(1, 259):
+                            self_test.net.deliver(self_test.in_t, {
+                                "s5": self_test.sid, "cid": cid,
+                                "seq": i, "d": "z" * 4096})
+                        _wait_for(lambda: any(
+                            d.get("closed")
+                            for d in self_test._cid_broadcast(cid)), 3.0)
+                    return data
+
+            return RacingSock(s)
+
+        with mock.patch.object(socket, "create_connection", racing_create):
+            self._open_cid(cid, tgt.port)
+            self.assertTrue(_wait_for(lambda: any(
+                d.get("closed") and d.get("reason") == "backpressure"
+                for d in self._cid_broadcast(cid)), 8.0),
+                "未等到 backpressure 收尾帧")
+            closed = next(d for d in self._cid_broadcast(cid)
+                          if d.get("closed")
+                          and d.get("reason") == "backpressure")
+            self.assertTrue(_wait_for(lambda: not any(
+                t.name in ("s5-conn-%d" % cid, "s5-wr-%d" % cid)
+                and t.is_alive()
+                for t in threading.enumerate()), 5.0),
+                "读/写线程未退出")
+            bc = self._cid_broadcast(cid)
+            after = [d for d in bc
+                     if "d" in d and d.get("seq", -1) >= closed["seq"]]
+            self.assertFalse(after,
+                             "数据帧占号排在 closed(seq=%d) 之后: %r"
+                             % (closed["seq"], after))
+
+    # ---- T32：并发同 sid 握手原子占坑，只允许一套会话线程 ----
+
+    def _start_code(self):
+        return scm.build_socks5_start_code({
+            "sid": self.sid, "in_topic": self.in_t,
+            "out_topic": self.out_t, "frame_max": 16384,
+            "ttl": 300, "heartbeat": self.HB,
+            "connect_timeout": 2.0, "gap_timeout": 15.0})
+
+    def test_t32_concurrent_handshake_single_session(self):
+        # 订阅点在"占坑之后、写回成品之前"：第一握手在此钉住，第二握手
+        # 必须等同一占位，而不是各自初始化。
+        first = threading.Event()
+        released = threading.Event()
+        orig_sub = self.net.subscribe
+
+        def gated_sub(topic):
+            if not first.is_set():
+                first.set()
+                self.assertTrue(released.wait(10.0), "门禁未释放")
+            return orig_sub(topic)
+
+        self.net.subscribe = gated_sub
+        results = {}
+
+        def run(tag):
+            results[tag] = PythonExecutor(globals=self.ns).execute(
+                self._start_code())
+
+        try:
+            ta = threading.Thread(target=run, args=("a",))
+            tb = threading.Thread(target=run, args=("b",))
+            ta.start()
+            self.assertTrue(first.wait(5.0), "第一握手未进入初始化")
+            # A 已占坑但未完成
+            self.assertIsInstance(
+                self.ns["_cmq_s5_sessions"].get(self.sid),
+                threading.Event, "缺少启动中占位")
+            tb.start()
+            time.sleep(0.8)
+            self.assertTrue(tb.is_alive(), "第二握手未等待占位（重复初始化？）")
+            released.set()
+            ta.join(10.0)
+            tb.join(10.0)
+            self.assertFalse(ta.is_alive() or tb.is_alive(), "握手线程挂死")
+            ra, rb = results["a"], results["b"]
+            self.assertTrue(ra["ok"] and rb["ok"],
+                            (ra.get("error"), rb.get("error")))
+            self.assertEqual(ra["r"], rb["r"], "两次握手返回不同 env")
+            self.assertTrue(json.loads(ra["r"])["ok"])
+            self.assertIsInstance(
+                self.ns["_cmq_s5_sessions"][self.sid], str,
+                "成品未覆盖占位")
+            for name in ("s5-in", "s5-hb", "s5-bulk"):
+                n = len([t for t in threading.enumerate()
+                         if t.name == name and t.is_alive()])
+                self.assertEqual(n, 1, "%s 线程数=%d（孤儿会话）" % (name, n))
+        finally:
+            self.net.subscribe = orig_sub
+            released.set()
+        self._started = True
+
+    def test_t32b_failed_init_releases_placeholder_for_retry(self):
+        # 赢家初始化异常：占位必须摘除，后来者才能抢坑成功。
+        saved = self.ns["gms"]
+        self.ns["gms"] = object()   # _find_net 扫不到 mqtt_net → RuntimeError
+        try:
+            resp = PythonExecutor(globals=self.ns).execute(self._start_code())
+            self.assertTrue(resp["ok"])
+            env = json.loads(resp["r"])
+            self.assertFalse(env["ok"], "缺网元时本应握手失败")
+            self.assertNotIn(self.sid, self.ns["_cmq_s5_sessions"],
+                             "失败后启动中占位残留")
+        finally:
+            self.ns["gms"] = saved
+        self._start()  # 立即重试：必须能重新占坑并成功
+        self.assertTrue(_wait_for(lambda: any(
+            isinstance(d, dict) and d.get("hb") is not None
+            for _, d in self.net.frames(self.out_t)), 3.0),
+            "占位释放后重试未拉起会话")
+
+    # ---- 闭包单元读取：模板内会话私有状态不挂 executor 全局名，只能从
+    #      守护线程的 __closure__ 顺着函数型 cell 向下找（深度 3 内） ----
+
+    def _closure_vars(self, root_name, wanted):
+        # 注意：匹配的是线程 target 的**函数名**（_in_loop/_hb_loop），
+        # 不是线程的 name（s5-in/s5-hb）。
+        code = (
+            "import threading as _th\n"
+            "_want = set(%r)\n"
+            "_out = {}\n"
+            "_seen = set()\n"
+            "_stack = []\n"
+            "for _t0 in _th.enumerate():\n"
+            "    _tg = getattr(_t0, '_target', None)\n"
+            "    if _tg is not None and getattr(_tg, '__name__', '') == %r:\n"
+            "        _stack.append(_tg)\n"
+            "while _stack and _want - set(_out):\n"
+            "    _f = _stack.pop()\n"
+            "    if id(_f) in _seen:\n"
+            "        continue\n"
+            "    _seen.add(id(_f))\n"
+            "    for _n, _cl in zip(_f.__code__.co_freevars,\n"
+            "                       _f.__closure__ or ()):\n"
+            "        if _n in _want:\n"
+            "            _out[_n] = _cl.cell_contents\n"
+            "        _v = _cl.cell_contents\n"
+            "        if callable(_v) and getattr(_v, '__closure__', None):\n"
+            "            _stack.append(_v)\n"
+            "r = _out\n" % (sorted(wanted), root_name)
+        )
+        resp = PythonExecutor(globals=self.ns).execute(code)
+        self.assertTrue(resp["ok"], resp.get("error"))
+        return resp["r"] or {}
+
+    # ---- T33：服务端 _rt_last 超量按龄清扫（借线程闭包单元注入） ----
+
+    def _rt_dict_via_closure(self):
+        return self._closure_vars("_in_loop",
+                                  ("_rt_last",)).get("_rt_last")
+
+    def test_t33_server_rt_last_pruned_by_age(self):
+        self._start()
+        rt = self._rt_dict_via_closure()
+        self.assertIsNotNone(rt, "未通过 s5-in 闭包定位到 _rt_last")
+        now = time.monotonic()
+        for i in range(4100):
+            rt[(900000 + i, 0)] = now - 60.0
+        rt[(999001, 0)] = now - 5.0
+        rt[(999002, 0)] = now
+        # 任意 NACK（cid 不存在也行）即驱动一轮 _retrans → 触发清扫
+        self.net.deliver(self.in_t,
+                         {"s5": self.sid, "cid": 77, "nack": []})
+        self.assertTrue(_wait_for(
+            lambda: len(self._rt_dict_via_closure()) == 2, 3.0),
+            "服务端去重表未按龄清扫: %r"
+            % list(self._rt_dict_via_closure().keys())[:5])
+
+    # ---- T34：writer 等 sock 超时必须走 _close_conn 留痕 ----
+
+    def test_t34_writer_sock_timeout_closes_with_reason(self):
+        gate = threading.Event()
+        real_create = socket.create_connection
+        tgt = RecvTarget()
+        tgt.start()
+
+        def hang_create(addr, timeout=None):
+            gate.wait(8.0)             # 建连远超 ctimeout，writer 先超时
+            return real_create(addr, timeout=timeout)
+
+        cid = 14
+        with mock.patch.object(socket, "create_connection", hang_create):
+            self._start(connect_timeout=1.0)   # writer 等待上限 = 1+5s
+            self._open_cid(cid, tgt.port)
+            self.net.deliver(self.in_t, {
+                "s5": self.sid, "cid": cid, "seq": 1, "d": "Q"})
+            self.assertTrue(_wait_for(lambda: any(
+                d.get("closed")
+                and d.get("reason") == "writer_sock_timeout"
+                for d in self._cid_broadcast(cid)), 8.0),
+                "writer sock 超时未留痕收尾")
+            gate.set()   # 放行建连：晚成的 socket 必须被 _dead 分支关掉
+            self.assertTrue(_wait_for(lambda: not any(
+                t.name in ("s5-conn-%d" % cid, "s5-wr-%d" % cid)
+                and t.is_alive()
+                for t in threading.enumerate()), 5.0),
+                "worker 未退出")
+            bc = self._cid_broadcast(cid)
+            self.assertFalse(any(isinstance(d.get("opened"), dict)
+                                 for d in bc),
+                             "收尾后倒序补发 opened: %r" % bc)
+            # 条目已摘：迟到数据帧无回包
+            n0 = len(bc)
+            self.net.deliver(self.in_t, {
+                "s5": self.sid, "cid": cid, "seq": 2, "d": "Y"})
+            time.sleep(0.2)
+            self.assertEqual(len(self._cid_broadcast(cid)), n0)
+        gate.set()
+        tgt.shutdown()
+
+    # ---- T35：writer_sock_timeout 先收尾后建连才抛异常：
+    #      不得出现 opened(ok=False)/connect_failed 与 closed 抢 seq=0 ----
+
+    def test_t35_connect_error_after_close_no_double_seq0(self):
+        gate = threading.Event()
+
+        def fail_late(addr, timeout=None):
+            gate.wait(8.0)          # 熬过 writer sock 超时（先被收尾）
+            raise OSError("simulated late connect failure")
+
+        cid = 15
+        with mock.patch.object(socket, "create_connection", fail_late):
+            self._start(connect_timeout=1.0)
+            self._open_cid(cid, 1)
+            # 喂一帧让 writer 进入等 sock 分支，ctimeout+5s 后超时收尾
+            self.net.deliver(self.in_t, {
+                "s5": self.sid, "cid": cid, "seq": 1, "d": "Q"})
+            self.assertTrue(_wait_for(lambda: any(
+                d.get("closed")
+                and d.get("reason") == "writer_sock_timeout"
+                for d in self._cid_broadcast(cid)), 8.0),
+                "未等到 writer_sock_timeout 收尾")
+            gate.set()   # 放行：conn_main 的 connect 随即抛 OSError
+            # 等 worker 全部退出（异常分支执行完）
+            self.assertTrue(_wait_for(lambda: not any(
+                t.name in ("s5-conn-%d" % cid, "s5-wr-%d" % cid)
+                and t.is_alive()
+                for t in threading.enumerate()), 5.0),
+                "conn_main 异常分支未退出")
+            time.sleep(0.2)
+        bc = self._cid_broadcast(cid)
+        # 关键 1：seq=0 只能有一条内容，且必须是 closed，绝不能再发 opened
+        seq0 = [d for d in bc if d.get("seq") == 0]
+        self.assertTrue(seq0, "缺少 seq=0 收尾帧")
+        self.assertEqual(len(seq0), 1, "出现两个 seq=0 帧: %r" % seq0)
+        self.assertTrue(seq0[0].get("closed"),
+                        "seq=0 不是 closed 帧: %r" % seq0)
+        self.assertFalse(any("opened" in d for d in bc),
+                         "收尾后倒序补发 opened: %r" % bc)
+        # 关键 2：异常分支不得再占 seq=1 发 connect_failed
+        self.assertFalse(any(d.get("reason") == "connect_failed"
+                             for d in bc),
+                         "迟到建连异常重复占号: %r" % bc)
+        seqs = [d["seq"] for d in bc if "seq" in d]
+        self.assertEqual(len(seqs), len(set(seqs)), "seq 被重复占用: %r" % seqs)
+
+    # ---- T36：payload 含 __PAYLOAD__ 子串不得破坏注入 ----
+
+    def test_t36_payload_containing_placeholder_is_injected_intact(self):
+        # payload 同时含裸占位符与两个候选锚点，逼替换器选 __PAYLOAD_2__
+        evil = "p__PAYLOAD__q__PAYLOAD_0____PAYLOAD_1____"
+        self.sid = evil
+        self.in_t = "s5/%s/__PAYLOAD__/in" % evil
+        self.out_t = "s5/%s/out" % evil
+        payload = {
+            "sid": self.sid, "in_topic": self.in_t,
+            "out_topic": self.out_t, "frame_max": 16384,
+            "ttl": 300, "heartbeat": self.HB,
+            "connect_timeout": 2.0, "gap_timeout": 15.0}
+        code = scm.build_socks5_start_code(payload)
+        compile(code, "<s5start>", "exec")   # 语法必须完好
+        self.assertNotIn('"__PAYLOAD__"', code,
+                         "裸占位符残留：载荷 JSON 已被破坏")
+        resp = PythonExecutor(globals=self.ns).execute(code)
+        self.assertTrue(resp["ok"],
+                        resp.get("stdout", "") + resp.get("error", ""))
+        self.assertTrue(json.loads(resp["r"])["ok"], resp["r"])
+        self._started = True
+        try:
+            self.assertTrue(_wait_for(lambda: any(
+                isinstance(d, dict) and d.get("hb") is not None
+                for _, d in self.net.frames(self.out_t)), 3.0),
+                "含占位符子串的 sid/topic 会话未正常拉起")
+        finally:
+            self.net.deliver(self.in_t, {"s5": self.sid, "stop": True})
+            self._started = False
+
+    # ---- T38：pub 失败计数会话私有，不跨会话串号 ----
+
+    def test_t38_pub_err_isolated_between_sessions(self):
+        self._start()
+        # 经 s5-hb 线程闭包顺函数型 cell 找到 _pub_fail（它定义在会话
+        # 函数体、被 _pub 闭包引用），调用两次模拟两笔 rc!=0 记账。
+        bump = (
+            "import threading as _th\n"
+            "_seen = set()\n"
+            "_stack = []\n"
+            "for _t0 in _th.enumerate():\n"
+            "    _tg = getattr(_t0, '_target', None)\n"
+            "    if _tg is not None and getattr(_tg, '__name__', '') == '_hb_loop':\n"
+            "        _stack.append(_tg)\n"
+            "_pf = None\n"
+            "while _stack and _pf is None:\n"
+            "    _f = _stack.pop()\n"
+            "    if id(_f) in _seen:\n"
+            "        continue\n"
+            "    _seen.add(id(_f))\n"
+            "    for _nm, _cl in zip(_f.__code__.co_freevars,\n"
+            "                         _f.__closure__ or ()):\n"
+            "        if _nm == '_pub_fail':\n"
+            "            _pf = _cl.cell_contents\n"
+            "        _v = _cl.cell_contents\n"
+            "        if callable(_v) and getattr(_v, '__closure__', None):\n"
+            "            _stack.append(_v)\n"
+            "r = 2 if _pf is not None else 0\n"
+            "if _pf is not None:\n"
+            "    _pf('paho rc=4 testA')\n"
+            "    _pf('paho rc=4 testA')\n")
+        resp = PythonExecutor(globals=self.ns).execute(bump)
+        self.assertTrue(resp["ok"], resp.get("error"))
+        self.assertEqual(resp["r"], 2)
+        self.assertTrue(_wait_for(lambda: any(
+            d.get("hb") is not None and d.get("pe", 0) >= 2
+            for _, d in self.net.frames(self.out_t)), 3.0),
+            "会话 A 心跳未捎带本会话错误数")
+        # 同进程第二个会话：计数必须从 0 起，不继承 A 的历史
+        sid_b = self.sid + "-b"
+        in_b = self.in_t + "-b"
+        out_b = self.out_t + "-b"
+        code_b = scm.build_socks5_start_code({
+            "sid": sid_b, "in_topic": in_b, "out_topic": out_b,
+            "frame_max": 16384, "ttl": 300, "heartbeat": self.HB,
+            "connect_timeout": 2.0, "gap_timeout": 15.0})
+        resp = PythonExecutor(globals=self.ns).execute(code_b)
+        self.assertTrue(resp["ok"])
+        self.assertTrue(json.loads(resp["r"])["ok"])
+        try:
+            self.assertTrue(_wait_for(lambda: any(
+                d.get("hb") is not None and d.get("pe", 0) == 0
+                for _, d in self.net.frames(out_b)), 3.0),
+                "会话 B 继承了会话 A 的 pub 错误计数")
+        finally:
+            self.net.deliver(in_b, {"s5": sid_b, "stop": True})
+
+    # ---- T39：TTL 起点用单调时钟（NTP 步进免疫） ----
+
+    def test_t39_ttl_start_is_monotonic_not_wallclock(self):
+        self._start()
+        v = self._closure_vars("_in_loop", ("_start",))
+        self.assertIn("_start", v)
+        # 墙上时钟现在约 1.7e9；monotonic 是开机秒数，且会话刚启动，
+        # 与当前 monotonic 的差必须在秒级——直接证明源不是 _t.time()。
+        self.assertLess(abs(v["_start"] - time.monotonic()), 5.0,
+                        "_start=%r 不是单调时钟" % v["_start"])
 
 
 # ===================== 第二轮：客户端侧 fakes =====================
@@ -519,7 +925,10 @@ class FakeClientMgr:
 
     def __init__(self, brokers, **kw):
         self.brokers = list(brokers)
-        self.clients = {}
+        # 非空 clients：产品侧以此判定专用连接真正可用；同时记录广播帧
+        # 供"就绪后走专用连接"断言（替代旧的 pass 黑盒）。
+        self.clients = {"fakebroker": object()}
+        self.broadcasts = []
         self.lock = threading.Lock()
         self.stop_ev = threading.Event()
         self.in_wait = threading.Event()
@@ -536,7 +945,7 @@ class FakeClientMgr:
         return True
 
     def publish_broadcast(self, topic, frame):
-        pass
+        self.broadcasts.append((topic, frame))
 
     def stop(self):
         self.stop_ev.set()
@@ -610,8 +1019,13 @@ class ReassemblyOrderingTests(unittest.TestCase):
                         "close() 后交付线程未退出")
 
 
-class ClientSessionFixTests(unittest.TestCase):
-    """修复点 T5/T6/T8/T9/T10/T11：真实 RemoteSocks5 + 真实本地 writer。"""
+class _Socks5SessionHarness:
+    """客户端会话测试公用基建（setUp/tearDown/helper）。
+
+    刻意**不**继承 unittest.TestCase：TestCase 子类会被 discover 收集，
+    而多个具体用例类需要复用同一份 setUp。直接继承 TestCase 会让父类的
+    T5/T6/... 在每个子类里重复跑一遍（会话级用例每个都拉起全套线程）。
+    """
 
     def setUp(self):
         self._old_bl = scm.BROKER_LIST
@@ -649,6 +1063,10 @@ class ClientSessionFixTests(unittest.TestCase):
         with self.tr.lock:
             return [d for _, d in self.tr.published
                     if isinstance(d, dict) and d.get("cid") == cid]
+
+
+class ClientSessionFixTests(_Socks5SessionHarness, unittest.TestCase):
+    """修复点 T5/T6/T8/T9/T10/T11：真实 RemoteSocks5 + 真实本地 writer。"""
 
     # ---- T5：远端正常 closed → clean EOF，不记 local_error ----
 
@@ -844,9 +1262,13 @@ class ClientSessionFixTests(unittest.TestCase):
         self.assertFalse(leftover, "交付/fin 线程残留: %r" % leftover)
 
 
-class Round3FixTests(ClientSessionFixTests):
-    """第三轮修复：hb 地板滚动、重组异常/满队可观测、close 顺序与 _bnet
-    复活竞态、clean EOF 的 fin 立即回收。继承会话级 setUp/tearDown。"""
+class Round3FixTests(_Socks5SessionHarness, unittest.TestCase):
+    """第三/四/五轮修复：hb 地板滚动、重组异常/满队可观测、close 顺序与
+    _bnet 复活竞态、clean EOF 的 fin 立即回收、NACK 移出回调线程、reader
+    兜底、_rt_last 清扫、有界补发队列、bulk 不回退全 broker。
+
+    继承 mixin 只拿 setUp/tearDown/helper；**不**继承 ClientSessionFixTests
+    本身，否则 T5/T6/... 会随父类在本类再跑一遍（每次都重拉全套线程）。"""
 
     @staticmethod
     def _hb_frame(delay_ms):
@@ -862,16 +1284,16 @@ class Round3FixTests(ClientSessionFixTests):
         sess._track_broker("b1", self._hb_frame(300))
         self.assertAlmostEqual(sess.hb_floor, 100, delta=20)
         # 61s 前的异常极小样本（NTP/GC/调度抖动）必须被窗口淘汰。
-        # 产品侧样本随 monotonic 单调 append，历史样本恒在队首，故注入
-        # 用 appendleft 还原真实时序。
-        sess._hb_floor_samples.appendleft((time.monotonic() - 61.0, 1))
+        # 产品侧样本随 monotonic 单调 append，历史样本恒在队首，故经锁内
+        # 钩子 appendleft 注入，还原真实时序且不绕过 _hb_lock 封装。
+        sess._hb_floor_inject(time.monotonic() - 61.0, 1, left=True)
         sess._track_broker("b1", self._hb_frame(500))
         self.assertGreaterEqual(sess.hb_floor, 80,
                                 "过期极小值未淘汰，地板被永久钉死")
         self.assertAlmostEqual(sess.hb_floor, 100, delta=20)
         # 近期样本全部老化后地板随之抬升（会话不再被误限速在最低档）
-        sess._hb_floor_samples.clear()
-        sess._hb_floor_samples.appendleft((time.monotonic() - 61.0, 1))
+        sess._hb_floor_reset()
+        sess._hb_floor_inject(time.monotonic() - 61.0, 1, left=True)
         sess._track_broker("b1", self._hb_frame(500))
         self.assertGreaterEqual(sess.hb_floor, 400)
 
@@ -941,8 +1363,11 @@ class Round3FixTests(ClientSessionFixTests):
     def test_t17_close_stops_threads_no_garbage_no_bnet_revival(self):
         sess, tr = self.sess, self.tr
         sid = sess.sid
-        self.assertTrue(_wait_for(lambda: sess._bnet is not None, 3.0),
-                        "open() 的种子 bulk 连接未建立")
+        # 同时等"对象已赋值"与"就绪事件"：事件在赋值后置位，只看 _bnet
+        # 非 None 理论上存在窗口颠倒，事件是产品侧实际使用的就绪语义。
+        self.assertTrue(_wait_for(
+            lambda: sess._bnet is not None and sess._bulk_ready.is_set(),
+            3.0), "open() 的种子 bulk 连接未就绪")
         n_before = len(FakeClientMgr.constructed)
         sess.close()
         # 身份与连接全部清空
@@ -1303,14 +1728,65 @@ class Round3FixTests(ClientSessionFixTests):
 
     def test_t30_hb_floor_self_filters_without_new_sample(self):
         sess = self.sess
-        sess._hb_floor_samples.append((time.monotonic() - 61.0, 1))
-        sess._hb_floor_samples.append((time.monotonic() - 5.0, 50))
+        sess._hb_floor_inject(time.monotonic() - 61.0, 1)
+        sess._hb_floor_inject(time.monotonic() - 5.0, 50)
         # 不调用 _track_broker（模拟长断网无新 hb）：属性自身过滤
         self.assertEqual(sess.hb_floor, 50)
         # 全部老化 → None（_pace_control 据此跳过，不被旧地板误限速）
-        sess._hb_floor_samples.clear()
-        sess._hb_floor_samples.append((time.monotonic() - 200.0, 1))
+        sess._hb_floor_reset()
+        sess._hb_floor_inject(time.monotonic() - 200.0, 1)
         self.assertIsNone(sess.hb_floor)
+
+    # ---- T37：bulk 未就绪只等待/丢帧，绝不回退主连接全 broker 扇出 ----
+
+    def test_t37_bulk_not_ready_waits_and_never_falls_back(self):
+        sess, tr = self.sess, self.tr
+        self.assertTrue(_wait_for(
+            lambda: sess._bnet is not None and sess._bulk_ready.is_set(),
+            3.0))
+        node = sess._bnet
+        # 强制回到 open() 后 ~4s 热身窗口的"未就绪"状态
+        sess._bnet = None
+        sess._bulk_ready.clear()
+        big = {"s5": sess.sid, "cid": 77, "seq": 1, "d": "Q" * 4096}
+        done = threading.Event()
+
+        def run():
+            sess._bulk_publish(big)
+            done.set()
+
+        with mock.patch.object(scm, "_BULK_READY_WAIT", 0.4):
+            th = threading.Thread(target=run, daemon=True)
+            th.start()
+            # 等待窗口内：线程应阻塞在就绪事件上，而不是立刻回退广播
+            time.sleep(0.15)
+            self.assertTrue(th.is_alive(),
+                            "未就绪时应等待 _bulk_ready，而非立即回退/丢弃")
+            with tr.lock:
+                self.assertFalse(any(
+                    isinstance(d, dict) and d.get("cid") == 77
+                    for _, d in tr.published),
+                    "大帧回退主连接（13× 全 broker 扇出回归）")
+            self.assertTrue(done.wait(3.0), "等待超时后未丢帧返回")
+            # 等够仍不可用：丢帧限频留痕，由服务端 NACK 补洞
+            self.assertTrue(any("丢帧待NACK补发" in m for m in self.logs),
+                            self.logs[-3:])
+            self.assertEqual(node.broadcasts, [],
+                             "未就绪帧误入专用连接")
+        # 就绪后下一帧走专用连接：主连接零新增、零丢帧日志
+        sess._bnet = node
+        sess._bulk_ready.set()
+        before_pub = len(tr.published)
+        before_log = len(self.logs)
+        big2 = dict(big, seq=2)
+        sess._bulk_publish(big2)
+        self.assertEqual(len(node.broadcasts), 1)
+        self.assertIs(node.broadcasts[0][1], big2)
+        with tr.lock:
+            self.assertEqual(len(tr.published), before_pub,
+                             "专用连接就绪仍回退主连接")
+        self.assertEqual(len(self.logs), before_log,
+                         "就绪路径误记丢帧日志")
 
 
 if __name__ == "__main__":

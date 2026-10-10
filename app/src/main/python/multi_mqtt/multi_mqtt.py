@@ -779,7 +779,7 @@ class ConnectionQualityStats:
                 lines.append(row)
 
         lines.append("=" * 90)
-        return "\n".join(lines)
+        return "\n".join(lines)+'\n'
     # [合并线程] _monitor_loop 已彻底删除，其逻辑合并到 MultiMQTTManager._dispatch_loop 中
 
     def _send_pings(self, wait_timeout=0.0):

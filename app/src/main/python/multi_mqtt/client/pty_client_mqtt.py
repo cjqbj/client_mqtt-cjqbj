@@ -83,6 +83,7 @@ fire-and-forget 发一帧 stop，不做 pty.close/transport.stop 那套慢清理
 from __future__ import annotations
 
 import argparse
+import base64
 import codecs
 import io
 import json
@@ -90,7 +91,6 @@ import logging
 import os
 import queue
 import re
-import shlex
 import shutil
 import socket
 import sys
@@ -1348,6 +1348,69 @@ def _strip_ansi(b: bytes) -> str:
     return _ANSI_RE.sub(b"", b).replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("utf-8", "replace")
 
 
+# ==================== AI 命令严格编码（base64 透明传输，任意特殊字符不破裂） ====================
+#
+# 背景（实证根因）：AIBridge.run() 是把一整行文本「敲」进远端**交互式
+# 登录 shell** 的 PTY。旧实现用 ``sh -c '<cmd>'``（shlex.quote，外层单
+# 引号），命令自身的单引号靠 ``'"'"'`` 拼接——在 bash 下通常无碍，但在
+# BusyBox ash 或 PTY→tmux→ssh 多层嵌套等环境里，交互行编辑/多层引号
+# 只要吃掉一层配对，内层命令即被截断，典型现象：
+#   printf '<内容>' >> file  →  printf '' >> file（文件被创建，0 字节）。
+# 而「外层单引号/双引号 + 手工转义」这类方案都必须逐字符对抗**两层 shell
+# 解析 + TTY 行规程**：``$``、`` ` ``、``"``、``\``、``!``（交互 bash
+# 历史展开）、裸换行与控制字节（ICANON 下直接当回车/Ctrl-C），各有各的
+# 坑，无法对任意字节严格无损。
+#
+# 方案（成熟库严格编码）：用标准库 base64 把整条命令编码为纯 ASCII 安全
+# 字符集（A-Za-z0-9+/=，不含任何 shell/TTY 元字符，也不产生裸换行），
+# 远端解码后作为**单个 argv** 交给 sh -c；命令原始字节完全不经过外层交互壳
+# 的引号解析，从根本上消除嵌套破裂面。外层即「双引号包裹」：
+#   sh -c "$(printf '%s' <B64> | <解码管线>)"
+# 双引号内命令替换的结果不再做单词拆分/glob，也不会重新解析替换文本里的
+# 引号/$/反引号，所以 sh 拿到的命令字符串与编码前逐字节一致（仅去掉尾随
+# 换行——对 shell 语义无影响）。解码管线全是固定字面量，内层只用单引号，
+# 与外层双引号不同型、互不嵌套；解码器代码里的括号也在单引号保护内，不会
+# 提前闭合 $( )。
+#
+# 解码器三级回退：base64（coreutils 与 BusyBox 默认都带该 applet）→
+# openssl（enc -d -base64 -A，单行）→ python3/python（远端本来就运行着
+# Python，最终兜底）。已在 bash/dash/ash 语法与 base64/openssl/python
+# 三条解码分支上实测通过。
+
+# 注意：本程序文本必须**不含单引号**（它被单引号裹在 python -c '...' 里），
+# 也不含双引号/$/反引号（外层是 sh -c "..."）；只用字母数字与 . , ; ( )。
+_AI_B64_DECODER_PY = (
+    "import sys,base64;"
+    "sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))"
+)
+_AI_B64_DECODE_PIPELINE = (
+    "{ base64 -d 2>/dev/null"
+    " || openssl enc -d -base64 -A 2>/dev/null"
+    " || python3 -c '%s' 2>/dev/null"
+    " || python -c '%s' 2>/dev/null; }"
+    % (_AI_B64_DECODER_PY, _AI_B64_DECODER_PY)
+)
+
+
+def _build_ai_run_line(cmd: str, begin_tag: str, end_tag: str) -> str:
+    """构造 run() 要敲进远端交互 PTY 的命令行（以 ``\\r`` 结尾）。
+
+    见上方「AI 命令严格编码」块注释：``cmd`` 经 base64 透明传输，远端
+    POSIX shell（sh/bash/ash/dash）解码后交给 ``sh -c``，单双引号、
+    ``$``、反引号、分号、裸换行等任意字符都不会改变命令本体。前置条件
+    （与旧实现相同）：外层登录 shell 为 POSIX 系，且远端至少有
+    base64 / openssl / python 三者之一。
+    """
+    b64 = base64.b64encode(str(cmd).encode("utf-8", "replace")).decode("ascii")
+    # b64 字符全部落在 shell 安全字符集（字母数字 + /+=），printf '%s'
+    # 原样吐出即可，无需再包引号；模板里的 %%s 经 Python % 格式化后是字面 %s。
+    return (
+        'echo %s; sh -c "$(printf \'%%s\' %s | %s)"; __ai_rc=$?; '
+        'echo %s:$__ai_rc\r'
+        % (begin_tag, b64, _AI_B64_DECODE_PIPELINE, end_tag)
+    )
+
+
 class AIBridge:
     """把这个常驻 PTY 暴露给 AI / 外部进程调用，命令全程可见。
 
@@ -1423,7 +1486,11 @@ class AIBridge:
         """在常驻 shell 里跑一条命令，等结束标记，返回 rc/输出；窗口全程可见。
 
         - 超时只停止回收，不杀远端命令（输出继续在窗口里刷，可用 send 干预）；
-        - 退出码取自 ``sh -c '<cmd>'``，外层登录 shell 需为 POSIX 系（sh/bash）。
+        - 退出码取自 ``sh -c "<cmd>"``；命令经 base64 严格编码后透传（见
+          :func:`_build_ai_run_line`），单双引号/``$``/反引号/裸换行等任意
+          特殊字符都不会让外层交互 shell 的引号嵌套破裂。前置条件：外层登录
+          shell 为 POSIX 系（sh/bash/ash/dash），远端有 base64/openssl/python
+          任一解码器。
         """
         pty = self.pty
         if pty is None:
@@ -1438,8 +1505,7 @@ class AIBridge:
         begin = "__AI_BEGIN_%s__" % tag
         end = "__AI_END_%s__" % tag
         q = self._add_listener()
-        line = ("echo %s; sh -c %s; __ai_rc=$?; echo %s:$__ai_rc\r"
-                % (begin, shlex.quote(str(cmd)), end))
+        line = _build_ai_run_line(str(cmd), begin, end)
         buf = b""
         timed_out = False
         m_end = None
@@ -2218,7 +2284,8 @@ def main(argv=None) -> int:
         private_key=args.key, allow_no_pub=args.allow)
     online, total, hosts = _broker_status(transport)
     _info("MQTT 就绪：在线 broker %d/%d，建连耗时 %.1f 秒"
-          % (online, total, time.monotonic() - t_conn)+ ", ".join(hosts))
+      % (online, total, time.monotonic() - t_conn)
+      + ("；在线节点：" + ", ".join(hosts) if hosts else ""))
     # if hosts:
         # _info("在线节点：" + ", ".join(hosts))
     # el

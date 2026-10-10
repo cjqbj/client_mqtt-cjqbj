@@ -251,6 +251,15 @@ def make_text(context, text="", size=14, color=SUB, bold=False, selectable=False
     view.setTextSize(size)
     view.setTextColor(_color(color))
     view.setLineSpacing(dp(context, 2), 1.0)
+    # 关键：显式允许多行/折行，禁止水平滚动，禁用省略号。
+    # 部分 ROM / 大字号下，ScrollView 内的 TextView 若不显式声明，
+    # 会优先横向溢出而不折行，导致右侧字段看不到（如 server_from）。
+    try:
+        view.setHorizontallyScrolling(False)
+        view.setSingleLine(False)
+        view.setEllipsize(None)
+    except Exception:
+        pass
     if bold:
         view.setTypeface(Typeface.DEFAULT, Typeface.BOLD)
     # 结果/日志类文本允许长按选择复制；列表行内文本不要开（会和整行点击抢手势）。

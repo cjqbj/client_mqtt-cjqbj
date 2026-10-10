@@ -198,6 +198,7 @@ private fun ClientMqttScreen() {
     var editingDeviceId by remember { mutableStateOf<String?>(null) }
     var permissions by remember { mutableStateOf(false) }
     var reloadTarget by remember { mutableStateOf<FeatureDescriptor?>(null) }
+    var featureReloadVersions by remember { mutableStateOf(emptyMap<String, Int>()) }
     // 冷启动恢复闸门：Python 端 selected_device_id 恢复完成前，
     // 轮询协程不得用 Kotlin 占位 topic 匹配并覆盖持久化选择。
     var restoreDone by remember { mutableStateOf(false) }
@@ -265,6 +266,11 @@ private fun ClientMqttScreen() {
                 ))
             }
         }
+    }
+
+    fun markFeatureReloaded(featureName: String) {
+        featureReloadVersions = featureReloadVersions +
+            (featureName to ((featureReloadVersions[featureName] ?: 0) + 1))
     }
 
     // 首次进入：以 Python 端持久化的 selected_device_id 为准恢复上次目标，
@@ -658,10 +664,11 @@ private fun ClientMqttScreen() {
                                 modifier = Modifier.fillMaxSize().weight(1f),
                                 beyondViewportPageCount = visibleFeatures.size
                             ) { page ->
-                                key(visibleFeatures[page].name) {
+                                val feature = visibleFeatures[page]
+                                key(feature.name, featureReloadVersions[feature.name] ?: 0) {
                                     // 所有 feature 界面都由 feature_*.py 自绘（ui=python），
                                     // APK 端只保留这一个通用宿主；新增/改版界面只热更脚本。
-                                    PythonViewPage(visibleFeatures[page], service)
+                                    PythonViewPage(feature, service)
                                 }
                             }
                     }
@@ -699,6 +706,7 @@ private fun ClientMqttScreen() {
                             selectedTopic = selectedTopic,
                             onBack = { settings = false },
                             onPermissions = { permissions = true },
+                            onFeatureReloaded = ::markFeatureReloaded,
                             // 设置页"刷新列表"/下载完成后立刻重扫 catalog，
                             // 不必等外层 3s 轮询，新增 feature 当场出现在底栏。
                             onRefreshFeatureList = {
@@ -740,11 +748,17 @@ private fun ClientMqttScreen() {
                             val raw = withContext(Dispatchers.IO) {
                                 service.callAttr("reload_feature", target.name).toString()
                             }
-                            refreshFeatures()
                             val result = JSONObject(raw)
                             if (result.optBoolean("ok")) {
-                                "Reloaded ${target.title}"
+                                markFeatureReloaded(target.name)
+                                try {
+                                    refreshFeatures()
+                                    "Reloaded ${target.title}"
+                                } catch (error: Exception) {
+                                    "Reloaded ${target.title}; feature list refresh failed: ${error.message}"
+                                }
                             } else {
+                                refreshFeatures()
                                 "Reload failed: ${result.optString("error", "unknown error")}"
                             }
                         }.getOrElse { "Reload failed: ${it.message}" }
@@ -1114,6 +1128,7 @@ private fun SettingsPage(
     selectedTopic: String,
     onBack: () -> Unit,
     onPermissions: () -> Unit,
+    onFeatureReloaded: (String) -> Unit,
     onRefreshFeatureList: () -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -1687,6 +1702,7 @@ private fun SettingsPage(
                                         }
                                         val result = JSONObject(response)
                                         downloadStatus = if (result.optBoolean("ok")) {
+                                            onFeatureReloaded(descriptor.name)
                                             "feature_${descriptor.name}.py reloaded."
                                         } else {
                                             "Reload failed: ${result.optString("error", "unknown error")}"

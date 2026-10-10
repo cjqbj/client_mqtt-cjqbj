@@ -21,9 +21,11 @@
 运行：
     cd multi_mqtt && python -m unittest tests.test_pty_mqtt -v
 """
+import base64
 import io
 import json
 import os
+import re
 import struct
 import sys
 import threading
@@ -450,6 +452,95 @@ class PtyCliPreCommandTests(unittest.TestCase):
         self.assertEqual((a.shell, a.heartbeat, a.dead_timeout, a.no_login,
                           a.size, a.interval, a.port),
                          ("/bin/bash", 2.0, 7.0, True, "20x80", 0.5, 0))
+
+
+class AIBridgeRunEncodingTests(unittest.TestCase):
+    """run() 必须把命令用 base64 严格编码进「双引号 sh -c」行，
+    任何特殊字符（单双引号/$/反引号/裸换行/中文）都不能让外层 shell 破裂。"""
+
+    def _extract_b64(self, line):
+        m = re.search(r"printf '%s' ([A-Za-z0-9+/=]*) \|", line)
+        self.assertTrue(m, "行内没有找到 b64 载荷: %r" % line)
+        return m.group(1)
+
+    def test_line_shape_double_quoted_sh_c(self):
+        line = pcm._build_ai_run_line("echo hi", "B", "E")
+        self.assertTrue(line.startswith("echo B; sh -c \"$(printf '%s' "))
+        self.assertIn(")\"; __ai_rc=$?; echo E:$__ai_rc\r", line)
+        self.assertTrue(line.endswith("\r"))
+        # 解码器三级回退（固定字面量，不含用户字节）
+        self.assertIn("base64 -d 2>/dev/null", line)
+        self.assertIn("openssl enc -d -base64 -A 2>/dev/null", line)
+        self.assertIn("python3 -c '%s' 2>/dev/null"
+                      % pcm._AI_B64_DECODER_PY, line)
+        self.assertIn("python -c '%s' 2>/dev/null"
+                      % pcm._AI_B64_DECODER_PY, line)
+
+    def test_payload_roundtrips_for_nasty_commands(self):
+        cases = [
+            "",
+            r"printf 'a\nb\n' >> /tmp/f",
+            "echo \"$x `y` \\\"q\\\" $((1+2)) !;|&# 's'",
+            "a;b|c&d>e<f()  \nsecond line\ttab",
+            "中文 unicode: héllo wörld — 百分号%%",
+            "back\\slash and exclam! history! and tilda~",
+            "nested quotes: '\"'\"'\"'\"' deep",
+        ]
+        for cmd in cases:
+            line = pcm._build_ai_run_line(cmd, "BB", "EE")
+            token = self._extract_b64(line)
+            self.assertEqual(base64.b64decode(token).decode("utf-8"), cmd,
+                             "命令往返不一致: %r" % cmd)
+
+    def test_line_is_tty_safe_printable_ascii(self):
+        # 除结尾回车外，整行必须是纯可打印 ASCII：不能再有裸换行/控制字节，
+        # 否则敲进 ICANON PTY 会被当成回车/Ctrl-C 提前提交。
+        cmd = "printf 'a\\nb\\n'\necho \"$x\""
+        line = pcm._build_ai_run_line(cmd, "B", "E")
+        raw = line.encode("utf-8")
+        self.assertTrue(raw.endswith(b"\r"))
+        body = raw[:-1]
+        body.decode("ascii")  # 非 ASCII 字符（如中文）也必须不出现
+        self.assertNotIn(b"\n", body)
+        self.assertTrue(all(0x20 <= b < 0x7F for b in body),
+                        "行内出现 TTY 控制字符")
+
+    def test_decoder_python_literal_has_no_quote_chars(self):
+        s = pcm._AI_B64_DECODER_PY
+        for ch in "'\"`$\\":
+            self.assertNotIn(ch, s)
+
+    def test_run_sends_built_line_and_collects_markers(self):
+        bridge = pcm.AIBridge()
+        sent = []
+
+        class FakePty:
+            end_reason = None
+
+            def send(self, data):
+                sent.append(bytes(data))
+
+        bridge.attach(FakePty(), None)
+        result = {}
+        t = threading.Thread(
+            target=lambda: result.update(bridge.run("printf 'x\\n'", timeout=3)))
+        t.start()
+        deadline = time.time() + 2
+        while not bridge._listeners and time.time() < deadline:
+            time.sleep(0.01)
+        q = bridge._listeners[0]
+        begin = re.search(rb"__AI_BEGIN_[0-9a-f]+__", sent[0]).group(0).decode()
+        end_tag = begin.replace("BEGIN", "END")
+        # 模拟远端交互 shell 回显 + 输出 + 结束标记
+        q.put(("%s\r\nSTDOUT\r\n%s:0\r\nprompt# "
+                % (begin, end_tag)).encode())
+        t.join(3)
+        self.assertFalse(t.is_alive())
+        self.assertTrue(sent[0].startswith(b"echo __AI_BEGIN_"))
+        self.assertIn(b'sh -c "$(printf \'%s\' ', sent[0])
+        self.assertEqual(result["rc"], 0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["out"], "STDOUT")
 
 
 class BinaryStdoutGuardTests(unittest.TestCase):
