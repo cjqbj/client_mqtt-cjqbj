@@ -54,8 +54,18 @@ class ProbeRunTests(unittest.TestCase):
 
     def test_run_success_reports_platform_fields(self):
         raw_repr = "('/data/data/com.qgb.client/files/python/bin/python', 'angler', 'aarch64', '3.10.108')"
+        response = {
+            "req_id": "20261010_170202.208",
+            "r": raw_repr,
+            "stdout": "",
+            "ok": True,
+            "server_time": 1791622923368,
+            "server_from": "mqtt.loralab.org",
+            "latency_ms": 629.82,
+            "client_from": "mqtt.loralab.org",
+        }
         config_patch, mqtt_patch, fake_mqtt = self._patch_rpc(
-            {"ok": True, "r": raw_repr}
+            response
         )
         with config_patch as device_config, mqtt_patch:
             # 显式传 topic 仍可覆盖默认目标。
@@ -67,6 +77,7 @@ class ProbeRunTests(unittest.TestCase):
         # 耗时不再展示给 UI（需要时在 adb 侧动态插桩）。
         self.assertNotIn("elapsed_ms", result)
         self.assertEqual(result["raw"], raw_repr)
+        self.assertEqual(result["response"], response)
         self.assertEqual(result["executable"], "/data/data/com.qgb.client/files/python/bin/python")
         self.assertEqual(result["node"], "angler")
         self.assertEqual(result["machine"], "aarch64")
@@ -76,6 +87,26 @@ class ProbeRunTests(unittest.TestCase):
         self.assertEqual(kwargs["request_topic"], "q")
         self.assertEqual(kwargs["timeout"], 2.0)
         device_config.assert_called_with(None)
+
+    def test_format_full_displays_complete_rpc_response(self):
+        response = {
+            "req_id": "20261010_170202.208",
+            "stdout": "",
+            "ok": True,
+            "server_time": 1791622923368,
+            "server_from": "mqtt.loralab.org",
+            "latency_ms": 629.82,
+            "client_from": "mqtt.loralab.org",
+        }
+        rendered = feature_probe.format_full(json.dumps({
+            "ok": True,
+            "topic": "sys/device/k12",
+            "response": response,
+        }))
+        for key in response:
+            self.assertIn(repr(key), rendered)
+        self.assertIn("'req_id': '20261010_170202.208'", rendered)
+        self.assertIn("'latency_ms': 629.82", rendered)
 
     def test_run_without_topic_follows_selected_target(self):
         raw_repr = "('/usr/bin/python3', 'k12', 'x86_64', '5.15.0')"

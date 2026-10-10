@@ -203,6 +203,41 @@ def feature_source_info(feature):
     }
 
 
+def feature_file_info(feature):
+    """Return metadata for the file backing the currently loaded feature module."""
+    source = feature_source_info(feature)
+    path = source["module_file"]
+    info = {
+        "module_file": path,
+        "modified": "",
+        "size": None,
+        "sha256": "",
+        "metadata_error": "",
+    }
+    if not source["loaded"]:
+        info["metadata_error"] = "feature module is not loaded"
+        return info
+    if not path:
+        info["metadata_error"] = "loaded module has no file path"
+        return info
+    try:
+        with open(path, "rb") as module_file:
+            stat = os.fstat(module_file.fileno())
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: module_file.read(64 * 1024), b""):
+                digest.update(chunk)
+        info.update({
+            "modified": time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)
+            ),
+            "size": stat.st_size,
+            "sha256": digest.hexdigest(),
+        })
+    except OSError as error:
+        info["metadata_error"] = f"{type(error).__name__}: {error}"
+    return info
+
+
 def list_features():
     names = set(BUILTIN_FEATURES)
     roots = [_UPDATE_DIR, os.path.dirname(__file__)]

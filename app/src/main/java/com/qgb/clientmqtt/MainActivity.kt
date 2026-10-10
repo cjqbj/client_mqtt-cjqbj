@@ -126,6 +126,21 @@ private data class FeatureDescriptor(
     val error: String? = null
 )
 
+private fun formatFeatureFileInfo(info: JSONObject?): String {
+    if (info == null) return "File metadata unavailable"
+    val path = info.optString("module_file").ifBlank { "unknown" }
+    val metadataError = info.optString("metadata_error")
+    if (metadataError.isNotBlank()) {
+        return "Loaded from: $path\nFile metadata unavailable: $metadataError"
+    }
+    return buildString {
+        appendLine("Loaded from: $path")
+        appendLine("Modified: ${info.optString("modified", "unknown")}")
+        appendLine("Size: ${info.optLong("size")} bytes")
+        append("SHA-256: ${info.optString("sha256", "unknown")}")
+    }
+}
+
 // 设置页"下载服务器 feature 列表"的一行：只保留文件名，一行一个。
 private data class ServerFeatureFile(
     val name: String
@@ -200,6 +215,7 @@ private fun ClientMqttScreen() {
     var editingDeviceId by remember { mutableStateOf<String?>(null) }
     var permissions by remember { mutableStateOf(false) }
     var reloadTarget by remember { mutableStateOf<FeatureDescriptor?>(null) }
+    var reloadFileInfo by remember { mutableStateOf("Loading file metadata...") }
     var featureReloadVersions by remember { mutableStateOf(emptyMap<String, Int>()) }
     // 冷启动恢复闸门：Python 端 selected_device_id 恢复完成前，
     // 轮询协程不得用 Kotlin 占位 topic 匹配并覆盖持久化选择。
@@ -213,6 +229,25 @@ private fun ClientMqttScreen() {
     val snackbarHostState = remember { SnackbarHostState() }
     val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
+
+    fun openReloadDialog(feature: FeatureDescriptor) {
+        reloadTarget = feature
+        reloadFileInfo = "Loading file metadata..."
+        scope.launch {
+            val info = runCatching {
+                withContext(Dispatchers.IO) {
+                    JSONObject(service.callAttr("feature_file_info", feature.name).toString())
+                }
+            }.getOrElse { error ->
+                JSONObject()
+                    .put("module_file", feature.moduleFile)
+                    .put("metadata_error", "${error.javaClass.simpleName}: ${error.message}")
+            }
+            if (reloadTarget?.name == feature.name) {
+                reloadFileInfo = formatFeatureFileInfo(info)
+            }
+        }
+    }
 
     fun parseTargets(raw: String) = buildList {
         val array = org.json.JSONArray(raw)
@@ -479,7 +514,7 @@ private fun ClientMqttScreen() {
                                         drawerState.close()
                                     }
                                 },
-                                onLongClick = { reloadTarget = feature }
+                                onLongClick = { openReloadDialog(feature) }
                             )
                             .padding(horizontal = 16.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -536,39 +571,45 @@ private fun ClientMqttScreen() {
     ) {
         Scaffold(
             topBar = {
-                TopAppBar(
-                    title = {
-                        Column {
-                            Text(selectedDevice)
-                            // 名称只作别名，topic 必须同屏可见：
-                            // 避免"选了 sys/device/request 却只显示 Target"的困惑。
-                            Text("$selectedTopic · $onlineStatus", style = MaterialTheme.typography.labelSmall)
+                Column {
+                    TopAppBar(
+                        title = {
+                            Column {
+                                Text(selectedDevice)
+                                // 名称只作别名，topic 必须同屏可见：
+                                // 避免"选了 sys/device/request 却只显示 Target"的困惑。
+                                Text("$selectedTopic · $onlineStatus", style = MaterialTheme.typography.labelSmall)
+                            }
+                        },
+                        actions = {
+                            if (!settings && !targetSettings && !permissions) {
+                                TextButton(onClick = { diagnostics = true }) {
+                                    Text("RPC logs")
+                                }
+                                IconButton(onClick = { scope.launch { drawerState.open() } }) {
+                                    Icon(Icons.Outlined.Menu, contentDescription = "Scripts and targets")
+                                }
+                                IconButton(onClick = {
+                                    editingDeviceId = selectedDeviceId
+                                    targetSettings = true
+                                }) {
+                                    Icon(Icons.Outlined.Tune, contentDescription = "Target settings")
+                                }
+                            }
+                            if (!settings && !targetSettings && !permissions) {
+                                IconButton(onClick = { settings = true }) {
+                                    Icon(Icons.Outlined.Settings, contentDescription = "App settings")
+                                }
+                            }
                         }
-                    },
-                    actions = {
-                        if (!settings && !targetSettings && !permissions) {
-                            TextButton(onClick = { diagnostics = true }) {
-                                Text("RPC logs")
-                            }
-                            IconButton(onClick = { scope.launch { drawerState.open() } }) {
-                                Icon(Icons.Outlined.Menu, contentDescription = "Scripts and targets")
-                            }
-                            IconButton(onClick = {
-                                editingDeviceId = selectedDeviceId
-                                targetSettings = true
-                            }) {
-                                Icon(Icons.Outlined.Tune, contentDescription = "Target settings")
-                            }
-                        }
-                        if (!settings && !targetSettings && !permissions) {
-                            IconButton(onClick = { settings = true }) {
-                                Icon(Icons.Outlined.Settings, contentDescription = "App settings")
-                            }
-                        }
-                    }
-                )
+                    )
+                    SnackbarHost(
+                        snackbarHostState,
+                        modifier = Modifier.padding(horizontal = 16.dp)
+                    )
+                }
             },
-            snackbarHost = { SnackbarHost(snackbarHostState) },
+            snackbarHost = {},
             bottomBar = {
                 if (!settings && !targetSettings && !permissions && !diagnostics && visibleFeatures.isNotEmpty()) {
                     val selectedPage = pagerState.currentPage.coerceIn(0, visibleFeatures.lastIndex)
@@ -594,7 +635,7 @@ private fun ClientMqttScreen() {
                                         onClick = {
                                             pagerScope.launch { pagerState.animateScrollToPage(index) }
                                         },
-                                        onLongClick = { reloadTarget = feature }
+                                        onLongClick = { openReloadDialog(feature) }
                                     ),
                                 horizontalArrangement = Arrangement.Center,
                                 verticalAlignment = Alignment.CenterVertically
@@ -730,10 +771,7 @@ private fun ClientMqttScreen() {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("feature_${feature.name}.py")
                     SelectionContainer {
-                        Text(
-                            "Loaded from: " + (feature.moduleFile.ifBlank { "not loaded yet" }),
-                            style = MaterialTheme.typography.bodySmall
-                        )
+                        Text(reloadFileInfo, style = MaterialTheme.typography.bodySmall)
                     }
                     Text(
                         "Drops sys.modules cache and pyc, then re-imports from py_updates.",
@@ -753,11 +791,12 @@ private fun ClientMqttScreen() {
                             val result = JSONObject(raw)
                             if (result.optBoolean("ok")) {
                                 markFeatureReloaded(target.name)
+                                val fileInfo = formatFeatureFileInfo(result.optJSONObject("file_info"))
                                 try {
                                     refreshFeatures()
-                                    "Reloaded ${target.title}"
+                                    "Reloaded ${target.title}\n$fileInfo"
                                 } catch (error: Exception) {
-                                    "Reloaded ${target.title}; feature list refresh failed: ${error.message}"
+                                    "Reloaded ${target.title}; feature list refresh failed: ${error.message}\n$fileInfo"
                                 }
                             } else {
                                 refreshFeatures()
@@ -1751,7 +1790,8 @@ private fun SettingsPage(
                                         val result = JSONObject(response)
                                         downloadStatus = if (result.optBoolean("ok")) {
                                             onFeatureReloaded(descriptor.name)
-                                            "feature_${descriptor.name}.py reloaded."
+                                            "feature_${descriptor.name}.py reloaded.\n" +
+                                                formatFeatureFileInfo(result.optJSONObject("file_info"))
                                         } else {
                                             "Reload failed: ${result.optString("error", "unknown error")}"
                                         }

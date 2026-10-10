@@ -539,6 +539,11 @@ def builtin_feature_files():
     )
 
 
+def feature_file_info(feature):
+    import bootstrap
+    return json.dumps(bootstrap.feature_file_info(feature), ensure_ascii=False)
+
+
 def reload_feature(feature):
     """Drop the cached feature module and re-import it (long-press action)."""
     import bootstrap
@@ -548,7 +553,12 @@ def reload_feature(feature):
             (item for item in bootstrap.describe_features() if item.get("name") == str(feature)),
             None,
         )
-        return json.dumps({"ok": True, "feature": str(feature), "descriptor": descriptor}, ensure_ascii=False)
+        return json.dumps({
+            "ok": True,
+            "feature": str(feature),
+            "descriptor": descriptor,
+            "file_info": bootstrap.feature_file_info(feature),
+        }, ensure_ascii=False)
     except BaseException as error:
         return json.dumps({
             "ok": False,
@@ -1407,6 +1417,8 @@ def probe_online(device=None, timeout=PROBE_TIMEOUT, topic=None):
         return result
 
     if not isinstance(response, dict) or response.get("r") is None:
+        if isinstance(response, dict):
+            result["response"] = response
         detail = ""
         if isinstance(response, dict):
             detail = str(response.get("error") or "").strip()
@@ -1414,6 +1426,7 @@ def probe_online(device=None, timeout=PROBE_TIMEOUT, topic=None):
         _record_request_end(selected, "probe", False, result["error"])
         return result
 
+    result["response"] = response
     raw = response.get("r")
     result["raw"] = raw
     values = _parse_probe_tuple(raw)

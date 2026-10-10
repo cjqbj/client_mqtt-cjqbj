@@ -19,6 +19,7 @@ server_from / latency_ms / client_from），逐字段一行便于核对；
 'r' 保持原始字符串形式，不做二次解析。
 """
 import json
+import pprint
 
 import client_service
 
@@ -63,11 +64,9 @@ def run(topic=None, timeout=DEFAULT_TIMEOUT):
 
 
 def format_full(raw):
-    """把 RPC 响应格式化成多行 JSON 文本。
+    """优先展示 MQTT RPC 原始响应，保留所有服务端和传输层字段。
 
-    - 只对最外层做 indent=2 美化，'r' 字段保持原样（字符串形式）；
-    - raw 是 str：先 json.loads，失败则原样返回；
-    - 其它情况：repr 兜底。
+    Older probe payloads without a response envelope remain readable.
     """
     data = raw
     if isinstance(data, str):
@@ -80,7 +79,10 @@ def format_full(raw):
         return repr(data)
 
     try:
-        return json.dumps(data, ensure_ascii=False, indent=2)
+        response = data.get("response")
+        if isinstance(response, dict):
+            data = response
+        return pprint.pformat(data, sort_dicts=False, width=80)
     except Exception:
         return repr(data)
 
