@@ -24,7 +24,7 @@ FEATURE = {
 DIAL_TIMEOUT = 20
 HANGUP_TIMEOUT = 15
 STATE_TIMEOUT = 10
-# placeCall 后等 TelecomManager 状态刷新的秒数
+# placeCall 后等 TelecomManager 状态刷新的秒数（用于异步复核，不阻塞 UI）
 STATE_SETTLE = 2.0
 # 每目标最多保留的拨打历史条数
 HISTORY_MAX = 20
@@ -56,8 +56,9 @@ if accounts is None or accounts.size() == 0:
 account = accounts.get(0)
 
 # 已通话时 placeCall 会抛 "already in call"，先自查，报错更清晰
+# 注意：用 0 代替 TelecomManager.CALL_STATE_IDLE，兼容旧版本 Android
 try:
-    if tm.getCallState() != TelecomManager.CALL_STATE_IDLE:
+    if tm.getCallState() != 0:
         raise Exception("Target is already in a call")
 except Exception as e:
     if "already in a call" in repr(e):
@@ -93,7 +94,8 @@ try:
     TelecomManager = jclass("android.telecom.TelecomManager")
     tm = ctx.getSystemService(ctx.TELECOM_SERVICE)
     try:
-        if tm.getCallState() == TelecomManager.CALL_STATE_IDLE:
+        # 用 0 代替 CALL_STATE_IDLE，兼容所有 Android 版本
+        if tm.getCallState() == 0:
             ok = True  # 幂等：本来就没通话，视为成功
     except Exception:
         pass
@@ -131,7 +133,7 @@ if not ok:
         errors.append("phone service: " + repr(e))
 
 r = json.dumps(
-    {{"ok": ok, "errors": [] if ok else errors}},
+    {"ok": ok, "errors": [] if ok else errors},
     ensure_ascii=False,
 )
 '''
@@ -142,17 +144,31 @@ def build_state_code():
 from java import jclass
 
 ActivityThread = jclass("android.app.ActivityThread")
-TelecomManager = jclass("android.telecom.TelecomManager")
 ctx = ActivityThread.currentApplication()
-tm = ctx.getSystemService(ctx.TELECOM_SERVICE)
+
+# 用数字 0/1/2 代替 TelecomManager.CALL_STATE_* 常量，
+# 兼容所有 Android 版本（尤其是 API < 31 的设备）
+state_val = 0  # 默认 idle
+try:
+    TelecomManager = jclass("android.telecom.TelecomManager")
+    tm = ctx.getSystemService(ctx.TELECOM_SERVICE)
+    state_val = tm.getCallState()
+except Exception:
+    try:
+        TelephonyManager = jclass("android.telephony.TelephonyManager")
+        tm = ctx.getSystemService(ctx.TELEPHONY_SERVICE)
+        state_val = tm.getCallState()
+    except Exception:
+        pass
 
 names = {
-    TelecomManager.CALL_STATE_IDLE: "idle",
-    TelecomManager.CALL_STATE_RINGING: "ringing",
-    TelecomManager.CALL_STATE_OFFHOOK: "offhook",
+    0: "idle",
+    1: "ringing",
+    2: "offhook",
 }
+
 try:
-    r = json.dumps({"ok": True, "state": names.get(tm.getCallState(), "unknown")},
+    r = json.dumps({"ok": True, "state": names.get(state_val, "unknown")},
                    ensure_ascii=False)
 except Exception as e:
     r = json.dumps({"ok": False, "error": repr(e)}, ensure_ascii=False)
@@ -217,7 +233,7 @@ def build_view(context):
         "Place / end calls on the target. Tap a history entry to reuse the number."
     )
 
-    # key -> {number, number_loaded, status, active, history, history_loaded}
+    # key -> {number, number_loaded, status, active, history, history_loaded, dial_gen}
     states = {}
     current = {"key": None, "topic": None}
     # 下拉展开状态（同一时刻只有当前目标的列表可见）
@@ -256,7 +272,8 @@ def build_view(context):
     def new_state():
         return {"number": "", "number_loaded": False,
                 "status": "Ready", "active": False,
-                "history": [], "history_loaded": False}
+                "history": [], "history_loaded": False,
+                "dial_gen": 0}
 
     def state_for(key):
         return states.setdefault(key, new_state())
@@ -267,6 +284,28 @@ def build_view(context):
         st = state_for(current["key"])
         status.setText(st["status"])
         hangup_btn.setEnabled(bool(st["active"]))
+
+    # ------------------------------------------------------------------
+    # 兼容解析：bootstrap.call_feature 可能返回 dict 或 str
+    # ------------------------------------------------------------------
+    def parse_feature_result(raw):
+        """兼容 bootstrap.call_feature 可能返回 dict 或 str 的情况"""
+        if isinstance(raw, dict):
+            if "r" in raw:
+                r_val = raw["r"]
+                if isinstance(r_val, str):
+                    try:
+                        return json.loads(r_val)
+                    except Exception:
+                        return {}
+                return r_val
+            return raw
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {}
+        return {}
 
     # ------------------------------------------------------------------
     # 历史下拉渲染（主线程）
@@ -281,7 +320,6 @@ def build_view(context):
             row.setBackgroundColor(pyui_kit.parse_color("#FFFFFF"))
         except Exception:
             pass
-        # 列表行不开文本选择，避免和整行点击抢手势（见 make_text 注释）
         pyui_kit.click(row, lambda n=number: pick_history(n))
         return row
 
@@ -316,7 +354,6 @@ def build_view(context):
         render_history()
 
     def pick_history(number):
-        # 点击历史条目：填回号码并收起下拉，由用户再按 Call 确认拨打
         try:
             number_input.setText(number)
             number_input.setSelection(len(number))
@@ -334,7 +371,7 @@ def build_view(context):
         set_history_open(not history_open["on"])
 
     # ------------------------------------------------------------------
-    # 号码 + 历史持久化：惰性加载（参考 feature_camera 的 *_loaded 模式）
+    # 号码 + 历史持久化：惰性加载
     # ------------------------------------------------------------------
     def load_saved(key):
         st = state_for(key)
@@ -345,10 +382,13 @@ def build_view(context):
 
         def work():
             raw = client_service.feature_settings("dialer", key)
-            try:
-                doc = json.loads(raw)
-            except (TypeError, ValueError):
-                doc = {}
+            if isinstance(raw, dict):
+                doc = raw
+            else:
+                try:
+                    doc = json.loads(raw)
+                except (TypeError, ValueError):
+                    doc = {}
             number = str(doc.get("number", "") or "")
             return number, normalize_history(doc.get("history"))
 
@@ -365,11 +405,9 @@ def build_view(context):
                 render_history()
                 paint()
 
-        # run_async 的 on_ok 回主线程；异常由它兜（§4.1）
         pyui_kit.run_async(work, apply_ok)
 
     def persist(key, number, history):
-        # 一次浅合并写入两个字段，避免号码/历史互相覆盖
         payload = json.dumps(
             {"number": number, "history": history}, ensure_ascii=False
         )
@@ -378,6 +416,37 @@ def build_view(context):
             client_service.update_feature_settings("dialer", payload, key)
 
         pyui_kit.run_async(work)
+
+    # ------------------------------------------------------------------
+    # 异步复核：拨号后延迟查一次真实状态，不锁任何按钮
+    # ------------------------------------------------------------------
+    def check_state_async(key, number, gen):
+        def work():
+            time.sleep(STATE_SETTLE)
+            return bootstrap.call_feature("dialer", "state")
+
+        def apply_ok(raw):
+            if current["key"] != key:
+                return
+            st = state_for(key)
+            if st.get("dial_gen") != gen:
+                return  # 期间用户已挂断/重拨，丢弃这次结果
+            result = parse_feature_result(raw)
+            if not isinstance(result, dict) or not result.get("ok"):
+                return
+            state_name = result.get("state", "unknown")
+            st["active"] = state_name in ("offhook", "ringing")
+            if st["active"]:
+                st["status"] = "In call: %s" % number
+            else:
+                st["status"] = "Dispatched %s (state: %s)" % (number, state_name)
+            paint()
+
+        def apply_error(_error):
+            # 静默失败，不覆盖已有状态
+            pass
+
+        pyui_kit.run_async(work, apply_ok, apply_error)
 
     # ------------------------------------------------------------------
     # Call
@@ -395,50 +464,46 @@ def build_view(context):
 
         st["number"] = number
         st["status"] = "Dialing %s ..." % number
+        # 关键：立即允许挂断，不等 RPC 往返，避免按钮灰色无法操作
+        st["active"] = True
+        st["dial_gen"] += 1
+        gen = st["dial_gen"]
         paint()
         # 先持久号码（网络失败也记住）；历史在确认下发成功后追加
         persist(key, number, st["history"])
 
         def work():
             raw = bootstrap.call_feature("dialer", "dial", number)
-            try:
-                dial_result = json.loads(raw)
-            except Exception:
-                return (pyui_kit.render_result(raw), False, None)
-            if not dial_result.get("ok"):
-                return (pyui_kit.render_result(raw), False, None)
-
-            # placeCall 异步，等 TelecomManager 状态刷新再核对
-            time.sleep(STATE_SETTLE)
-            state_raw = bootstrap.call_feature("dialer", "state")
-            try:
-                state_result = json.loads(state_raw)
-            except Exception:
-                state_result = {}
-            active = state_result.get("state") in ("offhook", "ringing")
-            if active:
-                return ("In call: %s" % number, True, number)
-            # 已下发但状态未刷新，如实显示，让用户按 Refresh 复核
-            return ("Dispatched %s (state: %s)" % (
-                number, state_result.get("state", "unknown")), True, number)
+            return parse_feature_result(raw), raw
 
         def apply_ok(payload):
-            # payload 是 (status_text, active, dialed_number) 元组
-            st["status"], st["active"], dialed = payload
-            if dialed and st["history_loaded"]:
-                st["history"] = history_push(st["history"], dialed)
+            dial_result, raw = payload
+            if st.get("dial_gen") != gen:
+                return  # 用户已挂断/重拨，丢弃
+            if not isinstance(dial_result, dict) or not dial_result.get("ok"):
+                st["active"] = False
+                st["status"] = "Dial failed: %s" % pyui_kit.render_result(raw)
+                paint()
+                return
+            st["status"] = "Dispatched %s — checking state ..." % number
+            if st["history_loaded"]:
+                st["history"] = history_push(st["history"], number)
                 persist(key, st["number"], st["history"])
             render_history()
             paint()
+            # 异步复核真实状态（不锁任何按钮，也不阻塞 UI）
+            check_state_async(key, number, gen)
 
         def apply_error(error):
+            if st.get("dial_gen") != gen:
+                return
             st["active"] = False
             st["status"] = "Dial failed: %s" % error
             paint()
 
         pyui_kit.run_async(
             work, apply_ok, apply_error,
-            buttons=(dial_btn, hangup_btn, refresh_btn),
+            buttons=(dial_btn,),  # 只锁拨号按钮，挂断/刷新保持可用
         )
 
     # ------------------------------------------------------------------
@@ -450,16 +515,15 @@ def build_view(context):
             return
         st = state_for(key)
         st["status"] = "Hanging up ..."
+        # 使进行中的异步状态复核失效，避免挂断后状态被"复活"
+        st["dial_gen"] += 1
         paint()
 
         def work():
             return bootstrap.call_feature("dialer", "hangup")
 
         def apply_ok(raw):
-            try:
-                result = json.loads(raw)
-            except Exception:
-                result = {"ok": False, "error": raw}
+            result = parse_feature_result(raw)
             if result.get("ok"):
                 st["active"] = False
                 st["status"] = "Call ended"
@@ -474,11 +538,11 @@ def build_view(context):
 
         pyui_kit.run_async(
             work, apply_ok, apply_error,
-            buttons=(dial_btn, hangup_btn, refresh_btn),
+            buttons=(dial_btn, hangup_btn),  # 锁拨号+挂断，刷新保持可用
         )
 
     # ------------------------------------------------------------------
-    # Refresh（从设备端拉真实状态）
+    # Refresh（从设备端拉真实状态）—— 不锁任何按钮，始终可点
     # ------------------------------------------------------------------
     def on_refresh():
         key = current["key"]
@@ -490,10 +554,7 @@ def build_view(context):
             return bootstrap.call_feature("dialer", "state")
 
         def apply_ok(raw):
-            try:
-                result = json.loads(raw)
-            except Exception:
-                result = {"ok": False}
+            result = parse_feature_result(raw)
             if result.get("ok"):
                 state_name = result.get("state", "unknown")
                 st["active"] = state_name in ("offhook", "ringing")
@@ -506,10 +567,8 @@ def build_view(context):
             st["status"] = "State query failed: %s" % error
             paint()
 
-        pyui_kit.run_async(
-            work, apply_ok, apply_error,
-            buttons=(dial_btn, hangup_btn, refresh_btn),
-        )
+        # 不传 buttons：Refresh 按钮始终可点，其它按钮也不被锁
+        pyui_kit.run_async(work, apply_ok, apply_error)
 
     pyui_kit.click(history_btn, toggle_history)
     pyui_kit.click(dial_btn, on_dial)
@@ -531,9 +590,7 @@ def build_view(context):
         current["topic"] = topic
         page.set_target("target topic: " + topic)
         st = state_for(key)
-        # 切目标先收起下拉，按新目标历史重建条目
         set_history_open(False)
-        # 切目标时清空输入框，若本地已有号码则填回
         try:
             number_input.setText(st["number"] if st["number_loaded"] else "")
             if st["number"]:
