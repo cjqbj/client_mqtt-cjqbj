@@ -106,9 +106,9 @@ def build_view(context):
     from android.widget import LinearLayout, TextView
 
     page = pyui_kit.Page(context, "Files", "Browse and download files on the target")
-    state = {"root": "/data/data", "boundary": "/data/data", "limit": 100,
+    state = {"root": "/sdcard", "boundary": "/sdcard", "limit": 100,
              "entries": [], "has_more": False, "next_offset": 0, "topic": None,
-             "loading": False}
+             "loading": False, "directory_cache": {}}
 
     # 状态/进度不再放进可滚动的列表区：借用页面固定副标题行
     # （"Browse and download files on the target"），列表上下滚也不会把速度滚没。
@@ -188,6 +188,36 @@ def build_view(context):
         root_line.setText(state["root"])
         load_more.setVisibility(View.VISIBLE if state["has_more"] else View.GONE)
 
+    def directory_key(root):
+        return state["topic"], root.rstrip("/") or "/"
+
+    def cache_current_directory():
+        state["directory_cache"][directory_key(state["root"])] = {
+            "entries": list(state["entries"]),
+            "has_more": state["has_more"],
+            "next_offset": state["next_offset"],
+            "limit": state["limit"],
+            "scroll_y": int(page.scroll.getScrollY()),
+        }
+
+    def restore_directory(root):
+        cached = state["directory_cache"].get(directory_key(root))
+        if cached is None:
+            return False
+        state["root"] = root
+        state["entries"] = list(cached["entries"])
+        state["has_more"] = cached["has_more"]
+        state["next_offset"] = cached["next_offset"]
+        state["limit"] = cached["limit"]
+        render_rows()
+        set_status(
+            "Loaded %d files%s"
+            % (len(state["entries"]), " (more below)" if state["has_more"] else "")
+        )
+        scroll_y = cached["scroll_y"]
+        pyui_kit.on_main(lambda: page.scroll.scrollTo(0, scroll_y))
+        return True
+
     def load_page(start, reset=False):
         if state["loading"]:
             return
@@ -236,8 +266,10 @@ def build_view(context):
         state["has_more"] = False
         state["next_offset"] = 0
         preview.setVisibility(View.GONE)
-        render_rows()
-        load_page(0)
+        if not restore_directory(new_root):
+            page.scroll.scrollTo(0, 0)
+            render_rows()
+            load_page(0)
 
     def on_play_entry(entry):
         """feature 互操作：Files -> Audio，在目标端扬声器播放该音频文件。
@@ -275,10 +307,12 @@ def build_view(context):
 
     def on_entry_click(entry):
         if entry.get("kind") == "directory":
+            cache_current_directory()
             child = state["root"].rstrip("/") + "/" + str(entry.get("path"))
             state["root"] = child
             state["entries"] = []
             state["has_more"] = False
+            page.scroll.scrollTo(0, 0)
             render_rows()
             load_page(0)
             return
@@ -371,9 +405,13 @@ def build_view(context):
         parent = state["root"].rstrip("/").rsplit("/", 1)[0] or "/"
         if len(parent) < len(boundary) or not parent.startswith(boundary.rstrip("/")):
             parent = boundary
+        cache_current_directory()
+        if restore_directory(parent):
+            return
         state["root"] = parent
         state["entries"] = []
         state["has_more"] = False
+        page.scroll.scrollTo(0, 0)
         render_rows()
         load_page(0)
 
@@ -390,8 +428,10 @@ def build_view(context):
     client_service.set_feature_back_handler("files", on_back)
 
     def on_refresh():
+        state["directory_cache"].pop(directory_key(state["root"]), None)
         state["entries"] = []
         state["has_more"] = False
+        page.scroll.scrollTo(0, 0)
         render_rows()
         load_page(0)
 
@@ -419,11 +459,12 @@ def build_view(context):
         page.set_target("target topic: " + topic)
         if state["topic"] is None:
             state["topic"] = topic
-            reset_to(str(cfg.get("remote_root") or "/data/data"))
+            reset_to(str(cfg.get("remote_root") or "/sdcard"))
         elif topic != state["topic"]:
             # 切目标：自动落到新目标的 remote_root 并刷新。
+            cache_current_directory()
             state["topic"] = topic
-            reset_to(str(cfg.get("remote_root") or "/data/data"))
+            reset_to(str(cfg.get("remote_root") or "/sdcard"))
 
     pyui_kit.watch_target(page.root, on_target)
     return page.root

@@ -28,13 +28,14 @@ _STATE = {
     "rpc_logs": [],
     "rpc_health": {},
 }
+DEFAULT_REMOTE_ROOT_OPTIONS = ("/sdcard", "/data/user/0/com.qgb.xime/")
 _DEFAULT_DEVICE = {
     "name": "Target",
     "request_topic": "sys/device/request",
     "private_key": "",
     "allow_no_server_pubkey_response": True,
     "timeout": 10,
-    "remote_root": "/data/data",
+    "remote_root": DEFAULT_REMOTE_ROOT_OPTIONS[0],
     # None/缺省 = 全部 feature 对该目标生效（默认全选）；
     # 显式列表 = 白名单，只有列出的 feature 在该目标显示/可用。
     "enabled_features": None,
@@ -113,6 +114,7 @@ _GLOBAL_FIELDS = (
     "feature_url_root",
     "online_probe_enabled",
     "online_probe_interval",
+    "remote_root_options",
     "scan_limit",
     "selected_device_id",
     # 以下三项此前漏在白名单外，durable 后端保存时被静默丢弃：
@@ -149,7 +151,20 @@ def _is_dir_writable(path):
 
 def _empty_config():
     return {"devices": [_DEFAULT_DEVICE.copy()], "scan_limit": 100,
-            "remote_root": "/data/data"}
+            "remote_root_options": list(DEFAULT_REMOTE_ROOT_OPTIONS)}
+
+
+def _normalize_remote_root_options(value):
+    options = []
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            path = str(item or "").strip()
+            if path and path not in options:
+                options.append(path)
+    for path in DEFAULT_REMOTE_ROOT_OPTIONS:
+        if path not in options:
+            options.append(path)
+    return options
 
 
 def _read_json_file(path):
@@ -911,7 +926,7 @@ def initialize(files_dir):
             # per-topic 存储：aliyun/草稿留在各 device 文档里，不做全局提升。
             for device in devices:
                 device.setdefault("id", uuid.uuid4().hex)
-                device.setdefault("remote_root", "/data/data")
+                device.setdefault("remote_root", DEFAULT_REMOTE_ROOT_OPTIONS[0])
                 if "aliyun" in device and not isinstance(device["aliyun"], dict):
                     device.pop("aliyun", None)
                 if "aliyun_json_draft" in device and not isinstance(
@@ -938,7 +953,7 @@ def initialize(files_dir):
                 ), None)
             for device in devices:
                 device.setdefault("id", uuid.uuid4().hex)
-                device.setdefault("remote_root", config.get("remote_root", "/data/data"))
+                device.setdefault("remote_root", DEFAULT_REMOTE_ROOT_OPTIONS[0])
                 device.pop("aliyun", None)
                 device.pop("aliyun_json_draft", None)
             config["devices"] = devices
@@ -947,6 +962,9 @@ def initialize(files_dir):
                 config["aliyun_json_draft"] = aliyun_draft
         config.setdefault("online_probe_enabled", True)
         config.setdefault("online_probe_interval", 30)
+        config["remote_root_options"] = _normalize_remote_root_options(
+            config.get("remote_root_options")
+        )
         config.pop("remote_root", None)
         saved_selected_id = config.get("selected_device_id")
         selected_device = next(
@@ -989,6 +1007,16 @@ def general_settings():
         "online_probe_enabled": bool(config.get("online_probe_enabled", True)),
         "online_probe_interval": max(5, min(interval, 3600)),
     }, ensure_ascii=False)
+
+
+def remote_root_options():
+    """全局保存的远程根目录下拉选项。"""
+    config = load_config()
+    options = _normalize_remote_root_options(config.get("remote_root_options"))
+    if config.get("remote_root_options") != options:
+        config["remote_root_options"] = options
+        save_config(config)
+    return json.dumps(options, ensure_ascii=False)
 
 
 def update_general_settings(values):
@@ -1070,7 +1098,7 @@ def device_catalog():
         if not device.get("id"):
             device["id"] = uuid.uuid4().hex
             changed = True
-        device.setdefault("remote_root", config.get("remote_root", "/data/data"))
+        device.setdefault("remote_root", DEFAULT_REMOTE_ROOT_OPTIONS[0])
     if changed:
         config["devices"] = devices
         save_config(config)
@@ -1505,7 +1533,9 @@ def update_device_settings(existing_device, values):
             selected["name"] = explicit_name
         elif not selected.get("name") or selected.get("name") == "Target":
             selected["name"] = request_topic.rsplit("/", 1)[-1]
-        selected["remote_root"] = str(values.get("remote_root", "/data/data"))
+        selected["remote_root"] = str(
+            values.get("remote_root", DEFAULT_REMOTE_ROOT_OPTIONS[0])
+        )
         if "enabled_features" in values:
             selected["enabled_features"] = _normalize_enabled_features(
                 values.get("enabled_features")
@@ -1741,9 +1771,11 @@ def rpc(code, device=None, timeout=None):
 
 
 def online(device=None):
-    """周期/手动在线探测入口：固定 2s 轻探针，复用 probe_online，
+    """周期/手动在线探测入口：复用 Probe 页面按目标保存的超时设置和 probe_online，
     不再走吃设备长超时的业务 rpc()。返回与历史调用方兼容的 {ok, result}。"""
-    result = probe_online(device)
+    settings = json.loads(feature_settings("probe", device))
+    timeout = settings.get("timeout", PROBE_TIMEOUT) if isinstance(settings, dict) else PROBE_TIMEOUT
+    result = probe_online(device, timeout=timeout)
     return json.dumps({"ok": bool(result.get("ok")), "result": result}, ensure_ascii=False)
 
 

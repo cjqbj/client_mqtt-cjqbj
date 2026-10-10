@@ -64,6 +64,8 @@ import androidx.compose.material.icons.twotone.Security
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -234,7 +236,7 @@ private fun ClientMqttScreen() {
                 item.optString("id", topic),
                 name,
                 topic,
-                item.optString("remote_root", "/data/data"),
+                item.optString("remote_root", "/sdcard"),
                 enabledFeatures
             ))
         }
@@ -887,7 +889,12 @@ private fun TargetSettingsPage(
     var topic by remember(existingDeviceId) {
         mutableStateOf(if (existingDeviceId == null) "sys/device/request" else "")
     }
-    var remoteRoot by remember(existingDeviceId) { mutableStateOf("/data/data") }
+    var remoteRoot by remember(existingDeviceId) { mutableStateOf("/sdcard") }
+    var remoteRootOptions by remember {
+        mutableStateOf(listOf("/sdcard", "/data/user/0/com.qgb.xime/"))
+    }
+    var remoteRootMenuExpanded by remember { mutableStateOf(false) }
+    var remoteRootOptionsError by remember { mutableStateOf("") }
     var privateKey by remember(existingDeviceId) { mutableStateOf("") }
     var timeout by remember(existingDeviceId) { mutableStateOf("10") }
     var allowNoServerKey by remember(existingDeviceId) { mutableStateOf(true) }
@@ -920,6 +927,21 @@ private fun TargetSettingsPage(
         }
     }
 
+    LaunchedEffect(Unit) {
+        runCatching {
+            val raw = withContext(Dispatchers.IO) {
+                service.callAttr("remote_root_options").toString()
+            }
+            val array = org.json.JSONArray(raw)
+            remoteRootOptions = buildList {
+                for (index in 0 until array.length()) {
+                    val path = array.optString(index).trim()
+                    if (path.isNotEmpty() && path !in this) add(path)
+                }
+            }
+        }.onFailure { remoteRootOptionsError = "Unable to load remote path choices: ${it.message}" }
+    }
+
     LaunchedEffect(deviceId, existingDeviceId) {
         val targetId = deviceId.ifBlank { existingDeviceId ?: return@LaunchedEffect }
         while (true) {
@@ -930,7 +952,7 @@ private fun TargetSettingsPage(
                 if (deviceId.isBlank()) deviceId = config.optString("id", targetId)
                 if (System.currentTimeMillis() - lastLocalEdit >= 1_200L) {
                     topic = config.optString("request_topic", "")
-                    remoteRoot = config.optString("remote_root", "/data/data")
+                    remoteRoot = config.optString("remote_root", "/sdcard")
                     privateKey = config.optString("private_key", "")
                     timeout = config.optString("timeout_draft", config.optString("timeout", "10"))
                     allowNoServerKey = config.optBoolean("allow_no_server_pubkey_response", true)
@@ -995,13 +1017,39 @@ private fun TargetSettingsPage(
             singleLine = true,
             label = { Text("Request topic") }
         )
-        OutlinedTextField(
-            remoteRoot,
-            { remoteRoot = it; lastLocalEdit = System.currentTimeMillis() },
-            Modifier.fillMaxWidth(),
-            singleLine = true,
-            label = { Text("Allowed remote root") }
-        )
+        Box(Modifier.fillMaxWidth()) {
+            OutlinedTextField(
+                remoteRoot,
+                { remoteRoot = it; lastLocalEdit = System.currentTimeMillis() },
+                Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("Allowed remote root") },
+                trailingIcon = {
+                    TextButton(onClick = { remoteRootMenuExpanded = true }) {
+                        Text("Choose")
+                    }
+                }
+            )
+            DropdownMenu(
+                expanded = remoteRootMenuExpanded,
+                onDismissRequest = { remoteRootMenuExpanded = false }
+            ) {
+                remoteRootOptions.forEach { path ->
+                    DropdownMenuItem(
+                        text = { Text(path) },
+                        onClick = {
+                            remoteRoot = path
+                            lastLocalEdit = System.currentTimeMillis()
+                            remoteRootMenuExpanded = false
+                        }
+                    )
+                }
+            }
+        }
+        if (remoteRootOptionsError.isNotBlank()) {
+            Text(remoteRootOptionsError, color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall)
+        }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(
                 privateKey,
