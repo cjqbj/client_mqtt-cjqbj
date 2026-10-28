@@ -102,6 +102,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.chaquo.python.Python
@@ -231,6 +233,18 @@ private fun ClientMqttScreen() {
     val snackbarHostState = remember { SnackbarHostState() }
     val service = remember { Python.getInstance().getModule("client_service") }
     val scope = rememberCoroutineScope()
+    val contentRoot = LocalView.current
+    val focusManager = LocalFocusManager.current
+
+    // 切换目标/重载 feature 会按新的 feature 列表重排 pager 页，被替换掉的页（Python
+    // 自绘界面挂在 AndroidView 里）如果仍有焦点 EditText，移除节点会走
+    // ViewGroup.rootViewRequestFocus → Compose 焦点搜索 → 测量中再次
+    // performMeasureAndLayout，抛 IllegalArgumentException 直接崩溃。所以在任何
+    // 会改动页面列表的入口先清掉 View 层与 Compose 层的焦点。
+    fun clearContentFocus() {
+        contentRoot.findFocus()?.clearFocus()
+        focusManager.clearFocus(force = true)
+    }
 
     fun openReloadDialog(feature: FeatureDescriptor) {
         reloadTarget = feature
@@ -544,6 +558,7 @@ private fun ClientMqttScreen() {
                         selected = selectedTopic == target.requestTopic,
                         onClick = {
                             // 先乐观更新 UI，Python 选择/落盘放到 IO，避免 Chaquopy 调用卡主线程。
+                            clearContentFocus()
                             selectedDeviceId = target.id
                             selectedTopic = target.requestTopic
                             selectedDevice = target.name
@@ -737,10 +752,13 @@ private fun ClientMqttScreen() {
                             existingDeviceId = editingDeviceId,
                             onBack = {
                                 targetSettings = false
+                                // 白名单改动会让当前目标的页面变少，先清焦点再刷新。
+                                clearContentFocus()
                                 // 勾选改动落盘后立刻重拉目录，不等 1s 轮询。
                                 scope.launch { runCatching { refreshTargets() } }
                             },
                             onTargetCreated = { id ->
+                                clearContentFocus()
                                 selectedDeviceId = id
                             }
                         )
@@ -784,6 +802,8 @@ private fun ClientMqttScreen() {
             confirmButton = {
                 TextButton(onClick = {
                     val target = feature
+                    // 重载会换掉整个页面（key 版本 +1），同样先清焦点。
+                    clearContentFocus()
                     reloadTarget = null
                     scope.launch {
                         val message = runCatching {
@@ -837,7 +857,9 @@ private fun PythonViewPage(feature: FeatureDescriptor, service: PyObject) {
                     setTextIsSelectable(true)
                 }
             }
-        }
+        },
+        // 兜底：页面被移除时再清一次 View 焦点，避免 rootViewRequestFocus。
+        onRelease = { it.clearFocus() }
     )
 }
 
