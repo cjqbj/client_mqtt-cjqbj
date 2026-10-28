@@ -19,7 +19,6 @@ server_from / latency_ms / client_from），逐字段一行便于核对；
 'r' 保持原始字符串形式，不做二次解析。
 """
 import json
-import pprint
 
 import client_service
 
@@ -63,30 +62,6 @@ def run(topic=None, timeout=DEFAULT_TIMEOUT):
     return json.dumps(payload, ensure_ascii=False)
 
 
-def format_full(raw):
-    """优先展示 MQTT RPC 原始响应，保留所有服务端和传输层字段。
-
-    Older probe payloads without a response envelope remain readable.
-    """
-    data = raw
-    if isinstance(data, str):
-        try:
-            data = json.loads(data)
-        except Exception:
-            return data
-
-    if not isinstance(data, dict):
-        return repr(data)
-
-    try:
-        response = data.get("response")
-        if isinstance(response, dict):
-            data = response
-        return pprint.pformat(data, sort_dicts=False, width=80)
-    except Exception:
-        return repr(data)
-
-
 def _parse_result(raw):
     """兼容 bootstrap.call_feature 可能返回 dict 或 str 的情况。
 
@@ -127,7 +102,7 @@ def build_view(context):
         context,
         "点按钮向【当前选中目标】发送最小探针；\n"
         "切换目标后按钮上的 topic 和超时会自动跟着变。\n"
-        "结果区按字段逐行展示完整 RPC 响应。",
+        "结果区统一展示 RPC 返回的完整 dict（含 req_id / latency_ms）。",
         selectable=True,
     )
     page.add(result)
@@ -310,8 +285,8 @@ def build_view(context):
             return bootstrap.call_feature("probe", "run", None, t)
 
         def apply_ok(raw):
-            # 多行展示：每个字段一行，'r' 保持原字符串不解析。
-            result.setText(format_full(raw))
+            # 统一展示：与其它 feature 相同的结果渲染（完整 dict + 摘要行）。
+            result.setText(pyui_kit.render_result(raw))
 
         def apply_error(error):
             result.setText("ERROR %s: %s" % (type(error).__name__, error))

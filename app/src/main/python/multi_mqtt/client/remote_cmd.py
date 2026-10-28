@@ -329,6 +329,100 @@ def _cmq_dispatch():
                 pass
             globals().get("_cmq_streams", {}).pop(_sid, None)
 
+    def _tmux_exec(_args):
+        # 远端 tmux 子命令：参数逐项 shlex.quote 后交给 sh，只有一层解析。
+        import shlex as _sx2
+        _p3 = _sp.run(["/bin/sh", "-c",
+                       " ".join(_sx2.quote(str(_x)) for _x in _args)],
+                      stdout=_sp.PIPE, stderr=_sp.PIPE, timeout=20.0)
+        return _p3.returncode, (_p3.stderr or b"")[:300]
+
+    def _tmux_worker(_sid, _cfg, _net):
+        # 后台守护线程：把「send-keys 投递 + pipe-pane 落盘」后的输出在**服务端
+        # 本地**增量读出来，逐帧 publish 到流 topic。客户端只订阅、零往返，
+        # 彻底取代旧形态「客户端每读一次 = 一次完整 RPC 问答」。
+        # 帧沿用 stream 帧格式 {"stream","seq","d"}（d 为 latin-1 承载的原始
+        # 字节），客户端按 seq 重排去重后拼成完整输出；命中结束标记即 done。
+        import re as _re3
+        _ev = globals().get("_cmq_tmux", {}).get(_sid, {}).get("event")
+        _pane = str(_cfg["pane"])
+        _path = str(_cfg["path"])
+        _fmax = max(512, int(_cfg["frame_max"]))
+        _poll = max(0.01, float(_cfg["poll"]))
+        _grace = max(0.2, float(_cfg["grace"]))
+        _end_re = _re3.compile(
+            _re3.escape(str(_cfg["end"]).encode("utf-8")) + rb":(\d+)")
+        _int_re = _re3.compile(rb"(?:^|\r?\n)\^C\r?\n")
+        _deadline = _t.time() + float(_cfg["ttl"])
+        _seq = 0
+        _off = 0
+        _tail = b""
+        _rc = None
+        _reason = "done"
+        _saw_int = False
+        _grace_dl = None
+        try:
+            while _ev is not None and not _ev.is_set():
+                if _t.time() > _deadline:
+                    _reason = "ttl"
+                    break
+                _chunk = b""
+                try:
+                    _sz = _o.path.getsize(_path)
+                except OSError:
+                    _sz = 0
+                if _sz > _off:
+                    try:
+                        with open(_path, "rb") as _fh3:
+                            _fh3.seek(_off)
+                            _chunk = _fh3.read(min(_fmax, _sz - _off))
+                    except OSError:
+                        _chunk = b""
+                if _chunk:
+                    _off += len(_chunk)
+                    try:
+                        _net.publish_broadcast(
+                            _cfg["topic"],
+                            {"stream": _sid, "seq": _seq,
+                             "d": _chunk.decode("latin-1")})
+                    except Exception:
+                        pass
+                    _seq += 1
+                    _win = _tail + _chunk
+                    _m3 = _end_re.search(_win)
+                    if _m3:
+                        _rc = int(_m3.group(1))
+                        break
+                    if not _saw_int and _int_re.search(_win[-128:]):
+                        # 人按 Ctrl-C：前台作业链被整体中止，END 不会出现；
+                        # 给收回显一小段宽限后就结束，客户端据此提前返回。
+                        _saw_int = True
+                        _grace_dl = _t.time() + _grace
+                    _tail = _win[-256:]
+                if _grace_dl is not None and _t.time() >= _grace_dl:
+                    _reason = "interrupted"
+                    break
+                _t.sleep(_poll)
+        except Exception as _e3:
+            _reason = "error: %s" % (_e3,)
+        finally:
+            try:
+                _tmux_exec(["tmux", "pipe-pane", "-t", _pane])
+            except Exception:
+                pass
+            try:
+                _o.remove(_path)
+            except OSError:
+                pass
+            try:
+                _net.publish_broadcast(
+                    _cfg["topic"],
+                    {"stream": _sid, "end": True, "reason": _reason,
+                     "frames": _seq, "rc": _rc})
+            except Exception:
+                pass
+            globals().get("_cmq_tmux", {}).pop(_sid, None)
+
     try:
         _op = _a.get("op")
 
@@ -651,6 +745,79 @@ def _cmq_dispatch():
                  "age": round(_t.time() - _v["started"], 1)}
                 for _k, _v in list(_ss2.items())]}
 
+        elif _op == "tmux_stream":
+            # 一条命令的输出流：同步完成「装管道 + 敲命令」，再起后台线程推流。
+            # 同步阶段出错直接回结构化错误，客户端据此决定回落轮询（旧服务端
+            # 没有本 op 时会回 "unknown op"，同样走回落）。
+            import threading as _th4, shlex as _sx4
+            _net = _find_mqtt_net()
+            if _net is None:
+                raise RuntimeError(
+                    "remote has no reusable MQTT manager (expected gms.mqtt_net)")
+            _sid = str(_a.get("sid") or ("tms-%d" % int(_t.time() * 1000)))
+            _reg = globals().setdefault("_cmq_tmux", {})
+            if _sid in _reg:
+                raise RuntimeError("tmux stream sid already active: %s" % _sid)
+            _pane = str(_a["pane"])
+            _path = str(_a["path"])
+            _line = str(_a["line"])
+            _cfg = {"topic": str(_a.get("topic") or "sys/device/stream"),
+                    "pane": _pane, "path": _path, "line": _line,
+                    "end": str(_a.get("end") or ""),
+                    "frame_max": max(512, int(_a.get("frame_max", 16384))),
+                    "poll": max(0.01, float(_a.get("poll", 0.05))),
+                    "grace": max(0.2, float(_a.get("grace", 1.0))),
+                    "ttl": min(max(5.0, float(_a.get("ttl", 120.0))), 7200.0)}
+            # 顺序必须是「先挂管道，再敲命令」：pipe-pane 只捕获挂载之后的输出。
+            _rcA, _errA = _tmux_exec(
+                ["tmux", "pipe-pane", "-t", _pane,
+                 "cat >> " + _sx4.quote(_path)])
+            if _rcA != 0:
+                raise RuntimeError("tmux pipe-pane failed rc=%s: %s"
+                                   % (_rcA, _errA.decode("utf-8", "replace")))
+            try:
+                _rcB, _errB = _tmux_exec(
+                    ["tmux", "send-keys", "-t", _pane, "-l", "--", _line])
+                if _rcB != 0:
+                    raise RuntimeError("tmux send-keys failed rc=%s: %s"
+                                       % (_rcB, _errB.decode("utf-8", "replace")))
+                _rcC, _errC = _tmux_exec(
+                    ["tmux", "send-keys", "-t", _pane, "Enter"])
+                if _rcC != 0:
+                    raise RuntimeError("tmux send-keys Enter failed rc=%s: %s"
+                                       % (_rcC, _errC.decode("utf-8", "replace")))
+            except Exception:
+                try:
+                    _tmux_exec(["tmux", "pipe-pane", "-t", _pane])
+                except Exception:
+                    pass
+                try:
+                    _o.remove(_path)
+                except OSError:
+                    pass
+                raise
+            _ev4 = _th4.Event()
+            _reg[_sid] = {"event": _ev4, "cfg": _cfg, "started": _t.time()}
+            _th4.Thread(target=_tmux_worker, args=(_sid, _cfg, _net),
+                        daemon=True).start()
+            _res = {"ok": True, "sid": _sid, "topic": _cfg["topic"],
+                    "pane": _pane, "ttl": _cfg["ttl"]}
+
+        elif _op == "tmux_stream_stop":
+            _sid = str(_a["sid"])
+            _ctx = globals().get("_cmq_tmux", {}).get(_sid)
+            if _ctx is not None:
+                _ctx["event"].set()
+            _res = {"ok": True, "sid": _sid, "was_active": _ctx is not None}
+
+        elif _op == "tmux_stream_list":
+            _reg = globals().get("_cmq_tmux", {})
+            _res = {"ok": True, "streams": [
+                {"sid": _k, "pane": _v["cfg"]["pane"],
+                 "topic": _v["cfg"]["topic"],
+                 "age": round(_t.time() - _v["started"], 1)}
+                for _k, _v in list(_reg.items())]}
+
         elif _op == "pull_dir":
             # 整目录打包回传（替代 shell 里的 tar|base64|split 手工流）：
             # 纯标准库 os.walk + tarfile + gzip（mtime=0 确定性输出），
@@ -841,8 +1008,39 @@ def _cmq_pty_start():
         import os as _o, time as _t, threading as _th, traceback as _tb
         if _o.name != "posix":
             raise RuntimeError("PTY 只能在 POSIX 服务端建立，当前系统: %s" % _o.name)
-        import pty as _pty, fcntl as _fc, termios as _te, struct as _st
+        import fcntl as _fc, termios as _te, struct as _st
         import select as _sel, subprocess as _sp, signal as _sg, queue as _qe
+
+        def _pty_openpty():
+            # Android/Chaquopy 的 os 没有 openpty，stdlib pty.py 会退到
+            # 扫 /dev/ptyXY 的 BSD 老接口；Android 只有 Unix98 /dev/ptmx，
+            # 于是必然误报 "out of pty devices"。这里按能力逐级兜底：
+            # os.openpty -> libc openpty -> 直接操作 /dev/ptmx。
+            try:
+                return _o.openpty()
+            except (AttributeError, OSError):
+                pass
+            try:
+                import ctypes as _ct
+                _libc = _ct.CDLL("libc.so", use_errno=True)
+                _pm, _ps = _ct.c_int(), _ct.c_int()
+                if _libc.openpty(_ct.byref(_pm), _ct.byref(_ps),
+                                 None, None, None) == 0:
+                    return _pm.value, _ps.value
+            except Exception:
+                pass
+            # 数值 ioctl：Android 的 termios 模块没有 TIOCSPTLCK/TIOCGPTN
+            _m2 = _o.open("/dev/ptmx", _o.O_RDWR | _o.O_NOCTTY)
+            try:
+                _fc.ioctl(_m2, 0x40045431, _st.pack("i", 0))   # unlockpt
+                _nb = _fc.ioctl(_m2, 0x80045430, _st.pack("I", 0))
+                _sn = _st.unpack("I", _nb)[0]
+                _s2 = _o.open("/dev/pts/%d" % _sn,
+                              _o.O_RDWR | _o.O_NOCTTY)
+            except Exception:
+                _o.close(_m2)
+                raise
+            return _m2, _s2
 
         # 本服务端进程的稳定身份（executor 全局命名空间跨握手持久，同一进程
         # 每次握手拿到同一个 uid）。多个持相同 key 的 server_mqtt 进程（旧
@@ -925,7 +1123,7 @@ def _cmq_pty_start():
             if not _o.path.isdir(_cwd):
                 _cwd = "/"
 
-        _mfd, _sfd = _pty.openpty()
+        _mfd, _sfd = _pty_openpty()
         _fc.ioctl(_sfd, _te.TIOCSWINSZ, _st.pack("HHHH", _rows, _cols, 0, 0))
         _envv = dict(_o.environ)
         _envv["TERM"] = _term
@@ -1845,6 +2043,44 @@ fi
         """列出远端仍在运行的汇报流（诊断用）。"""
         return self._call("stream_list", req_timeout=req_timeout).get("streams", [])
 
+    # ---------- tmux 命令输出流（服务端主动分帧推送，客户端零往返） ----------
+
+    def tmux_stream(self, sid, pane, line, path, end_marker,
+                    topic=DEFAULT_STREAM_TOPIC, ttl=120.0,
+                    frame_max=PTY_FRAME_MAX, poll=0.05, grace=1.0,
+                    req_timeout=30.0) -> dict:
+        """让远端把一条 tmux 命令行产生的输出**主动推送**到 ``topic``。
+
+        远端做的事（全部在服务端进程内，本地 IO，不占客户端往返）：
+
+        1. ``tmux pipe-pane`` 把 ``pane`` 的输出落盘到 ``path``；
+        2. ``send-keys`` 投递 ``line`` + 单独一个 Enter；
+        3. 后台线程按 offset 增量读该文件，每次 ``publish_broadcast`` 一帧
+           ``{"stream": sid, "seq": n, "d": latin-1 字节}``；
+        4. 命中 ``end_marker:<rc>`` 即收尾（结束帧带 ``rc``）；识别到行首
+           ``^C`` 则给 ``grace`` 秒宽限后以 ``reason="interrupted"`` 结束。
+
+        客户端须先用 ``transport.stream_subscribe(topic, handler)`` 订阅，
+        再调用本方法（否则最早几帧会丢）。收尾帧：
+        ``{"stream": sid, "end": True, "reason", "frames", "rc"}``。
+        """
+        return self._call("tmux_stream", req_timeout=req_timeout, sid=sid,
+                          pane=pane, line=line, path=path, end=end_marker,
+                          topic=topic, ttl=ttl, frame_max=frame_max,
+                          poll=poll, grace=grace)
+
+    def tmux_stream_stop(self, sid, req_timeout=10.0) -> dict:
+        """请求远端停止某条输出流（远端随即关管道、删临时文件、发结束帧）。"""
+        try:
+            return self._call("tmux_stream_stop", req_timeout=req_timeout, sid=sid)
+        except Exception:
+            return {"ok": False, "sid": sid}
+
+    def tmux_stream_list(self, req_timeout=20.0) -> list:
+        """列出远端仍在跑的 tmux 输出流（诊断用，便于确认没有泄漏）。"""
+        return self._call("tmux_stream_list",
+                          req_timeout=req_timeout).get("streams", [])
+
     # ---------- 文件传输（仅用于 ≤1MiB 的小文件！） ----------
 
     def read(self, path, allow_large=False) -> bytes:
@@ -2489,18 +2725,19 @@ class RemotePty:
         except Exception:
             pass
 
-    def wait_end(self, timeout=None) -> bool:
-        """阻塞到远端会话结束（或超时）。返回是否已结束。"""
-        return self._end_event.wait(timeout)
+    def leave(self) -> None:
+        """本地脱离：只清理本地订阅/状态，**不发 stop**，远端 shell/tmux
+        原封不动继续跑（孤儿会话由服务端按 TTL 收割，重连可续）。
 
-    def close(self) -> None:
-        """断开：通知服务端停止、取消本地订阅；不停底层 transport/node。"""
-        if self.sid is not None:
-            self.detach()
-            try:
-                self._end_event.wait(1.5)
-            except Exception:
-                pass
+        与 :meth:`detach` / :meth:`close` 的区别：后两者会通知服务端结束
+        会话并 kill 进程组。Ctrl-] / 命令栏 detach 必须走本方法——文档与
+        banner 承诺"本地脱离（远端 tmux/shell 继续运行）"，旧实现复用
+        detach 发 stop，未进 tmux 的裸 shell 前台作业会被 SIGHUP/SIGKILL。
+        """
+        self._cleanup_local()
+
+    def _cleanup_local(self):
+        """close/leave 共用的本地清理：退订输出流、关重排缓冲、复位状态。"""
         if self._handler is not None and self.out_topic is not None:
             try:
                 self.tr.stream_unsubscribe(self.out_topic, self._handler)
@@ -2514,3 +2751,17 @@ class RemotePty:
         self._owner_ready = False
         self._pending_frames = []
         self.foreign_frames = 0
+
+    def wait_end(self, timeout=None) -> bool:
+        """阻塞到远端会话结束（或超时）。返回是否已结束。"""
+        return self._end_event.wait(timeout)
+
+    def close(self) -> None:
+        """断开：通知服务端停止、取消本地订阅；不停底层 transport/node。"""
+        if self.sid is not None:
+            self.detach()
+            try:
+                self._end_event.wait(1.5)
+            except Exception:
+                pass
+        self._cleanup_local()

@@ -31,6 +31,7 @@ import queue
 import logging
 import threading
 import traceback
+import socket
 import socketserver
 import urllib.parse
 import http.client as _http_client
@@ -84,6 +85,31 @@ class _WSGIWFile:
         return self._state['pre'].getvalue()
 
 
+class _CIDict(dict):
+    """大小写不敏感的请求头字典。
+
+    保留原始键名供迭代 / 内省；查找忽略大小写，对齐原生
+    BaseHTTPRequestHandler.headers（email.message.Message）的语义。
+    environ 的 HTTP_* 还原出的键是 'AUTHORIZATION' 这类大写形式，
+    check_basic_auth / RPC 代码用 'Authorization' 查询，普通 dict 会漏。
+    """
+
+    def get(self, key, default=None):
+        for k in self:
+            if k.lower() == str(key).lower():
+                return dict.__getitem__(self, k)
+        return default
+
+    def __getitem__(self, key):
+        for k in self:
+            if k.lower() == str(key).lower():
+                return dict.__getitem__(self, k)
+        raise KeyError(key)
+
+    def __contains__(self, key):
+        return any(k.lower() == str(key).lower() for k in self)
+
+
 class _WSGIHandlerShim:
     """让 RPCRequestHandler.handle_rpc(self) 在 WSGI 下原样运行的薄垫片。
 
@@ -120,11 +146,13 @@ class _WSGIHandlerShim:
             headers['Content-Type'] = environ['CONTENT_TYPE']
         if environ.get('CONTENT_LENGTH'):
             headers['Content-Length'] = environ['CONTENT_LENGTH']
-        self.headers = headers
+        self.headers = _CIDict(headers)
 
-        # 从 RPCRequestHandler 同步类级状态
+        # 从 RPCRequestHandler 同步类级状态（每请求新建 shim，运行期
+        # 动态改动 set_basic_auth / key 后下一请求立即生效）
         self.key = RPCRequestHandler.key
         self.executor = RPCRequestHandler.executor
+        self.basic_auth = RPCRequestHandler.basic_auth
 
         # 响应状态
         self._status = 200
@@ -132,6 +160,11 @@ class _WSGIHandlerShim:
         self.wfile = _WSGIWFile(state)
 
     # ---- BaseHTTPRequestHandler 兼容方法 ---------------------------------
+
+    # handle_rpc 入口的认证门会调 self.check_basic_auth()：直接复用
+    # RPCRequestHandler 的实现（只依赖 basic_auth/headers/send_*/wfile，
+    # shim 均已提供），不复制逻辑。
+    check_basic_auth = RPCRequestHandler.check_basic_auth
 
     def send_response(self, code, message=None):
         self._status = int(code)
@@ -283,6 +316,23 @@ def _build_wsgi_application():
             ])
             return [body]
 
+        # 认证门在所有分支之前：favicon / 重定向 / Range / RPC 都先过
+        # basic_auth，与原生 do_GET 首查对齐。401 由 shim 的 WSGI 语义
+        # 写进提交缓冲（end_headers 已提交，body 是提交后的分块）。
+        state = {
+            'committed': False,
+            'start_response': start_response,
+            'chunks': queue.Queue(),
+            'pre': io.BytesIO(),
+        }
+        shim = _WSGIHandlerShim(environ, state)
+        if not RPCRequestHandler.check_basic_auth(shim):
+            # 同步路径无并发写者，非阻塞排空已写入的分块即可
+            parts = []
+            while not state['chunks'].empty():
+                parts.append(state['chunks'].get_nowait())
+            return parts
+
         # favicon 分支（对应 do_GET 中的同名分支）
         if path == '/favicon.ico' and RPCRequestHandler.favicon_bytes:
             body = RPCRequestHandler.favicon_bytes
@@ -312,15 +362,7 @@ def _build_wsgi_application():
                     environ, start_response, match.group(1), match.group(2))
 
         # 其余路径全部交给原装的 handle_rpc（在线程中执行）
-        state = {
-            'committed': False,
-            'start_response': start_response,
-            'chunks': queue.Queue(),
-            'pre': io.BytesIO(),
-        }
-
         def run():
-            shim = _WSGIHandlerShim(environ, state)
             try:
                 RPCRequestHandler.handle_rpc(shim)
             except Exception:
@@ -380,7 +422,18 @@ application = _build_wsgi_application()
 
 class _ThreadingWSGIServer(socketserver.ThreadingMixIn, WSGIServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # 同 server_http.ThreadedHTTPServer：Windows 上 SO_REUSEADDR 会静默
+    # 双绑正在监听的端口（Linux 只复用 TIME_WAIT），改用 SO_EXCLUSIVEADDRUSE
+    # 让端口被占时启动立即报错，快速失败而不是静默挂死。
+    if sys.platform == 'win32':
+        allow_reuse_address = False
+    else:
+        allow_reuse_address = True
+
+    def server_bind(self):
+        if sys.platform == 'win32':
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 class _QuietHandler(WSGIRequestHandler):

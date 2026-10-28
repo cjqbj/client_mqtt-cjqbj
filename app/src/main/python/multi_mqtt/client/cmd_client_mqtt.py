@@ -532,10 +532,36 @@ def _parse_watch(line):
         rest = toks[2].split(None, 1)
         cmd = rest[1] if len(rest) > 1 else ""
     else:
-        cmd = toks[1] if len(toks) == 2 else toks[2]
+        # split(None, 2) 最多 3 段、第 3 段自带余下原文：必须拼接 toks[1:]。
+        # 旧实现 len(toks)==3 时只取 toks[2]，`watch df -h` 丢掉 "df"、
+        # 实际周期执行的是 "-h"。
+        cmd = " ".join(t for t in toks[1:] if t)
     if not cmd:
         return None
     return interval, cmd
+
+
+def _parse_grep_opts(toks):
+    """解析 %grep 选项（-i/-F/-r/--include），就地消耗已识别 token。
+
+    返回 (opts, err)：err 非 None 表示用法错误（如 --include 缺模式值），
+    调用方应打印 err 并放弃本条命令——旧行为直接对空列表 pop 抛
+    IndexError 穿透 REPL 主循环。
+    """
+    opts = {"ignore_case": False, "fixed": False, "recursive": True, "include": None}
+    while toks and toks[0].startswith("-") and toks[0] != "-":
+        t = toks.pop(0)
+        if t == "-i":
+            opts["ignore_case"] = True
+        elif t == "-F":
+            opts["fixed"] = True
+        elif t == "--include":
+            if not toks:
+                return None, "--include 需要一个模式参数，如 --include '*.py'"
+            opts["include"] = toks.pop(0)
+        elif t in ("-r", "-R"):
+            opts["recursive"] = True
+    return opts, None
 
 
 def _build_shell_prompt(history_path):
@@ -650,18 +676,11 @@ def run_repl(shell: MqttRemoteShell, history_path=None):
 
     def do_grep(arg):
         # 极简解析：支持 -i/-F/-r 和 --include G；其余按 PAT [paths...]
-        opts = {"ignore_case": False, "fixed": False, "recursive": True, "include": None}
         toks = arg.split()
-        while toks and toks[0].startswith("-") and toks[0] != "-":
-            t = toks.pop(0)
-            if t == "-i":
-                opts["ignore_case"] = True
-            elif t == "-F":
-                opts["fixed"] = True
-            elif t == "--include":
-                opts["include"] = toks.pop(0)
-            elif t in ("-r", "-R"):
-                opts["recursive"] = True
+        opts, err = _parse_grep_opts(toks)
+        if err:
+            print_fn(err, color=_cm.C.YELLOW)
+            return
         if not toks:
             print_fn("用法: %grep [-i] [-F] [-r] [--include G] PAT [PATH...]",
                      color=_cm.C.YELLOW)

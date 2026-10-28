@@ -169,6 +169,58 @@ def _attach_class():
     return cls
 
 
+def watch_edit(edit, fn, interval_ms=400):
+    """输入框内容变化时回调 fn(text)，用于「编辑即刻保存」。
+
+    坑：android.text.TextWatcher 经 Chaquopy dynamic_proxy 真机实测不触发
+    （addTextChangedListener 调用成功，但 afterTextChanged 从不回调），
+    所以这里用与 watch_target 同款的「挂窗期间轮询」：只在输入框 attached
+    时跑，离开窗口自动停，feature 侧用法保持不变。
+    """
+    from android.os import Handler, Looper
+
+    handler = Handler(Looper.getMainLooper())
+    state = {"text": None}
+
+    def read_text():
+        try:
+            return edit.getText().toString()
+        except BaseException:  # noqa: BLE001 - 输入框被回收时不能炸
+            return ""
+
+    tick = _runnable_class()()
+
+    def tick_fn():
+        if not edit.isAttachedToWindow():
+            return
+        try:
+            text = read_text()
+            if state["text"] is None:
+                state["text"] = text
+            elif text != state["text"]:
+                state["text"] = text
+                guarded("edit change callback", lambda: fn(text))()
+        except BaseException as error:  # noqa: BLE001 - 轮询 tick 绝不能炸
+            report_feature_error("watch edit", error)
+        handler.postDelayed(tick, interval_ms)
+
+    tick.fn = tick_fn
+
+    def on_attach():
+        # 重新挂窗时刷新基线，避免把程序化 setText 误判成用户编辑。
+        state["text"] = read_text()
+        handler.removeCallbacks(tick)
+        handler.post(tick)
+
+    def on_detach():
+        handler.removeCallbacks(tick)
+
+    edit.addOnAttachStateChangeListener(_attach_class()(on_attach, on_detach))
+    if edit.isAttachedToWindow():
+        state["text"] = read_text()
+        handler.post(tick)
+
+
 def _post(fn):
     """在主线程执行 fn（显式 Runnable 适配器，Chaquopy 不接受裸 callable）。"""
     from android.os import Handler, Looper
@@ -285,6 +337,26 @@ def make_code_edit(context, text="", lines=6):
     view.setMinLines(lines)
     view.setMaxLines(lines * 2)
     view.setTypeface(Typeface.MONOSPACE)
+    view.setHorizontallyScrolling(False)
+    view.setPadding(dp(context, 10), dp(context, 8), dp(context, 10), dp(context, 8))
+    return view
+
+
+def make_text_edit(context, text="", lines=4):
+    """多行普通文本输入框（非等宽）：用于锁屏提示等自由文本。"""
+    from android.text import InputType
+    from android.view import Gravity
+    from android.widget import EditText
+    view = EditText(context)
+    view.setText(str(text))
+    view.setInputType(
+        InputType.TYPE_CLASS_TEXT
+        | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+    )
+    view.setGravity(Gravity.TOP)
+    view.setMinLines(lines)
+    view.setMaxLines(lines * 3)
     view.setHorizontallyScrolling(False)
     view.setPadding(dp(context, 10), dp(context, 8), dp(context, 10), dp(context, 8))
     return view
@@ -520,20 +592,53 @@ def pretty(raw):
     return json.dumps(value, indent=2, ensure_ascii=False)
 
 
-def render_result(raw):
-    """通用结果渲染：结构化 JSON + 目标端原始 stdout/stderr 原样追加。"""
-    parts = [pretty(raw)]
+def rpc_dict(raw):
+    """把 feature 返回统一成 dict（bootstrap.call_feature 的 JSON 字符串或 dict）。"""
+    if isinstance(raw, dict):
+        return raw
     try:
         value = json.loads(raw)
     except (TypeError, ValueError):
-        value = None
-    if isinstance(value, dict):
-        stdout = value.get("_stdout")
-        stderr = value.get("_stderr")
-        if stdout:
-            parts.append("Python stdout:\n" + str(stdout).rstrip())
-        if stderr:
-            parts.append("Python stderr:\n" + str(stderr).rstrip())
+        return {"ok": False, "error": "non-JSON RPC result", "raw": str(raw)[:2000]}
+    return value if isinstance(value, dict) else {"ok": False, "result": value}
+
+
+def result_summary(data):
+    """统一摘要行：ok / latency / req_id（元数据兼容 _rpc 嵌套）。"""
+    parts = []
+    if isinstance(data.get("ok"), bool):
+        parts.append("ok=%s" % ("true" if data["ok"] else "false"))
+    rpc = data.get("_rpc") if isinstance(data.get("_rpc"), dict) else {}
+    latency = data.get("latency_ms", rpc.get("latency_ms"))
+    if latency is not None:
+        parts.append("latency=%sms" % latency)
+    server_from = data.get("server_from", rpc.get("server_from"))
+    if server_from:
+        parts.append(str(server_from))
+    req_id = data.get("req_id", rpc.get("req_id"))
+    if req_id:
+        parts.append("req_id=%s" % req_id)
+    return "RPC  " + "  ".join(parts) if parts else "RPC"
+
+
+def render_result(raw, max_chars=6000):
+    """所有 feature 共用的 RPC 结果渲染：统一摘要行 + 完整返回 dict。
+
+    feature 的 UI 只调用本函数，不再各自拼状态行，保证同一份 RPC 返回
+    在所有页面里的呈现一致（含 req_id / latency_ms / _rpc 元数据）。
+    超长结果按 max_chars 截断，避免一次性塞爆界面。
+    """
+    data = rpc_dict(raw)
+    text = json.dumps(data, indent=2, ensure_ascii=False)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n...[truncated %d chars]" % (len(text) - max_chars)
+    parts = [result_summary(data) + "\n" + text]
+    stdout = data.get("_stdout") or data.get("stdout")
+    stderr = data.get("_stderr") or data.get("stderr")
+    if isinstance(stdout, str) and stdout.strip():
+        parts.append("Python stdout:\n" + stdout.rstrip())
+    if isinstance(stderr, str) and stderr.strip():
+        parts.append("Python stderr:\n" + stderr.rstrip())
     return "\n\n".join(parts)
 
 

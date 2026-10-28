@@ -69,33 +69,13 @@ def eval(code=None, timeout=DEFAULT_TIMEOUT):
         "stderr": result.get("stderr") if isinstance(result.get("stderr"), str) else "",
         "error": result.get("error") if isinstance(result.get("error"), str) else "",
     }
+    # 与其它 feature 统一：保留 RPC 信封元数据（req_id / latency_ms ...）。
+    metadata = {key: result[key] for key in (
+        "req_id", "server_time", "server_from", "latency_ms", "client_from",
+    ) if key in result}
+    if metadata:
+        payload["_rpc"] = metadata
     return json.dumps(payload, ensure_ascii=False)
-
-
-def _format(payload):
-    if not isinstance(payload, dict):
-        return repr(payload)
-    parts = []
-    head = "ok=%s  timeout=%ss  topic=%s" % (
-        payload.get("ok"),
-        payload.get("timeout"),
-        payload.get("topic"),
-    )
-    parts.append(head)
-    error = payload.get("error")
-    if error:
-        parts.append("--- error ---\n%s" % error)
-    stdout = (payload.get("stdout") or "").rstrip()
-    if stdout:
-        parts.append("--- stdout ---\n%s" % stdout)
-    stderr = (payload.get("stderr") or "").rstrip()
-    if stderr:
-        parts.append("--- stderr ---\n%s" % stderr)
-    if payload.get("r") is not None:
-        parts.append("r = %s" % payload.get("r"))
-    if not payload.get("ok") and not (error or stdout or stderr):
-        parts.append("(no output; 检查目标是否在线 / 代码是否把结果放在末行或 r)")
-    return "\n\n".join(parts)
 
 
 def build_view(context):
@@ -157,10 +137,7 @@ def build_view(context):
             )
 
         def apply_ok(raw):
-            try:
-                output.setText(_format(json.loads(raw)))
-            except (TypeError, ValueError):
-                output.setText(str(raw))
+            output.setText(pyui_kit.render_result(raw))
 
         def apply_error(error):
             output.setText("ERROR %s: %s" % (type(error).__name__, error))

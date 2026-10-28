@@ -21,6 +21,7 @@
 运行：
     cd multi_mqtt && python -m unittest tests.test_pty_mqtt -v
 """
+import asyncio
 import base64
 import io
 import json
@@ -344,6 +345,35 @@ class RemotePtyClientTests(unittest.TestCase):
         # resize/detach 在未 open 时静默忽略，不能炸
         pty.resize(24, 80)
         pty.detach()
+        pty.leave()
+
+    def test_leave_detaches_without_stop_frame(self):
+        """本地脱离必须不发 stop：远端 shell/tmux 按承诺继续运行。
+
+        旧行为：Ctrl-] 路径复用 detach() 发 stop 帧，服务端 _in_loop 对
+        进程组 SIGHUP→SIGKILL，未进 tmux 的裸 shell 前台作业被杀。
+        """
+        tr = FakeTransport()
+        pty, _, _, _ = _open_pty(tr, "pty-leave-1")
+        pty.leave()
+        # 全部上行帧里不允许出现 stop（claim 等控制帧可以有）
+        self.assertFalse(any(f.get("stop") for _, f in tr.published),
+                         "leave() 不得发 stop 帧: %r" % tr.published)
+        # 本地订阅已退、状态已复位
+        self.assertIn(("unsub", "pty/pty-leave-1/out"), tr.events)
+        self.assertIsNone(pty.sid)
+        self.assertIsNone(pty.owner)
+        # 幂等：sid 已 None 时再次 leave 无操作
+        pty.leave()
+
+    def test_close_still_sends_stop_frame(self):
+        """close()/detach() 的"结束远端会话"语义不变。"""
+        tr = FakeTransport()
+        pty, _, _, _ = _open_pty(tr, "pty-close-1")
+        pty.close()
+        self.assertTrue(any(f.get("stop") for _, f in tr.published))
+        self.assertIn(("unsub", "pty/pty-close-1/out"), tr.events)
+        self.assertIsNone(pty.sid)
 
     def test_open_timeout_unsubscribes(self):
         tr = FakeTransport(response=None)
@@ -455,8 +485,9 @@ class PtyCliPreCommandTests(unittest.TestCase):
 
 
 class AIBridgeRunEncodingTests(unittest.TestCase):
-    """run() 必须把命令用 base64 严格编码进「双引号 sh -c」行，
-    任何特殊字符（单双引号/$/反引号/裸换行/中文）都不能让外层 shell 破裂。"""
+    """run() 的 base64 编码分支必须把命令严格编码进「双引号 sh -c」行，
+    任何特殊字符（单双引号/$/反引号/裸换行/中文）都不能让外层 shell 破裂；
+    raw 分支（默认）把命令原文交给 shlex.quote 包一层单引号。"""
 
     def _extract_b64(self, line):
         m = re.search(r"printf '%s' ([A-Za-z0-9+/=]*) \|", line)
@@ -464,10 +495,12 @@ class AIBridgeRunEncodingTests(unittest.TestCase):
         return m.group(1)
 
     def test_line_shape_double_quoted_sh_c(self):
-        line = pcm._build_ai_run_line("echo hi", "B", "E")
+        line = pcm._build_ai_run_line_b64("echo hi", "B", "E")
         self.assertTrue(line.startswith("echo B; sh -c \"$(printf '%s' "))
-        self.assertIn(")\"; __ai_rc=$?; echo E:$__ai_rc\r", line)
-        self.assertTrue(line.endswith("\r"))
+        self.assertIn(")\"; __ai_rc=$?; echo E:$__ai_rc", line)
+        # 回车不再拼在行尾：raw/base64 两种行都由投递方（PTY 写 / send-keys
+        # Enter）单独发送，避免行内出现 TTY 控制字符。
+        self.assertNotIn("\r", line)
         # 解码器三级回退（固定字面量，不含用户字节）
         self.assertIn("base64 -d 2>/dev/null", line)
         self.assertIn("openssl enc -d -base64 -A 2>/dev/null", line)
@@ -487,23 +520,32 @@ class AIBridgeRunEncodingTests(unittest.TestCase):
             "nested quotes: '\"'\"'\"'\"' deep",
         ]
         for cmd in cases:
-            line = pcm._build_ai_run_line(cmd, "BB", "EE")
+            line = pcm._build_ai_run_line_b64(cmd, "BB", "EE")
             token = self._extract_b64(line)
             self.assertEqual(base64.b64decode(token).decode("utf-8"), cmd,
                              "命令往返不一致: %r" % cmd)
 
     def test_line_is_tty_safe_printable_ascii(self):
-        # 除结尾回车外，整行必须是纯可打印 ASCII：不能再有裸换行/控制字节，
-        # 否则敲进 ICANON PTY 会被当成回车/Ctrl-C 提前提交。
+        # 整行必须是纯可打印 ASCII：不能有裸换行/控制字节，否则敲进 ICANON
+        # PTY 会被当成回车/Ctrl-C 提前提交。
         cmd = "printf 'a\\nb\\n'\necho \"$x\""
-        line = pcm._build_ai_run_line(cmd, "B", "E")
-        raw = line.encode("utf-8")
-        self.assertTrue(raw.endswith(b"\r"))
-        body = raw[:-1]
-        body.decode("ascii")  # 非 ASCII 字符（如中文）也必须不出现
-        self.assertNotIn(b"\n", body)
-        self.assertTrue(all(0x20 <= b < 0x7F for b in body),
+        line = pcm._build_ai_run_line_b64(cmd, "B", "E")
+        line.encode("utf-8").decode("ascii")  # 非 ASCII 字符（如中文）也必须不出现
+        self.assertNotIn("\n", line)
+        self.assertNotIn("\r", line)
+        self.assertTrue(all(0x20 <= ord(ch) < 0x7F for ch in line),
                         "行内出现 TTY 控制字符")
+
+    def test_raw_line_quotes_cmd_and_leaves_cr_to_sender(self):
+        # raw 模式：人能在窗口里看到命令原文，特殊字符由 shlex.quote 单引号兜住。
+        cmd = "echo it's; echo $HOME; echo '中文'"
+        line = pcm._build_ai_run_line_raw(cmd, "B", "E")
+        self.assertEqual(
+            line,
+            "echo B; sh -c %s; __ai_rc=$?; echo E:$__ai_rc"
+            % __import__("shlex").quote(cmd))
+        self.assertNotIn("\r", line)
+        self.assertIn("'\"'\"'", line)  # 内层单引号已被正确转义
 
     def test_decoder_python_literal_has_no_quote_chars(self):
         s = pcm._AI_B64_DECODER_PY
@@ -529,18 +571,276 @@ class AIBridgeRunEncodingTests(unittest.TestCase):
         while not bridge._listeners and time.time() < deadline:
             time.sleep(0.01)
         q = bridge._listeners[0]
-        begin = re.search(rb"__AI_BEGIN_[0-9a-f]+__", sent[0]).group(0).decode()
+        begin = re.search(rb"__AI_BEGIN_[\w]+__", sent[0]).group(0).decode()
         end_tag = begin.replace("BEGIN", "END")
         # 模拟远端交互 shell 回显 + 输出 + 结束标记
         q.put(("%s\r\nSTDOUT\r\n%s:0\r\nprompt# "
                 % (begin, end_tag)).encode())
         t.join(3)
         self.assertFalse(t.is_alive())
-        self.assertTrue(sent[0].startswith(b"echo __AI_BEGIN_"))
-        self.assertIn(b'sh -c "$(printf \'%s\' ', sent[0])
+        # transport=None → tmux 探测失败 → 回落原生 PTY（raw 模式）
+        self.assertEqual(result["channel"], "pty")
+        expected = pcm._build_ai_run_line_raw("printf 'x\\n'", begin, end_tag)
+        self.assertEqual(sent[0].decode(), expected + "\r")
         self.assertEqual(result["rc"], 0)
         self.assertTrue(result["ok"])
         self.assertEqual(result["out"], "STDOUT")
+
+
+
+class AIBridgePushChannelTests(unittest.TestCase):
+    """服务端主动推送通道：按 seq 重排去重拼装、rc/打断来自结束帧，
+    只在「旧服务端不认识 op」时回落轮询（绝不重复投递命令）。"""
+
+    class FakePty:
+        end_reason = None
+
+    class FakeShell:
+        """替身 RemoteShell：把 tmux_stream 调用变成按脚本发推送帧。"""
+
+        def __init__(self, transport, script=None, error=None):
+            self.tr = transport
+            self.script = script
+            self.error = error
+            self.calls = []
+            self.stopped = []
+            self.topic = None
+
+        def tmux_stream(self, sid, pane, line, path, end_marker, topic,
+                        ttl=120.0, frame_max=None, poll=None, grace=None,
+                        req_timeout=30.0):
+            self.calls.append(dict(sid=sid, pane=pane, line=line, path=path,
+                                   end=end_marker, topic=topic, ttl=ttl))
+            self.topic = topic
+            if self.error is not None:
+                raise self.error
+            if self.script is not None:
+                self.script(self, sid, line, end_marker)
+            return {"ok": True, "sid": sid}
+
+        def tmux_stream_stop(self, sid, req_timeout=10.0):
+            self.stopped.append(sid)
+            return {"ok": True, "sid": sid, "was_active": True}
+
+    def _bridge(self, shell):
+        b = pcm.AIBridge()
+        tr = FakeTransport()
+        b.attach(self.FakePty(), tr)
+        b._shell = shell
+        b._PUSH_START_WAIT = 0.05
+        b._pick_pane = lambda pane=None: "%1"
+        return b, tr
+
+    @staticmethod
+    def _emit(tr, shell, sid):
+        def frame(d, seq=None, **ka):
+            payload = dict(ka)
+            payload["stream"] = sid
+            if seq is not None:
+                payload["seq"] = seq
+                payload["d"] = d
+            tr.emit(shell.topic, payload)
+        return frame
+
+    def test_stream_reorders_dedups_and_returns_rc(self):
+        holder = {}
+
+        def script(shell, sid, line, end_marker):
+            begin = re.search(r"__AI_BEGIN_[\w]+__", line).group(0)
+            emit = self._emit(shell.tr, shell, sid)
+            # 乱序 + 重复：同一帧经多个 broker 各到一份，且后发的可能先到。
+            emit("STDOUT\r\n", seq=1)
+            emit("STDOUT\r\n", seq=1)
+            emit("%s\r\n" % begin, seq=0)
+            emit("%s:0\r\nprompt# " % end_marker, seq=2)
+            emit(None, end=True, reason="done", frames=3, rc=0)
+
+        holder["shell"] = self.FakeShell(None, script=script)
+        b, tr = self._bridge(holder["shell"])
+        holder["shell"].tr = tr
+        self.assertTrue(b._push_ready())
+        res = b.run("true", timeout=3)
+        self.assertEqual(res["channel"], "tmux+push")
+        self.assertEqual(res["rc"], 0)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["out"], "STDOUT")
+        # frames 统计收到的数据帧（含重复副本）；重复不影响输出本身
+        self.assertGreaterEqual(res["frames"], 3)
+        self.assertEqual(res["pane"], "%1")
+        # 结束帧已到 = 服务端 worker 已自行退出并清理管道，客户端不再多发
+        # 一轮 tmux_stream_stop（实测约 0.4s）；只在超时/提前退出时才补停。
+        self.assertFalse(holder["shell"].stopped)
+
+    def test_timeout_stops_remote_worker(self):
+        def script(shell, sid, line, end_marker):
+            begin = re.search(r"__AI_BEGIN_[\w]+__", line).group(0)
+            self._emit(shell.tr, shell, sid)("%s\r\n" % begin, seq=0)
+
+        shell = self.FakeShell(None, script=script)
+        shell.tr = None
+        b, tr = self._bridge(shell)
+        shell.tr = tr
+        res = b.run("sleep 99", timeout=0.4)
+        self.assertTrue(res["timed_out"])
+        # 未命中 END：远端 worker 仍在推流，必须显式停掉避免泄漏
+        self.assertTrue(shell.stopped)
+
+    def test_ctrl_c_routes_to_active_pane(self):
+        sent, calls = [], []
+
+        class P:
+            end_reason = None
+
+            def send(self, data):
+                sent.append(data)
+
+        class R:
+            rc = 0
+            stdout = b""
+
+        b = pcm.AIBridge()
+        b.attach(P(), FakeTransport())
+        b._shell = self.FakeShell(None)
+        b._active_pane = "%7"
+        b._tmux = lambda args: calls.append(list(args)) or R()
+        r = b.send("\x03")
+        self.assertTrue(r.get("interrupt"))
+        self.assertEqual(calls, [["send-keys", "-t", "%7", "C-c"]])
+        self.assertEqual(sent, [])
+        # 没有 AI 命令在跑时，Ctrl-C 仍按原语义写本 PTY
+        b._active_pane = None
+        b.send("\x03")
+        self.assertEqual(sent, [b"\x03"])
+
+    def test_interrupt_end_frame_marks_interrupted(self):
+        def script(shell, sid, line, end_marker):
+            begin = re.search(r"__AI_BEGIN_[\w]+__", line).group(0)
+            emit = self._emit(shell.tr, shell, sid)
+            emit("%s\r\n" % begin, seq=0)
+            emit("partial\r\n^C\r\n", seq=1)
+            emit(None, end=True, reason="interrupted", frames=2, rc=None)
+
+        shell = self.FakeShell(None, script=script)
+        b, tr = self._bridge(shell)
+        shell.tr = tr
+        res = b.run("sleep 99", timeout=3)
+        self.assertEqual(res["channel"], "tmux+push")
+        self.assertTrue(res["interrupted"])
+        self.assertIsNone(res["rc"])
+        self.assertFalse(res["ok"])
+        self.assertIn("partial", res["out"])
+
+    def test_unknown_op_falls_back_to_polling(self):
+        shell = self.FakeShell(None, error=pcm.RemoteOpError("unknown op: 'tmux_stream'"))
+        b, tr = self._bridge(shell)
+        called = {}
+
+        def fake_poll(target, cmd, timeout, begin, end, enc, tag, on_output=None):
+            called.update(target=target, cmd=cmd)
+            return {"ok": True, "channel": "tmux", "rc": 0, "out": "poll"}
+
+        b._run_via_tmux = fake_poll
+        res = b.run("echo hi", timeout=3)
+        self.assertEqual(res["channel"], "tmux")
+        self.assertEqual(called["target"], "%1")
+        self.assertEqual(called["cmd"], "echo hi")
+
+    def test_start_failure_without_op_error_returns_error_not_duplicate(self):
+        shell = self.FakeShell(None, error=pcm.RemoteError("pipe-pane failed"))
+        b, tr = self._bridge(shell)
+        called = []
+        b._run_via_tmux = lambda *a, **k: called.append(1) or {"channel": "tmux"}
+        res = b.run("echo hi", timeout=3)
+        self.assertEqual(res["channel"], "tmux+push")
+        self.assertFalse(res["ok"])
+        self.assertIn("启动失败", res["error"])
+        self.assertEqual(called, [])   # 绝不重复投递同一条命令
+
+    def test_tail_exposes_live_output_while_running(self):
+        release = threading.Event()
+
+        def script(shell, sid, line, end_marker):
+            begin = re.search(r"__AI_BEGIN_[\w]+__", line).group(0)
+            emit = self._emit(shell.tr, shell, sid)
+            emit("%s\r\n" % begin, seq=0)
+            emit("step1\r\n", seq=1)
+            # 模拟长命令：前两帧到齐后挂住，等主线程查完 tail 再收尾
+            threading.Thread(target=lambda: (release.wait(2),
+                                             emit("%s:0\r\n" % end_marker, seq=2)),
+                             daemon=True).start()
+
+        shell = self.FakeShell(None, script=script)
+        b, tr = self._bridge(shell)
+        shell.tr = tr
+        result = {}
+        t = threading.Thread(target=lambda: result.update(b.run("sleep 1", timeout=5)))
+        t.start()
+        self.assertTrue(_wait_until(lambda: b.tail()["total"] > 0, timeout=2))
+        live = b.tail()
+        self.assertEqual(live["channel"], "tmux+push")
+        self.assertIn("step1", live["tail"])
+        release.set()
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(result["rc"], 0)
+
+    def test_transport_without_subscribe_uses_polling(self):
+        b = pcm.AIBridge()
+        b.attach(self.FakePty(), None)
+        b._pick_pane = lambda pane=None: "%1"
+        self.assertFalse(b._push_ready())
+        b._run_via_tmux = lambda *a, **k: {"ok": True, "channel": "tmux"}
+        self.assertEqual(b.run("x", timeout=2)["channel"], "tmux")
+
+
+class AIBridgePaneSelectTests(unittest.TestCase):
+    """_resolve_pane 必须取 session 内 window_index 最小窗口的 active pane，
+    且固化 pane_id（%N）而不是会漂移的 0:0 索引。"""
+
+    def _bridge(self, panes):
+        b = pcm.AIBridge()
+
+        class R:
+            rc = 0
+            stdout = b""
+
+        def fake_tmux(args):
+            r = R()
+            if args[0] == "list-sessions":
+                r.stdout = b"main|2|1700000009\nother|0|1600000000\n"
+            else:
+                r.stdout = panes
+            return r
+
+        b._tmux = fake_tmux
+        return b
+
+    def test_picks_min_window_index_active_pane(self):
+        # 窗口 1 的 active pane 是 %3；窗口 3 更靠后不应被选中
+        b = self._bridge(b"3|0|%5|1\n1|0|%2|0\n1|1|%3|1\n3|1|%6|0\n")
+        self.assertEqual(b._resolve_pane(), "%3")
+        self.assertEqual(b._pane_source, "auto")
+        self.assertTrue(b._tmux_ok)
+        # 固化后再次取用不再解析
+        b._tmux = lambda args: (_ for _ in ()).throw(AssertionError("不应重解析"))
+        self.assertEqual(b._pick_pane(None), "%3")
+
+    def test_no_tmux_returns_none(self):
+        b = pcm.AIBridge()
+        b._tmux = lambda args: None
+        self.assertIsNone(b._resolve_pane())
+        self.assertFalse(b._tmux_ok)
+
+    def test_tmux_output_without_rows_returns_none(self):
+        b = self._bridge(b"")
+        self.assertIsNone(b._resolve_pane())
+        self.assertFalse(b._tmux_ok)
+
+    def test_pick_encoding_degrades_on_control_bytes(self):
+        b = pcm.AIBridge()
+        self.assertEqual(b._pick_encoding("echo hi", None), "raw")
+        self.assertEqual(b._pick_encoding("echo a\nb", None), "base64")
+        self.assertEqual(b._pick_encoding("echo hi", "base64"), "base64")
 
 
 class BinaryStdoutGuardTests(unittest.TestCase):
@@ -854,6 +1154,33 @@ class PtyMagicBarTests(unittest.TestCase):
         self.assertEqual(ctx["live"]["heartbeat"], 0.0)
         pcm._run_magic("ttl 10", ctx)
         self.assertEqual(ctx["live"]["ttl"], 60.0)  # 下限夹取
+
+    def test_heartbeat_hot_tune_links_dead_timeout(self):
+        """热调 heartbeat 必须按开局规则联动 dead_timeout。
+
+        旧行为只改 live["heartbeat"]：热调 heartbeat 0 / 调大后，静默
+        shell 超过陈旧的 dead_timeout 即被误判服务器已死强制退出。
+        """
+        _, _, ctx = self._ctx()   # 初始 heartbeat=5, dead_timeout=15
+        _, lines = pcm._run_magic("heartbeat 300", ctx)
+        self.assertEqual(ctx["live"]["heartbeat"], 300.0)
+        self.assertEqual(ctx["live"]["dead_timeout"], 900.0)  # max(15, 3*300)
+        self.assertTrue(any("联动" in x for x in lines))
+        # 关闭心跳 → 同步停止判死（开局同一规则）
+        _, lines = pcm._run_magic("heartbeat 0", ctx)
+        self.assertEqual(ctx["live"]["heartbeat"], 0.0)
+        self.assertEqual(ctx["live"]["dead_timeout"], 0.0)
+        self.assertTrue(any("不再判死" in x for x in lines))
+        # 判死被显式关闭时开心跳：保持关闭（尊重用户显式选择）
+        pcm._run_magic("heartbeat 10", ctx)
+        self.assertEqual(ctx["live"]["heartbeat"], 10.0)
+        self.assertEqual(ctx["live"]["dead_timeout"], 0.0)
+        # 显式重开判死后恢复 3×心跳下限联动
+        pcm._run_magic("dead 20", ctx)
+        pcm._run_magic("heartbeat 5", ctx)
+        self.assertEqual(ctx["live"]["dead_timeout"], 20.0)  # max(20, 15)
+        pcm._run_magic("heartbeat 10", ctx)
+        self.assertEqual(ctx["live"]["dead_timeout"], 30.0)  # max(20, 30)
 
     def test_local_dead_timeout_no_frame(self):
         tr, _, ctx = self._ctx()
@@ -1660,6 +1987,7 @@ class SelectionAutoUnstickTests(unittest.TestCase):
         time.sleep(0.08)
         self.assertEqual(pcm._filter_injected_esc(b"\x1b"), b"\x1b")
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows console API only")
     def test_cancel_only_when_console_is_foreground(self):
         import ctypes
         k = ctypes.windll.kernel32
@@ -1671,6 +1999,7 @@ class SelectionAutoUnstickTests(unittest.TestCase):
             self.assertFalse(pcm._cancel_console_selection())
             kb.assert_not_called()  # 非前台绝不发 ESC（会打进别的程序）
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows console API only")
     def test_cancel_sends_esc_down_up_and_arms_guard(self):
         import ctypes
         k = ctypes.windll.kernel32
@@ -1690,6 +2019,7 @@ class SelectionAutoUnstickTests(unittest.TestCase):
         with mock.patch.object(pcm.sys, "platform", "linux"):
             self.assertFalse(pcm._cancel_console_selection())
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows console API only")
     def test_enable_vt_does_not_touch_input_mode(self):
         # 回归：QuickEdit 必须保留——_enable_output_vt 只许操作输出句柄
         import ctypes
@@ -2136,5 +2466,173 @@ class LogConsoleEndToEndTests(unittest.TestCase):
             self.assertIn("e2e-logging-marker-92", text)
 
 
+class McpProgressTokenTests(unittest.TestCase):
+    """MCP 进度是**按请求**协商的：只有 _meta.progressToken 存在才上报。"""
+
+    def test_no_ctx_means_no_progress(self):
+        self.assertIsNone(pcm._mcp_progress_token(None))
+
+    def test_dict_meta_token(self):
+        class Ctx:
+            class request_context:
+                meta = {"progressToken": "tok-abc"}
+
+        class CtxSnake:
+            class request_context:
+                # mcp 2.x 真实运行时就是这个形态：SDK 把 progressToken
+                # 归一化成 progress_token，只查驼峰会永远判无进度。
+                meta = {"progress_token": "tok-snake"}
+
+        class CtxIntToken:
+            class request_context:
+                meta = {"progress_token": 0}
+
+        self.assertEqual(pcm._mcp_progress_token(Ctx()), "tok-abc")
+        self.assertEqual(pcm._mcp_progress_token(CtxSnake()), "tok-snake")
+        # token 允许 int，0 是合法值，不能被 or 短路吞掉
+        self.assertEqual(pcm._mcp_progress_token(CtxIntToken()), 0)
+
+    def test_object_meta_token_and_missing(self):
+        class Meta:
+            progressToken = "tok-obj"
+
+        class Ctx:
+            request_context = type("RC", (), {"meta": Meta()})()
+
+        class CtxNoToken:
+            request_context = type("RC", (), {"meta": None})()
+
+        class CtxNoRequest:
+            @property
+            def request_context(self):
+                raise ValueError("Context is not available outside of a request")
+
+        self.assertEqual(pcm._mcp_progress_token(Ctx()), "tok-obj")
+        self.assertIsNone(pcm._mcp_progress_token(CtxNoToken()))
+        self.assertIsNone(pcm._mcp_progress_token(CtxNoRequest()))
+
+    def test_last_line_keeps_tail(self):
+        self.assertEqual(pcm._mcp_last_line("a\nT3\r\n"), "T3")
+        self.assertEqual(pcm._mcp_last_line(""), "")
+
+
+class DollarEncodingTests(unittest.TestCase):
+    """多行命令的可读编码：raw / $'...' / base64 的选择与转义。"""
+
+    def test_dollar_quote_escapes(self):
+        self.assertEqual(pcm._dollar_quote("a\nb"), "$'a\\nb'")
+        self.assertEqual(pcm._dollar_quote("a\tb"), "$'a\\tb'")
+        self.assertEqual(pcm._dollar_quote("it's"), "$'it\\'s'")
+        self.assertEqual(pcm._dollar_quote("a\\b"), "$'a\\\\b'")
+        self.assertEqual(pcm._dollar_quote("\x01"), "$'\\x01'")
+        # 产出的必须是单行，不能带任何裸控制字节
+        quoted = pcm._dollar_quote("a\nb\tc\r\x01")
+        self.assertNotIn("\n", quoted)
+        self.assertNotIn("\t", quoted)
+        self.assertNotIn("\r", quoted)
+
+    def test_pick_encoding_matrix(self):
+        br = pcm.AIBridge()
+        # 没有需要转义的字符：保持原文（与 shell 无关）
+        self.assertEqual(br._pick_encoding("echo hi", None), "raw")
+        # 有换行 + bash 家族 → dollar；dash/未知 → base64（绝不猜）
+        br.set_shell("/bin/bash")
+        self.assertEqual(br._pick_encoding("a\nb", None), "dollar")
+        self.assertEqual(br._pick_encoding("a\x01b", None), "dollar")
+        br.set_shell("/bin/dash")
+        self.assertEqual(br._pick_encoding("a\nb", None), "base64")
+        br.set_shell("")
+        self.assertEqual(br._pick_encoding("a\nb", None), "base64")
+        # 显式模式：dollar 强制生效，但 NUL 无法表示 → base64
+        self.assertEqual(br._pick_encoding("a\nb", "dollar"), "dollar")
+        self.assertEqual(br._pick_encoding("a\x00b", "dollar"), "base64")
+        self.assertEqual(br._pick_encoding("echo hi", "base64"), "base64")
+        br.set_shell("/usr/bin/zsh")
+        self.assertEqual(br._pick_encoding("a\nb", None), "dollar")
+
+    def test_build_line_dollar_is_single_readable_line(self):
+        line = pcm.AIBridge._build_line("echo 1\necho 2", "__B__", "__E__",
+                                        "dollar")
+        self.assertIn("$'echo 1\\necho 2'", line)
+        self.assertNotIn("\n", line)
+        self.assertTrue(line.startswith("echo __B__; sh -c $'"))
+
+    def test_shell_basename(self):
+        self.assertEqual(pcm._shell_basename("/bin/bash"), "bash")
+        self.assertEqual(pcm._shell_basename("-bash"), "bash")
+        self.assertEqual(pcm._shell_basename(""), "")
+
+
+class McpWaitTests(unittest.IsolatedAsyncioTestCase):
+    """pty_run(wait=...) 提前返回时必须让 AI 一眼看出"没跑完、结果不完整"。"""
+
+    def test_partial_result_flags(self):
+        st = {"tail": "T1\nT2", "elapsed": 3.1, "total": 7, "channel": "tmux+push"}
+        res = pcm._mcp_partial_result(st, 3.0)
+        self.assertIs(res["ok"], False)
+        self.assertIs(res["completed"], False)
+        self.assertIs(res["partial"], True)
+        self.assertIs(res["running"], True)
+        self.assertIs(res["wait_exceeded"], True)
+        self.assertIsNone(res["rc"])
+        self.assertEqual(res["out"], "T1\nT2")
+        self.assertEqual(res["wait_seconds"], 3.0)
+        self.assertIn("不完整", res["error"])
+        self.assertIn("pty_tail", res["next_action"])
+
+    def test_partial_result_trims_command_echo(self):
+        # tmux raw 回显里带字面量 END 标记，正文必须从 BEGIN 行之后开始
+        st = {"tail": "echo __AI_BEGIN_20261028_074840_930__; sh -c 'x'; "
+                      "echo __AI_END_20261028_074840_930__:$__ai_rc\n"
+                      "__AI_BEGIN_20261028_074840_930__\nT1\nT2\n",
+              "total": 100}
+        res = pcm._mcp_partial_result(st, 3.0)
+        self.assertEqual(res["out"], "T1\nT2")
+        self.assertNotIn("$__ai_rc", res["out"])
+
+    async def test_wait_zero_returns_running_snapshot(self):
+        fut = asyncio.get_running_loop().create_future()  # 永不完成，模拟长命令
+        st = {"tail": "TICK1", "elapsed": 0.1, "total": 6, "channel": "tmux+push"}
+        started = time.monotonic()
+        result, snap = await pcm._mcp_await_run(
+            fut, 0, None, None, tail_fn=lambda n: dict(st))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIsNone(result)
+        self.assertEqual(snap["tail"], "TICK1")
+        partial = pcm._mcp_partial_result(snap, 0)
+        self.assertIs(partial["completed"], False)
+
+    async def test_wait_positive_returns_result_when_finished(self):
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result({"ok": True, "rc": 0, "out": "done"})
+        result, snap = await pcm._mcp_await_run(
+            fut, 3, None, None, tail_fn=lambda n: {"tail": ""})
+        self.assertEqual(result, {"ok": True, "rc": 0, "out": "done"})
+        self.assertIsNone(snap)
+
+    async def test_default_wait_blocks_until_done(self):
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result({"ok": True, "rc": 1, "out": "boom"})
+        result, snap = await pcm._mcp_await_run(
+            fut, -1, None, None, tail_fn=lambda n: {"tail": ""})
+        self.assertEqual(result["rc"], 1)
+        self.assertIsNone(snap)
+
+    async def test_progress_reported_while_waiting(self):
+        fut = asyncio.get_running_loop().create_future()  # 永不完成
+        calls = []
+
+        class Ctx:
+            async def report_progress(self, progress, total=None, message=None):
+                calls.append((progress, total, message))
+
+        await pcm._mcp_await_run(
+            fut, 0, "tok-1", Ctx(),
+            tail_fn=lambda n: {"tail": "T1", "elapsed": 0.5, "total": 202})
+        self.assertGreaterEqual(len(calls), 1)
+        self.assertIn("T1", calls[0][2])
+
+
 if __name__ == "__main__":
     unittest.main()
+

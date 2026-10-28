@@ -1,4 +1,29 @@
+"""浏览器实时双向编辑服务器文件；可直接 import，由已在运行的 server_http RPC 服务打开。
+
+无需命令行启动：只要服务器（server_mqtt.py / server_http.py）已在跑，浏览器访问
+URL 即代码，等价于执行 ``import realtime_editor;realtime_editor.html(response,file='/tmp/txt')``：
+
+    http://192.168.1.12:1177/import%20realtime_editor;realtime_editor.html(response,file=/tmp/txt)
+
+路径可不加引号：server_http.handle_rpc 对整段语法错误的代码有裸路径救援，
+会把表达式起始位置的 /tmp/txt、C:/x/y 自动补引号后重试。
+
+文件不存在时自动创建（含父目录）。同一文件多次打开复用同一 Editor，多个标签页
+互相同步；不同文件各得独立 WebSocket 路由 /ws/realtime_editor/<md5前12位>，
+处理函数在首次打开时动态注册进 server_http.RPCRequestHandler.websocket_handlers
+（类属性字典，请求期实时可见），因此模块被 URL import 的同时即可收 WebSocket
+连接，不依赖启动参数 websocket_handler，也无需重启服务。
+
+RPC 入口（p / response 由 server_http.handle_rpc 注入）：
+    realtime_editor.html(p)                  编辑默认文件 default_file
+    realtime_editor.html(p, '/tmp/txt')      位置参数亦可
+    realtime_editor.status(p)                列出已打开文件、ws 路由、客户端数、revision
+
+命令行独立跑（兼容旧用法）：
+    python realtime_editor.py 文本文件 [--port 1133] [--host 0.0.0.0]
+"""
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -7,10 +32,16 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-#import rpc
 import server_http
 
 logger = logging.getLogger(__name__)
+
+# html(p) 未传 file 时编辑的文件；main() 会把它替换成命令行参数
+default_file = 'realtime_editor.txt'
+
+# str(绝对路径) -> Editor；同一文件的多次打开复用同一实例
+_editors = globals().setdefault('_editors', {})  # setdefault 防 importlib.reload：reload 复用同一模块 __dict__ 重执行顶层，普通赋值把名字重绑到空 dict——已开编辑器（带活 WS 推送连接）变孤儿、同一文件再开时新建第二个 Editor 双实例并发写
+_editors_lock = globals().setdefault('_editors_lock', threading.RLock())  # 锁必须与表一起 setdefault：reload 重造新锁对象后，已攥旧锁的线程与拿新锁的线程互不排斥、同时进临界区
 
 PAGE = r'''<!doctype html>
 <html lang="zh-CN">
@@ -36,6 +67,8 @@ footer { height: 30px; flex: 0 0 30px; display: flex; align-items: center; gap: 
 <footer><span id="state">连接中...</span><span id="latency">延迟 --</span><span id="server-time">服务器时间 --</span> <div class="title" id="filename"></div> </footer>
 <script>
 const fileName = __FILE_NAME__;
+// 本页对应的 WebSocket 路由，按文件分发：/ws/realtime_editor/<md5前12位>
+const wsPath = __WS_PATH__;
 const editor = document.getElementById('editor');
 const state = document.getElementById('state');
 const latency = document.getElementById('latency');
@@ -51,7 +84,7 @@ function showServerTime(value) {
 }
 function connect() {
     clearTimeout(reconnectTimer);
-    socket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+    socket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + wsPath);
     socket.onopen = () => { state.textContent = '已连接'; state.className = ''; };
     socket.onclose = () => {
         state.textContent = '连接断开，重连中'; state.className = 'error';
@@ -108,6 +141,12 @@ connect();
 class Editor:
     def __init__(self, path):
         self.path = Path(path).expanduser().resolve()
+        # 不存在则自动创建：URL 传入任意新路径即可开编，等价 nano 新文件
+        if not self.path.exists():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text('', encoding='utf-8')
+        # 按文件内容分发独立 ws 路由；md5 保证 URL 安全且跨进程稳定
+        self.ws_path = '/ws/realtime_editor/' + hashlib.md5(str(self.path).encode('utf-8')).hexdigest()[:12]
         self.lock = threading.RLock()
         self.clients = set()
         self.revision = 0
@@ -183,18 +222,18 @@ class Editor:
                     self.logger.warning("Invalid message received (not edit or content not string), sending error")
                     connection.send(self._message('error', message='无效的编辑消息'))
                     continue
-                    
+
                 self.logger.info(f"Received message  {connection.socket} type: {msg_type} len: {len(message.get('content',''))}")
-                
+
                 with self.lock:
                     self.save(message['content'])
                     # 1. 仅给发送方回复 saved（不带 content，因为发送方文本已经是最新的）
                     reply = self._message('saved', sent_at=message.get('sent_at'))
                     connection.send(reply)
-                    
+
                     # 2. 给其他所有客户端发送 changed（带有 content，强制更新他们的 textarea）
                     update_msg = self._message('changed', content=self.content)
-                
+
                 # 排除发送者本身，将内容广播给其他协同者
                 self.broadcast(update_msg, exclude=connection)
 
@@ -231,9 +270,50 @@ class Editor:
             self.broadcast(message)
 
 
-def preview_html(response_obj):
-    response_obj.set_header('Content-Type', 'text/html; charset=utf-8')
-    response_obj.set_data(PAGE.replace('__FILE_NAME__', json.dumps(str(editor.path.name), ensure_ascii=False)))
+def get_editor(path=None):
+    """取（必要时创建）某文件的编辑器。
+
+    首次创建时把 editor.websocket 动态注册进 server_http.RPCRequestHandler.
+    websocket_handlers——类属性字典在每个请求期实时读取，因此对已在运行的
+    RPC 服务器（如 server_mqtt.py 启动的 1177）即刻生效，无需重启或命令行；
+    同时启动外部修改监视线程。
+    """
+    resolved = Path(path or default_file).expanduser().resolve()
+    with _editors_lock:
+        editor = _editors.get(str(resolved))
+        if editor is None:
+            editor = Editor(resolved)
+            _editors[str(resolved)] = editor
+            server_http.RPCRequestHandler.websocket_handlers[editor.ws_path] = editor.websocket
+            threading.Thread(target=editor.watch,
+                             name=f'RealtimeEditorWatch-{editor.path.name}', daemon=True).start()
+        return editor
+
+
+def _render(editor):
+    return (PAGE
+            .replace('__FILE_NAME__', json.dumps(str(editor.path), ensure_ascii=False))
+            .replace('__WS_PATH__', json.dumps(editor.ws_path)))
+
+
+# ------------------------------------------------------------------ #
+# HTTP RPC 入口：p / response 由 server_http.handle_rpc 注入
+# ------------------------------------------------------------------ #
+def html(p, file=None):
+    """编辑页；file 缺省编辑 default_file，同一文件复用同一编辑器与 ws 路由。"""
+    editor = get_editor(file)
+    p.set_header('Content-Type', 'text/html; charset=utf-8')
+    p.set_header('Cache-Control', 'no-store')
+    p.set_data(_render(editor))
+
+
+preview_html = html
+
+
+def status(p):
+    """列出当前进程内所有编辑器：文件、ws 路由、在线客户端数、revision。"""
+    return {str(e.path): {'ws_path': e.ws_path, 'clients': len(e.clients), 'revision': e.revision}
+            for e in list(_editors.values())}
 
 
 def main():
@@ -249,18 +329,18 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
-    global editor
-    editor = Editor(args.file)
-    threading.Thread(target=editor.watch, name='RealtimeEditorWatcher', daemon=True).start()
-    server= server_http.start_rpc_server(
+    global default_file
+    default_file = args.file
+    server = server_http.start_rpc_server(
         port=args.port,
         ip=args.host,
         globals=globals(),
         locals=locals(),
-        websocket_handler=editor.websocket,
-        websocket_path='/ws',
         redirect_root='/preview_html(p)',
     )
+    # websocket_handlers 现为共享注册表、只合并不替换：注册与 start 的
+    # 先后顺序已无约束（preview_html 也会惰性补注册）
+    editor = get_editor(args.file)
     print(f'Open http://127.0.0.1:{args.port}/preview_html(p)')
     try:
         while True:

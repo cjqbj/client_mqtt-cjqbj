@@ -20,7 +20,6 @@ class ServerHttpTests(unittest.TestCase):
             "ThreadedHTTPServer",
             "WebSocket",
             "get_bmp_bytes",
-            "pretty_format",
             "qpsu",
             "stime",
         ):
@@ -58,7 +57,7 @@ class ServerHttpTests(unittest.TestCase):
                     b"Sec-WebSocket-Version: 13\r\n"
                     b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
                 )
-                response = client.recv(1024).decode("ascii")
+                response = client.recv(1024).split(b"\r\n\r\n", 1)[0].decode("ascii")
             self.assertIn("HTTP/1.1 101 Switching Protocols", response)
             self.assertIn("Sec-WebSocket-Accept:", response)
         finally:

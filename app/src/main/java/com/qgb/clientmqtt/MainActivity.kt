@@ -53,6 +53,7 @@ import androidx.compose.material.icons.outlined.CameraAlt
 import androidx.compose.material.icons.outlined.Extension
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Menu
 import androidx.compose.material.icons.outlined.NetworkWifi
 import androidx.compose.material.icons.outlined.PlayArrow
@@ -156,6 +157,7 @@ private fun featureIcon(feature: FeatureDescriptor) = when (feature.icon?.lowerc
     "phone", "dial", "dialer", "call", "telephone" -> Icons.Outlined.Call
     "info", "about" -> Icons.Outlined.Info
     "settings", "config", "tune" -> Icons.Outlined.Settings
+    "lock", "lockscreen", "screen" -> Icons.Outlined.Lock
     else -> when (feature.name) {
         "files" -> Icons.Outlined.Folder
         "camera" -> Icons.Outlined.CameraAlt
@@ -928,6 +930,8 @@ private fun TargetSettingsPage(
     var topic by remember(existingDeviceId) {
         mutableStateOf(if (existingDeviceId == null) "sys/device/request" else "")
     }
+    // 左上角大字显示的 topic 别名（存 device_settings.name，空则回退 topic 末段）。
+    var displayName by remember(existingDeviceId) { mutableStateOf("") }
     var remoteRoot by remember(existingDeviceId) { mutableStateOf("/sdcard") }
     var remoteRootOptions by remember {
         mutableStateOf(listOf("/sdcard", "/data/user/0/com.qgb.xime/"))
@@ -991,6 +995,7 @@ private fun TargetSettingsPage(
                 if (deviceId.isBlank()) deviceId = config.optString("id", targetId)
                 if (System.currentTimeMillis() - lastLocalEdit >= 1_200L) {
                     topic = config.optString("request_topic", "")
+                    displayName = config.optString("name", "").let { if (it == "Target") "" else it }
                     remoteRoot = config.optString("remote_root", "/sdcard")
                     privateKey = config.optString("private_key", "")
                     timeout = config.optString("timeout_draft", config.optString("timeout", "10"))
@@ -1009,12 +1014,13 @@ private fun TargetSettingsPage(
         }
     }
 
-    LaunchedEffect(deviceId, topic, remoteRoot, privateKey, timeout, allowNoServerKey, enabledFeatures, loaded) {
+    LaunchedEffect(deviceId, topic, displayName, remoteRoot, privateKey, timeout, allowNoServerKey, enabledFeatures, loaded) {
         if (!loaded || topic.isBlank()) return@LaunchedEffect
         delay(300)
         val timeoutValue = timeout.toDoubleOrNull()?.takeIf { it > 0 }
         val values = JSONObject()
             .put("request_topic", topic.trim())
+            .put("name", displayName.trim())
             .put("remote_root", remoteRoot)
             .put("private_key", privateKey)
             .put("allow_no_server_pubkey_response", allowNoServerKey)
@@ -1049,6 +1055,14 @@ private fun TargetSettingsPage(
             Text(if (existingDeviceId == null) "Add target" else "Target settings", style = MaterialTheme.typography.headlineSmall)
             Button(onClick = onBack) { Text("Done") }
         }
+        OutlinedTextField(
+            displayName,
+            { displayName = it; lastLocalEdit = System.currentTimeMillis() },
+            Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Name (shown at top left)") },
+            placeholder = { Text(topic.substringAfterLast('/')) }
+        )
         OutlinedTextField(
             topic,
             { topic = it; lastLocalEdit = System.currentTimeMillis() },

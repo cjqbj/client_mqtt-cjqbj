@@ -47,39 +47,39 @@ class TCPFrameProtocol:
 
 
 class TCPServer:
-    def __init__(self, host='0.0.0.0', port=1166, 
+    def __init__(self, host='0.0.0.0', port=1166,
                  globals=None,
                  executor_pool_size=10):
         self.host = host
         self.port = port
-        # self.globals_dict = globals_dict or {}
-        self.locals_dict = locals_dict or {}
-        
-        # 请求-响应映射：等待中的请求
-        # self.pending_requests = {}  # req_id -> threading.Event
-        # self.pending_lock = threading.Lock()
-        # self.req_counter = 0
-        
-        # 执行器
+        # 持久命名空间：与 server_http / server_mqtt 同一模式——默认零拷贝
+        # 直接持有调用方 globals（PythonExecutor copy_globals=False），调用
+        # 方启动后才赋值的名字对本通道实时可见。
+        self.globals_dict = globals
+
+        # 执行器：请求级上下文（client_sock 等）经 execute(globals=...)
+        # 注入共享命名空间，执行完自动还原，不泄漏进持久状态
         from rpc_executor import PythonExecutor
-        self.executor = PythonExecutor(globals=globals)#,locals_dict=locals_dict
-        
+        self.executor = PythonExecutor(globals=globals)
+
         # 线程池处理业务逻辑
         self.worker_pool = ThreadPoolExecutor(max_workers=executor_pool_size)
-        
+
         self.server_socket = None
         self.running = False
-        
+
         self.client_locks = {} # 防止 多个 worker 线程同时往同一个 socket sendall 依然可能串帧
         self.client_locks_lock = threading.Lock()
-        
+
     def start(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(128)
         self.running = True
-        
+        # port=0（让 OS 分配）时回填实际端口，方便测试/多实例
+        self.port = self.server_socket.getsockname()[1]
+
         logger.info(f"TCP RPC server listening on {self.host}:{self.port}")
         
         accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
@@ -149,37 +149,17 @@ class TCPServer:
         """执行业务逻辑并发送响应"""
         try:
             code = request_body.get('code', '')
-            
-            # 构建执行环境（同HTTP版本）
-            # inject_locals = self.globals_dict#.copy()
-            inject_locals = {}
-            
-            inject_locals['__name__'] = '__tcp_rpc__'
-            # inject_locals['client_id'] = client_id
-            inject_locals['client_sock'] = client_sock  # 危险！直接暴露socket
-            #这是设计好的行为，尽可能暴露底层 原生 socket 对象暴露给执行代码后，用户可以直接调用 `client_sock.recv()`、`accept()` 等阻塞方法，直接挂死 worker 线程
-            # 不用更安全的包装
-            # class SocketWrapper:
-                # def __init__(self, sock):
-                    # self._sock = sock
-                # def send(self, data):
-                    # if isinstance(data, str):
-                        # data = data.encode()
-                    # self._sock.sendall(data)
-                # @property
-                # def peer(self):
-                    # return self._sock.getpeername()
-            
-            # inject_locals['conn'] = SocketWrapper(client_sock)
-            
-            # 执行
+
+            # 请求级上下文注入（server_http 模式）：client_sock 只在本请求
+            # 执行期间可见，结束自动还原。刻意暴露原生 socket 是既有设计：
+            # 用户代码可直接调用 recv()/accept() 等阻塞方法挂住 worker 线程，
+            # 不做更安全的包装（历史注释明示这是设计好的行为）。
             execution = self.executor.execute(
                 code,
-                # globals_dict=inject_locals,
-                # locals_dict=self.locals_dict,#.copy()
-                locals_dict=inject_locals
+                globals={'__name__': '__tcp_rpc__',
+                         'client_sock': client_sock},
             )
-            
+
             # 构建响应
             response = {
                 'req_id': req_id,
@@ -189,7 +169,7 @@ class TCPServer:
             }
             if not execution['ok']:
                 response['error'] = execution.get('error')
-                
+
         except Exception as e:
             response = {
                 'req_id': req_id,
@@ -214,7 +194,11 @@ class TCPServer:
         
     def stop(self):
         self.running = False
-        self.server_socket.close()
+        if self.server_socket is not None:
+            try:
+                self.server_socket.close()
+            except OSError:
+                pass
         self.worker_pool.shutdown(wait=False)
 
 
@@ -320,8 +304,9 @@ if __name__ == '__main__':
     port=1166
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == 'server':
-        # logger.setLevel(logging.DEBUG)  # 为什么仍然不输出info
-        server = TCPServer(port=port, globals_dict=globals(),locals_dict=locals())
+        # 与 server_http.__main__ 同一模式：持久命名空间直接持有本模块
+        # globals（零拷贝），TCP/MQTT/HTTP 三通道语义一致
+        server = TCPServer(port=port, globals=globals())
         server.start()
         input("Press Enter to stop\n")
         server.stop()

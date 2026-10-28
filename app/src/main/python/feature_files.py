@@ -106,6 +106,8 @@ def build_view(context):
     from android.widget import LinearLayout, TextView
 
     page = pyui_kit.Page(context, "Files", "Browse and download files on the target")
+    # 左上角已经显示当前目标（别名），这里不再重复一行 topic 文字。
+    page.target_line.setVisibility(View.GONE)
     state = {"root": "/sdcard", "boundary": "/sdcard", "limit": 100,
              "entries": [], "has_more": False, "next_offset": 0, "topic": None,
              "loading": False, "directory_cache": {}}
@@ -115,6 +117,10 @@ def build_view(context):
     def set_status(text):
         page.set_subtitle(text)
 
+    def rpc_one_line(raw):
+        """只取一行元数据（ok / 延迟 / server_from / req_id），不重复原始响应。"""
+        return pyui_kit.result_summary(pyui_kit.rpc_dict(raw))
+
     # 图片预览同样走原生缩放控件（与相机页一致），失败自动回退静态图。
     preview = pyui_kit.make_zoom_image(context, height_dp=240)
     page.add(preview, top=6)
@@ -123,6 +129,12 @@ def build_view(context):
         context, "", size=12, color=pyui_kit.MUTED, selectable=True
     )
     page.add(root_line, top=4)
+
+    # 统一 RPC 结果区：与其它 feature 一致，展示最近一次 RPC 返回的 dict。
+    rpc_line = pyui_kit.make_text(
+        context, "", size=11, color=pyui_kit.MUTED, selectable=True
+    )
+    page.add(rpc_line, top=4)
 
     rows_box = LinearLayout(context)
     rows_box.setOrientation(LinearLayout.VERTICAL)
@@ -236,6 +248,7 @@ def build_view(context):
 
         def apply_ok(result):
             state["loading"] = False
+            # 文件列表本身就是内容：不再重复整份原始响应，元数据并进状态行。
             if not result.get("ok"):
                 if start == 0:
                     state["entries"] = []
@@ -249,8 +262,9 @@ def build_view(context):
             state["next_offset"] = int(result.get("next_offset", start + len(page_items)))
             render_rows()
             set_status(
-                "Loaded %d files%s"
-                % (len(state["entries"]), " (more below)" if state["has_more"] else "")
+                "Loaded %d files%s · %s"
+                % (len(state["entries"]), " (more below)" if state["has_more"] else "",
+                   rpc_one_line(result))
             )
 
         def apply_error(error):
@@ -285,6 +299,7 @@ def build_view(context):
             return client_service.call_feature("audio", "play", remote_path)
 
         def apply_ok(raw):
+            rpc_line.setText(rpc_one_line(raw))
             try:
                 result = json.loads(raw)
             except (TypeError, ValueError):
@@ -333,7 +348,8 @@ def build_view(context):
 
             stop_beat = pyui_kit.repeat_every(3, upload_beat)
             try:
-                transfer = json.loads(bootstrap.call_feature("files", "upload", remote_path))
+                raw_transfer = bootstrap.call_feature("files", "upload", remote_path)
+                transfer = json.loads(raw_transfer)
                 if not transfer.get("ok"):
                     raise RuntimeError(transfer.get("error", "upload failed"))
                 url = transfer.get("url")
@@ -377,12 +393,14 @@ def build_view(context):
                 bitmap = BitmapFactory.decodeByteArray(data, 0, len(data))
             return {
                 "bitmap": bitmap,
+                "transfer_raw": raw_transfer,
                 "upload_elapsed": upload_elapsed,
                 "dl_elapsed": dl_elapsed,
                 "total_elapsed": time.time() - started,
             }
 
         def apply_ok(payload):
+            rpc_line.setText(rpc_one_line(payload.get("transfer_raw") or ""))
             if payload.get("bitmap") is not None:
                 preview.setImageBitmap(payload["bitmap"])
                 preview.setVisibility(View.VISIBLE)
@@ -456,7 +474,6 @@ def build_view(context):
     )
 
     def on_target(_key, topic, cfg):
-        page.set_target("target topic: " + topic)
         if state["topic"] is None:
             state["topic"] = topic
             reset_to(str(cfg.get("remote_root") or "/sdcard"))

@@ -39,6 +39,46 @@ AI 常驻调用（监控窗口模型，避免每条命令重连 broker）
     curl "http://127.0.0.1:1188/$(python -c \
 "import urllib.parse;print(urllib.parse.quote('import json;p.set_data(json.dumps(ai_bridge.run(\\\"uname -a\\\"),ensure_ascii=False))'))")"
 
+MCP 工具服务（Model Context Protocol，AI 客户端标准工具协议）
+====================================================
+pip install "mcp[cli]" 后，常驻 PTY 自动以标准 MCP 工具形式持续暴露：
+默认**复用 --port 的 HTTP 口**（路径 /mcp，与 RPC/浏览器日志台同口并存，
+不新开端口；新版 SDK 走 streamable-http，旧版退回 /sse+/messages）：
+
+    claude mcp add --transport http pty http://192.168.1.3:1188/mcp
+
+工具集：pty_run 跑命令回收 rc/输出、pty_tail 查长命令实时进度、
+pty_send 喂交互键、pty_pane 查询/设置 AI 命令的 tmux 窗口、pty_status
+会话与 broker 状态、pty_log 本地诊断日志、pty_redraw 写卡滞自愈+整屏
+重绘；另有 9 个远端文件工具：fs_read/fs_ls/fs_glob/fs_grep 只读，
+fs_write/fs_edit/fs_mkdir/fs_move/fs_delete 默认允许写任意路径
+（pty_run 本就能执行任意代码，写入根限制没有实际意义；--fs-read-only 可
+整体禁写）。文件工具走 ai_bridge.transport.request 把 Python 源码发到
+远端 server_mqtt.py 进程里 exec，作用于**远端机器**的文件系统（路径语义
+是远端的，如 /root/...），既不经过交互 shell、也不占 busy 锁，与
+client_mqtt.rpc 同一条通道。pty_* 与 HTTP RPC 口同源同锁。
+--no-mcp 关闭；--mcp-port>0 改为另起独立端口（--port 0 关闭 RPC 口时仍
+要 MCP 的场景）。未装 mcp 包只记日志，PTY 照常工作。
+
+AI 命令的三条投递通道（run() 自动选择，逐级回落）
+==================================================
+① tmux 推送（默认）：客户端一次 RPC 让远端装 pipe-pane + send-keys，
+远端起后台线程本地增量读输出并逐帧 publish，客户端只订阅收流——没有
+"每读一次一往返"，长命令输出可以边产生边到达（pty_tail 即看这份实时
+缓冲）。② tmux 轮询：远端不认识推送 op（旧版本）时退回客户端按 offset
+增量读。③ 原生 PTY：tmux 不可用时直写本 PTY，行为与改造前一致。
+
+每次 MCP 工具调用都会分配一个 6 位调用 id（os.urandom(3).hex()），开始行
+带完整参数，完成行整行缩进、带参数短摘要 + 状态 + 耗时，两行各自可独立
+阅读，并发交错也不影响归属：
+    [MCP] 3f9a2b 开始 fs_read file_path='/tmp/a.txt' offset=0 limit=2000
+       [MCP] 3f9a2b 完成 fs_read file_path='/tmp/a.txt' offset=0 limit=2000 ok 0.36s
+业务失败是 FAIL + 原因，异常是 FAIL + 异常类型；参数按 repr 转义成单行、
+开始行单值超 400 字符截断、完成行单值只留前 60 字符。不用等远端返回，
+远端卡死/超时时也能从日志台看出是哪个调用没收尾。/mcp 的 2xx HTTP 访问行
+（每次调用伴随多条 POST、既无工具名也无参数）已被过滤，只保留 4xx/5xx；
+无状态 SDK 的 "Terminating session: None" INFO 已压到 WARNING，避免冲散日志。
+
 本地诊断日志与 PTY 画面彻底分离
 ====================================
 本终端窗口**只渲染远端 shell**；broker 连接/重连、每笔 [RPC] 请求、
@@ -91,6 +131,7 @@ import logging
 import os
 import queue
 import re
+import shlex
 import shutil
 import socket
 import sys
@@ -117,7 +158,8 @@ from .cmd_client_mqtt import (              # noqa: E402
     MqttTransport, add_connection_args,
 )
 from .remote_cmd import (                   # noqa: E402
-    RemotePty, RemoteError, DEFAULT_PTY_TTL,
+    RemotePty, RemoteShell, RemoteError, DEFAULT_PTY_TTL,
+    RemoteOpError, _PtyReorderBuffer,
 )
 
 from multi_mqtt import stime, BROKER_LIST
@@ -145,6 +187,16 @@ alias_detach_key   = ('detach_key', 'detachkey')
 alias_menu_key     = ('menu_key', 'menukey', 'magic_key')
 alias_rpc_port     = ('port', 'rpc_port', 'p')
 alias_rpc_host     = ('host', 'rpc_host')
+# MCP 工具服务（pip install "mcp[cli]" 后默认挂在 --port 的 RPC 口上）
+alias_mcp_port     = ('mcp_port', 'mcp')
+alias_mcp_transport= ('mcp_transport', 'mcptrans')
+alias_no_mcp       = ('no_mcp', 'nomcp')
+# MCP 文件工具的全局只读开关（默认关闭，写家族作用于任意路径）
+alias_fs_read_only = ('fs_read_only', 'fsro')
+# AI 目标窗口：默认「session 内 window_index 最小的窗口」，可 CLI/RPC 指定
+alias_ai_pane     = ('ai_pane', 'aipane', 'aip')
+# AI 命令编码：raw=窗口里直接看到命令原文（默认）；base64=旧严格编码兜底
+alias_ai_encoding = ('ai_encoding', 'aienc')
 alias_command      = ('command', 'cmd')
 # 本地命令栏查看诊断日志（只读，不碰会话参数）
 alias_log          = ('log', 'logs')
@@ -155,6 +207,74 @@ alias_redraw       = ('redraw', 'refresh', 'rd')
 # PTY 语境再补 detach 系列（顺序无所谓，匹配一律用 in）。
 alias_detach = tuple(dict.fromkeys(
     ('detach', 'd', 'bye', 'q', 'x') + tuple(_cm.alias_exit)))
+
+
+# ==================== 版本自检：单文件 vs pty/parts 分片是否同步 ====================
+#
+# 单文件由 generate_single_file.py 把 parts/ 全部分片按序字节拼接而成，
+# 「单文件字节 == 分片拼接」时两侧 sha256 必然相同——不需要在文件里嵌
+# 任何版本标记（嵌标记反而破坏逐字节拼接的不变量）。main() 启动时自动
+# 比对一次：分片改了没重组（或有人手改了单文件）会打 WARN 并给出重组
+# 命令；结果也可随时经 HTTP RPC 查询：
+#
+#     curl "http://127.0.0.1:1188/r=check_parts_sync()"
+#
+# 部署机上没有 parts 目录时自动跳过，纯单文件场景不告警。
+
+
+def check_parts_sync(verbose: bool = True) -> dict:
+    """比对运行中的单文件与 client/pty/parts 分片是否逐字节同步。
+
+    返回 {"ok": True/False/None(无法判定), "single", "parts",
+    "sha_single", "sha_parts"}；verbose=True 时把结论写本地日志。
+    """
+    import hashlib
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    if os.path.basename(here) == "pty":     # 包模式 client/pty/__init__.py
+        parts_dir = os.path.join(here, "parts")
+        single = os.path.join(os.path.dirname(here), "pty_client_mqtt.py")
+    else:                                    # 单文件模式（含 _generated 预览）
+        parts_dir = os.path.join(here, "pty", "parts")
+        single = os.path.abspath(__file__)
+    try:
+        names = sorted(n for n in os.listdir(parts_dir) if n.endswith(".py"))
+    except OSError:
+        names = []
+    if not names:
+        res = {"ok": None, "reason": "parts 目录不存在（纯部署场景），跳过",
+               "single": single, "parts": parts_dir}
+        if verbose:
+            _info("[pty] 版本自检：%s" % res["reason"])
+        return res
+    h = hashlib.sha256()
+    for n in names:
+        with open(os.path.join(parts_dir, n), "rb") as f:
+            h.update(f.read())
+    sha_parts = h.hexdigest()
+    try:
+        with open(single, "rb") as f:
+            sha_single = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        sha_single = None
+    if sha_single is None:
+        res = {"ok": False, "single": single, "parts": parts_dir,
+               "sha_single": None, "sha_parts": sha_parts[:12]}
+        if verbose:
+            _emit_local("[pty][WARN] 版本自检：单文件 %s 不存在"
+                        "（parts 才是真相源）\n" % single)
+        return res
+    res = {"ok": sha_single == sha_parts, "single": single, "parts": parts_dir,
+           "sha_single": sha_single[:12], "sha_parts": sha_parts[:12]}
+    if verbose and res["ok"]:
+        _info("[pty] 版本自检：与 pty/parts 分片同步（sha256=%s）" % sha_parts[:12])
+    elif verbose:
+        _emit_local("[pty][WARN] 版本自检：当前文件与 client/pty/parts 分片不一致"
+                    "（文件 %s / 分片 %s）！分片改动后请重组："
+                    "python client/pty/generate_single_file.py "
+                    "-o client/pty_client_mqtt.py -f\n"
+                    % (res["sha_single"], res["sha_parts"]))
+    return res
 
 
 # ============================ 本地终端：输出 ANSI 支持 ============================
@@ -356,8 +476,8 @@ _TERMINAL_CLEANUP = (b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l"
                      b"\x1b[?1006l\x1b[0m\x1b[?25h\r\n")
 
 
-_BIN_STDOUT_CACHE = None
-_BIN_STDERR_CACHE = None
+_BIN_STDOUT_CACHE = globals().setdefault('_BIN_STDOUT_CACHE', None)  # reload 重绑 None 会触发二次解析：会话期 sys.stdout 正被 _RingTextIO/redirect 替换，重解析可能锁错流；setdefault 保住首解析结果
+_BIN_STDERR_CACHE = globals().setdefault('_BIN_STDERR_CACHE', None)  # 同 _BIN_STDOUT_CACHE：stderr 会话期被 _RingTextIO 导流，首解析结果必须跨 reload 保活
 
 
 def _bin_stdout():
@@ -403,9 +523,9 @@ def _bin_stderr():
 _TERM_QUEUE_MAX = 8 * 1024 * 1024
 
 # 会话期 stdout 异步写线程（run_session 创建）；启动前为 None。
-_OUT_WRITER = None
+_OUT_WRITER = globals().setdefault('_OUT_WRITER', None)  # 必须防 reload：110_session/080_writerdiag 判空创建 _TerminalWriter（各带独立写线程），reload 把名字重绑 None 后会再起一条写线程，双线程并发写同一控制台；setdefault 保住活线程引用
 # stderr 异步写线程，懒初始化（_info 在 main 最早阶段就会用到）。
-_ERR_WRITER = None
+_ERR_WRITER = globals().setdefault('_ERR_WRITER', None)  # 同 _OUT_WRITER：050_status 判空懒建，reload 重绑 None = 再起一条 err 写线程，与旧线程并发写终端
 
 
 class _TerminalWriter:
@@ -452,8 +572,17 @@ class _TerminalWriter:
                 return
             room = self._max_bytes - self._queued_bytes
             if len(data) > room:
-                self.dropped += len(data) - room
-                data = data[:room]
+                # 按 UTF-8 字符边界截断：硬切 data[:room] 会切出半个汉字，
+                # 这种残尾正是控制台零进度死循环的燃料（2026-10-25 实证）。
+                clipped = _clip_utf8(data, room)
+                self.dropped += len(data) - len(clipped)
+                data = clipped
+            if not data:
+                return
+            # 卡滞计时从本次入队起算：空闲期后第一笔数据若沿用上次 flush
+            # 时间戳，stall_seconds 会把空闲秒数虚报成卡滞（实测虚报 11s+）。
+            if self._queued_bytes == 0:
+                self._last_flush_ts = time.monotonic()
             self._queued_bytes += len(data)
         self._q.put(data)
 
@@ -469,12 +598,20 @@ class _TerminalWriter:
         self._thread.join(timeout)
 
     def stall_seconds(self) -> float:
-        """有积压未写出时，距上次成功 flush 的秒数；无积压返回 0。"""
+        """有积压未写出时，距上次成功 flush 的秒数；无积压返回 0。
+
+        队列里没数据（正卡在一条原生写上）时改用通道自身的忙碌时长：
+        否则零进度 carry 僵住会被误判成"空闲"，自愈永远不触发。
+        """
         with self._lock:
             pending = self._queued_bytes
-        if pending <= 0:
-            return 0.0
-        return max(0.0, time.monotonic() - self._last_flush_ts)
+        s = 0.0
+        if pending > 0:
+            s = max(0.0, time.monotonic() - self._last_flush_ts)
+        busy = getattr(self._stream, "busy_seconds", None)
+        if busy is not None:
+            s = max(s, busy())
+        return s
 
     def abandon_pending(self) -> None:
         """自愈：当前块写完（或原生阻塞解除）后丢弃全部剩余积压并退出。
@@ -531,10 +668,11 @@ def _terminal_cleanup(sync: bool = False):
         _OUT_WRITER.write(_TERMINAL_CLEANUP)
         return
     try:
-        buf = _bin_stdout()
-        if buf is not None:
-            buf.write(_TERMINAL_CLEANUP)
-            buf.flush()
+        # 同步兜底也走独立控制台通道：绝不再碰 BufferedWriter
+        # （它可能正被一条零进度的 flush 占着锁）。
+        sink = _ConsoleSink("cleanup")
+        sink.write(_TERMINAL_CLEANUP)
+        sink.flush()
     except Exception:
         pass
 
@@ -605,6 +743,242 @@ def install_console_guards(console, on_signal=None):
     return restore
 
 
+# ============ 控制台输出通道（UTF-8 跨帧重组 + 零进度保护） ============
+#
+# 2026-10-25 冻结实证（1188 RPC + py-spy 现场）：
+#   1) 远端输出按字节分帧，切点可能落在 UTF-8 字符中间（汉字 3B / emoji 4B）；
+#   2) _io._WindowsConsoleIO.write 对"末尾不完整的多字节序列"返回 0 字节且
+#      不抛异常（实测 b"abc\\xe4\\xb8" 只写 3B，剩下的 b"\\xe4\\xb8" 永远返回 0）；
+#   3) CPython BufferedWriter.flush() 的 C 循环在 0 进度上无限重试：持锁 + 烧核
+#      （实测 3 秒采样 73% 单核、线程停在 pty_client_mqtt.py 的 flush 行）；
+#   4) 旧 _TerminalWriter 全部共用 _bin_stdout() 缓存的同一个 BufferedWriter，
+#      于是 reset_out_writer 换线程也换不掉那把锁，60 秒一次的自愈反而每 60 秒
+#      多留一个永久阻塞线程（实测 62 个 pty-out 线程在等同一把锁）。
+#
+# 本通道的对策：
+#   * 绕开 BufferedWriter，直接 Win32 WriteConsoleW（非控制台退回 os.write）；
+#   * 写前把末尾不完整的 UTF-8 字节留进 carry，等下一帧补齐再写，半字符永不
+#     进入控制台；
+#   * 原生写返回 0 进度时只记账并保留剩余数据，绝不原地空转重试；
+#   * 每个 sink 自带锁和自己的 CONOUT$ 句柄，reset 即换新实例：旧实例就算卡死
+#     在原生写里，也拖不住新写线程。
+
+_UTF8_TAIL_SCAN = 4                 # 末尾最多回看 3 字节找 UTF-8 起始字节
+_CONSOLE_CARRY_MAX = 64 * 1024      # carry 上限：异常时也不让内存无限涨
+
+
+def _utf8_complete_len(data: bytes) -> int:
+    """返回 data 中"最后一个完整 UTF-8 字符"结束处的偏移。
+
+    末尾若是半个字符（如 b"abc\\xe4\\xb8" 里的 \\xe4\\xb8），返回截断点；
+    数据本身非法（4 字节内都找不到起始字节）时按完整处理，交给控制台做替换。
+    """
+    n = len(data)
+    for back in range(1, _UTF8_TAIL_SCAN + 1):
+        if back > n:
+            return n                        # 全是延续字节：非法数据，按完整处理
+        lead = data[n - back]
+        if lead < 0x80:                     # ASCII：末尾即完整
+            return n
+        if 0x80 <= lead <= 0xBF:            # 延续字节：继续往前找起始字节
+            continue
+        if 0xC0 <= lead <= 0xF7:            # 合法起始字节：按长度判断是否补齐
+            need = 2 if lead <= 0xDF else (3 if lead <= 0xEF else 4)
+            return n if back >= need else n - back
+        return n                            # 非法字节（0xF8+）：按完整处理
+    return n
+
+
+def _clip_utf8(data: bytes, room: int) -> bytes:
+    """把 data 截到 room 字节内，且切点必须落在字符边界（不切断多字节字符）。"""
+    if room <= 0:
+        return b""
+    if len(data) <= room:
+        return data
+    return data[:_utf8_complete_len(data[:room])]
+
+
+class _ConsoleSink:
+    """单一控制台输出通道：自有锁 + UTF-8 carry + 零进度保护。
+
+    与旧设计（共用 sys.stdout.buffer 那个 BufferedWriter）的关键差别：锁和
+    控制台句柄都是本对象私有的。reset 时换新实例即换新通道，旧实例即使卡在
+    原生写里也不会阻塞新写线程。
+    """
+
+    def __init__(self, name: str = "stdout"):
+        self._name = name
+        self._lock = threading.Lock()
+        self._carry = b""
+        self._handle = None
+        self._own_handle = False
+        self._win32 = False
+        self._fd = 1
+        self._open_console()
+        self.created_ts = time.monotonic()
+        self._busy_since = 0.0
+        self._last_progress_ts = time.monotonic()
+        # 诊断计数（writer_diag 直接可见）
+        self.writes = 0
+        self.written_bytes = 0
+        self.zero_progress = 0     # 原生写返回 0 进度的次数
+        self.partial_writes = 0    # 原生写只写了一部分的次数
+        self.dropped_bytes = 0
+        self.holder = None         # 正在原生写里的线程名（持锁者）
+
+    # ---- 通道建立 ----
+
+    def _open_console(self) -> None:
+        """优先新开 CONOUT$ 句柄；拿不到控制台句柄时退回 fd 直写（管道/文件）。"""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.windll.kernel32
+            # 显式声明 64 位安全的签名：默认 c_int 会截断 HANDLE
+            k.CreateFileW.restype = wintypes.HANDLE
+            k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                      wintypes.DWORD, wintypes.LPVOID,
+                                      wintypes.DWORD, wintypes.DWORD,
+                                      wintypes.HANDLE]
+            k.GetStdHandle.restype = wintypes.HANDLE
+            k.GetStdHandle.argtypes = [wintypes.DWORD]
+            k.GetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.LPDWORD]
+            k.WriteConsoleW.restype = wintypes.BOOL
+            k.WriteConsoleW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR,
+                                        wintypes.DWORD, wintypes.LPDWORD,
+                                        wintypes.LPVOID]
+            k.CloseHandle.argtypes = [wintypes.HANDLE]
+            invalid = wintypes.HANDLE(-1).value
+            # 先确认进程 stdout 本身是不是控制台：重定向到文件/管道时必须
+            # 继续写 fd（尊重 > out.txt、| tee 这类用法），不能偷写 CONOUT$。
+            std = k.GetStdHandle(0xFFFFFFF5)  # STD_OUTPUT_HANDLE(-11)
+            mode = wintypes.DWORD()
+            if not (std and std != invalid
+                    and k.GetConsoleMode(std, ctypes.byref(mode))):
+                return
+            h = k.CreateFileW("CONOUT$", 0x40000000 | 0x80000000,  # GENERIC_READ|WRITE
+                              0x1 | 0x2,                           # FILE_SHARE_READ|WRITE
+                              None, 3, 0, None)                    # OPEN_EXISTING
+            if h and h != invalid:
+                if k.GetConsoleMode(h, ctypes.byref(mode)):
+                    self._handle = h
+                    self._own_handle = True
+                    self._win32 = True
+                    return
+                k.CloseHandle(h)
+            self._handle = std
+            self._win32 = True
+        except Exception:
+            self._win32 = False
+            self._handle = None
+
+    # ---- 原生写 ----
+
+    def _raw_write(self, data: bytes) -> int:
+        """返回实际消费的字节数；0 表示没有进度（调用方保留剩余数据）。"""
+        if self._win32:
+            import ctypes
+            from ctypes import wintypes
+            text = data.decode("utf-8", "replace")
+            if not text:
+                return len(data)
+            buf = ctypes.create_unicode_buffer(text)
+            n = wintypes.DWORD(0)
+            ok = ctypes.windll.kernel32.WriteConsoleW(
+                self._handle, buf, len(buf) - 1, ctypes.byref(n), None)
+            if not ok:
+                return 0
+            # 控制台把整串收进屏幕缓冲区，n 为 0 才算零进度
+            return len(data) if n.value else 0
+        return os.write(self._fd, data)
+
+    # ---- 对外接口（与 _TerminalWriter 期望的 write/flush 兼容） ----
+
+    def write(self, data) -> int:
+        data = bytes(data)
+        if not data:
+            return 0
+        with self._lock:
+            self.holder = threading.current_thread().name
+            self._busy_since = time.monotonic()
+            try:
+                buf = self._carry + data
+                self._carry = b""
+                cut = _utf8_complete_len(buf)
+                if cut < len(buf):
+                    # 末尾半个字符：留到下一帧补齐，绝不交给控制台
+                    self._carry = buf[cut:]
+                    buf = buf[:cut]
+                if not buf:
+                    return 0
+                total = len(buf)
+                done = 0
+                while done < total:
+                    try:
+                        k = self._raw_write(buf[done:])
+                    except Exception:
+                        k = 0
+                    if not k or k < 0:
+                        # 零进度：记账 + 保留剩余（含 carry），不原地重试
+                        self.zero_progress += 1
+                        rest = buf[done:] + self._carry
+                        if len(rest) > _CONSOLE_CARRY_MAX:
+                            self.dropped_bytes += len(rest) - _CONSOLE_CARRY_MAX
+                            rest = rest[-_CONSOLE_CARRY_MAX:]
+                        self._carry = rest
+                        break
+                    if k < total - done:
+                        self.partial_writes += 1
+                    done += k
+                    self._last_progress_ts = time.monotonic()
+                self.writes += 1
+                self.written_bytes += done
+                return done
+            finally:
+                self._busy_since = 0.0
+                self.holder = None
+
+    def flush(self) -> None:
+        """Win32 控制台/裸 fd 都是无缓冲写，flush 无事可做。"""
+
+    def busy_seconds(self) -> float:
+        """当前原生写已持续多久（秒）；卡在 OS 调用上时它会持续增长。"""
+        since = self._busy_since
+        s = max(0.0, time.monotonic() - since) if since else 0.0
+        # carry 长期写不出去 = 零进度僵住，同样算卡滞
+        if self._carry:
+            s = max(s, time.monotonic() - self._last_progress_ts)
+        return s
+
+    def snapshot(self) -> dict:
+        # 刻意不加 self._lock：写线程可能正持锁卡在原生写里，诊断/自愈必须
+        # 随时可读（属性读取在 GIL 下足够安全），否则 writer_diag 也会被冻住。
+        carry = self._carry
+        return {
+            "kind": "writeconsolew" if self._win32 else "fd",
+            "handle": int(self._handle) if self._handle else None,
+            "writes": self.writes,
+            "written_bytes": self.written_bytes,
+            "zero_progress": self.zero_progress,
+            "partial_writes": self.partial_writes,
+            "dropped_bytes": self.dropped_bytes,
+            "carried_bytes": len(carry),
+            "carry_head": carry[:8].hex(),
+            "holder": self.holder,
+            "busy_seconds": round(self.busy_seconds(), 2),
+            "age_seconds": round(time.monotonic() - self.created_ts, 1),
+        }
+
+
+def _new_console_sink(name: str = "stdout") -> "_ConsoleSink":
+    """新建一个独立控制台通道（新锁 + 新 CONOUT$ 句柄）。
+
+    reset_out_writer 必须走这里：只有换新实例才能真正甩掉旧通道里卡死的
+    原生写调用；沿用同一个流对象是上一版自愈失效的直接原因。
+    """
+    return _ConsoleSink(name)
 # ============================ 本地热键：按键名解析 ============================
 
 # 多字节热键（如 Ctrl+Alt+Insert 的 ESC[2;7~）到达时，ESC 可能与后续字节
@@ -1056,7 +1430,7 @@ class LogHub:
 
 
 # 模块级单例：必须在 main() 调 start_rpc_server 之前存在（handler 引用它）
-_LOG_HUB = LogHub(_LOCAL_LOG)
+_LOG_HUB = globals().setdefault('_LOG_HUB', LogHub(_LOCAL_LOG))  # setdefault 防 reload 日志分脑：120_cli 已把 .serve 按值捕获进服务器配置、浏览器订阅全挂在旧 hub 上，reload 普通赋值会重绑到新 hub——新代码往新 hub 发、旧 WS 订阅者收不到，快照/增量各走一半；LogHub 构造只存 ring 引用无副作用，reload 时重复求值仅多一个即弃对象
 
 
 def _lan_ip() -> str:
@@ -1254,16 +1628,38 @@ def _info(msg):
 
 # ---- 写线程诊断与自愈（AI 经 RPC 可直接调用） ----
 
+# 自愈次数：诊断用，也是"每次 reset 是否真的换了新通道"的旁证
+_WRITER_RESETS = globals().setdefault('_WRITER_RESETS', 0)
+
+# 自动换通道次数上限：正常一次就够；上限只兜"换了也没用"的极端场景，
+# 避免像旧版那样每 60 秒留一个永久阻塞线程（实测堆到 62 个）。
+_AUTO_RESET_MAX = 50
+
+
+def _writer_sink_snapshot() -> dict:
+    """当前 stdout 通道快照（写线程卡滞告警用；不含写线程自身状态）。"""
+    w = _OUT_WRITER
+    snap = getattr(w._stream, "snapshot", None) if w is not None else None
+    return snap() if snap is not None else {}
+
+
 def _writer_state(w):
     if w is None:
         return None
-    return {
+    state = {
         "queued_bytes": w._queued_bytes,
         "queue_items": w._q.qsize(),
         "dropped": w.dropped,
         "stall_seconds": round(w.stall_seconds(), 2),
         "abandon": w._abandon,
+        "thread": (w._thread.ident, w._thread.name, w._thread.is_alive()),
+        "stream_kind": type(w._stream).__name__,
     }
+    snap = getattr(w._stream, "snapshot", None)
+    # 通道快照：holder=正在原生写里的线程、zero_progress=0 进度次数、
+    # busy_seconds=本条原生写持续秒数，一眼定位"锁死/零进度"两类冻结。
+    state["sink"] = snap() if snap is not None else None
+    return state
 
 
 def writer_diag() -> dict:
@@ -1273,23 +1669,43 @@ def writer_diag() -> dict:
     （它在快照之后的 run_session 里创建）；本函数运行时动态读模块全局，
     一条 RPC 即可看清卡滞现场：``r=writer_diag()``。
     """
-    return {"out": _writer_state(_OUT_WRITER), "err": _writer_state(_ERR_WRITER)}
+    ts = [t for t in threading.enumerate() if t.name.startswith("pty-out")]
+    return {
+        "out": _writer_state(_OUT_WRITER),
+        "err": _writer_state(_ERR_WRITER),
+        "pty_out_threads": len(ts),
+        "resets": _WRITER_RESETS,
+        "mcp_port": globals().get("_MCP_PORT"),
+    }
 
 
 def reset_out_writer() -> dict:
     """stdout 写线程卡死时自愈：旧 writer 写完当前块即丢弃积压退出，
-    新建 writer 接管后续输出。调用方随后应发 redraw 让远端整屏重绘。"""
-    global _OUT_WRITER
+    新建 writer + **全新控制台通道** 接管后续输出。
+
+    2026-10-25 实证：旧实现复用 _bin_stdout() 缓存的同一个 BufferedWriter，
+    新旧 writer 共享同一把被零进度 flush 占住的锁，换线程毫无意义，只会
+    每 60 秒多留一个永久阻塞线程（实测堆到 62 个）。必须换 _ConsoleSink
+    新实例（新锁 + 新 CONOUT$ 句柄）才能真正恢复输出。
+    """
+    global _OUT_WRITER, _WRITER_RESETS
     old = _OUT_WRITER
     if old is None:
         return {"ok": False, "error": "无 stdout writer（会话未建立？）"}
     stall = old.stall_seconds()
+    old_state = _writer_state(old)
     old.abandon_pending()
-    term_out = _bin_stdout()
-    if term_out is None:
+    if _bin_stdout() is None:
         return {"ok": False, "error": "终端输出流不可用"}
-    _OUT_WRITER = _TerminalWriter(term_out, name="pty-out")
-    return {"ok": True, "stall_seconds": round(stall, 2)}
+    _OUT_WRITER = _TerminalWriter(_new_console_sink("pty-out"), name="pty-out")
+    _WRITER_RESETS += 1
+    return {
+        "ok": True,
+        "stall_seconds": round(stall, 2),
+        "resets": _WRITER_RESETS,
+        "old": old_state,
+        "new": _writer_state(_OUT_WRITER),
+    }
 
 
 # ---- QuickEdit 选择模式冻结：自动解除（保留左键选择/右键粘贴） ----
@@ -1348,6 +1764,44 @@ def _strip_ansi(b: bytes) -> str:
     return _ANSI_RE.sub(b"", b).replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("utf-8", "replace")
 
 
+# ---- tmux 管道收流的运行参数 ----
+# 远端 pipe 文件目录：tmux 的 pipe-pane 是远端 shell 执行的，路径必须是远端路径；
+# 每次 run 用启动时间 tag 独立命名，run 结束即删（避免长会话把 /tmp 写满）。
+_AI_PIPE_DIR = "/tmp"
+# 单次增量读取上限（128 KiB，等于 RemoteShell 的 WIRE_BUDGET）：防止一条超大
+# 输出把一次 MQTT 往返撑爆，轮询循环里会继续补齐剩余部分。取 128 KiB 而不是
+# 更大值，是因为超过这个尺寸远端会改走暂存分片（每次 fetch 又是一次完整往返），
+# 单次读取的实际耗时反而成倍增长。
+_AI_PIPE_READ_MAX = 131072
+# pipe 文件轮询间隔（秒）：0.12s 在"实时感"与"MQTT 往返开销"之间取平衡。
+_AI_POLL = 0.12
+# 人按 Ctrl-C 打断的识别与宽限期（秒）。
+# 打断时整条 "echo BEGIN; sh -c ...; echo END" 前台作业链一并被中止，END 根本
+# 不会输出；若死等到 timeout，AI 侧要白等几十秒才知道被中断。这里识别终端
+# 对 Ctrl-C 的回显（行首 ^C），再给一小段宽限期收尾输出，仍未出现 END 就提前
+# 返回并标记 interrupted=True。判据限定"行首"，避免匹配命令输出正文里的 ^C。
+_AI_INTERRUPT_RE = re.compile(rb"(?:^|\r?\n)\^C\r?\n")
+_AI_INTERRUPT_GRACE = 1.0
+
+# ---- 服务端主动推送（流式响应）参数 ----
+# 每个会话一条独立 topic（随机后缀），避免与 RemoteShell.stream 的周期汇报
+# 或另一台客户端的命令流相互串帧；订阅在会话期内只做一次（见 _push_ready），
+# 之后每 run 只是远端起一个推送 worker，客户端零额外订阅往返。
+_AI_STREAM_TOPIC_PREFIX = "sys/device/ai"
+# 实时预览缓冲上限：tail() 只回最后这么多原始字节，够看长命令进度又不吃内存。
+_AI_LIVE_MAX = 65536
+
+
+def _tmux_rows(data: bytes, n: int):
+    """把 ``tmux -F 'a|b|c'`` 的输出切成字段列表（不足 n 列的脏行直接丢弃）。"""
+    rows = []
+    for line in data.decode("utf-8", "replace").splitlines():
+        parts = line.split("|")
+        if len(parts) >= n:
+            rows.append(parts)
+    return rows
+
+
 # ==================== AI 命令严格编码（base64 透明传输，任意特殊字符不破裂） ====================
 #
 # 背景（实证根因）：AIBridge.run() 是把一整行文本「敲」进远端**交互式
@@ -1392,22 +1846,107 @@ _AI_B64_DECODE_PIPELINE = (
 )
 
 
-def _build_ai_run_line(cmd: str, begin_tag: str, end_tag: str) -> str:
-    """构造 run() 要敲进远端交互 PTY 的命令行（以 ``\\r`` 结尾）。
+def _build_ai_run_line_b64(cmd: str, begin_tag: str, end_tag: str) -> str:
+    """构造 run() 要敲进远端交互 shell 的命令行（**不含尾部回车**）。
 
     见上方「AI 命令严格编码」块注释：``cmd`` 经 base64 透明传输，远端
     POSIX shell（sh/bash/ash/dash）解码后交给 ``sh -c``，单双引号、
     ``$``、反引号、分号、裸换行等任意字符都不会改变命令本体。前置条件
     （与旧实现相同）：外层登录 shell 为 POSIX 系，且远端至少有
     base64 / openssl / python 三者之一。
+
+    尾部回车由投递方决定：走 PTY 时追加 ``\\r``，走 tmux 时另发一个
+    ``Enter`` 键（见 :meth:`AIBridge._send_keys`），因为 tmux 的
+    ``send-keys -l`` 把 ``\\r`` 当字面字节写进 pane，语义不如单发 Enter 清晰。
     """
     b64 = base64.b64encode(str(cmd).encode("utf-8", "replace")).decode("ascii")
     # b64 字符全部落在 shell 安全字符集（字母数字 + /+=），printf '%s'
     # 原样吐出即可，无需再包引号；模板里的 %%s 经 Python % 格式化后是字面 %s。
     return (
         'echo %s; sh -c "$(printf \'%%s\' %s | %s)"; __ai_rc=$?; '
-        'echo %s:$__ai_rc\r'
+        'echo %s:$__ai_rc'
         % (begin_tag, b64, _AI_B64_DECODE_PIPELINE, end_tag)
+    )
+
+
+def _build_ai_run_line_raw(cmd: str, begin_tag: str, end_tag: str) -> str:
+    """构造「命令原文可见」模式的命令行（**不含尾部回车**）。
+
+    与 b64 版的唯一区别：命令本体不进 base64，而是用 ``shlex.quote`` 做
+    **一层** POSIX 单引号转义后直接交给 ``sh -c``。人切到该 tmux 窗口时
+    看到的就是：
+
+        echo __AI_BEGIN_xxxx__; sh -c '用户实际要跑的命令'; __ai_rc=$?; echo __AI_END_xxxx__:$__ai_rc
+
+    为什么这里一层转义就够、不会重蹈旧实现「多层嵌套引号被吃」的覆辙：
+    旧实现是 ``sh -c "$(printf %s B64 | base64 -d)"``，命令文本要穿过
+    「外层交互 shell 的双引号 + 命令替换 + 内层 sh -c」多层；现在命令文本
+    只穿过「目标 shell 的一层词法解析」，shlex.quote 产出的单引号片段在
+    任何 POSIX shell（sh/bash/ash/dash）里都是严格无损的——内部的单引号
+    由 ``'"'"'`` 展开，不会与外层配对出错。
+
+    已知边界（因此 run() 会自动降级到 b64 模式）：
+    - 命令含裸换行/控制字节：交互 shell 会当回车或 Ctrl-C 提交，无法作为
+      一行完整输入；
+    - 命令超过 pty 规范模式单行上限 MAX_CANON（Linux 通常 4096 字节）时，
+      交互 shell 读走前写入端会阻塞，极端情况下被截断。
+    """
+    return (
+        "echo %s; sh -c %s; __ai_rc=$?; echo %s:$__ai_rc"
+        % (begin_tag, shlex.quote(str(cmd)), end_tag)
+    )
+
+
+# 支持 ANSI-C 引用 $'...' 的交互 shell（按可执行文件名判断）。dash/POSIX sh
+# 不支持：在 dash 里 $'a\nb' 不会报错，而是退化成字面量，命令会静默跑错，
+# 所以「猜」是绝对不能做的——探测不到一律走 base64。
+_AI_DOLLAR_SHELLS = frozenset(("bash", "zsh", "ksh", "ksh93", "mksh", "ash"))
+
+
+def _shell_basename(path) -> str:
+    """从 shell 路径（/bin/bash、-bash）取可执行文件名，用于能力判断。"""
+    text = str(path or "").strip().replace("\\", "/")
+    return text.rsplit("/", 1)[-1].strip().lower().lstrip("-")
+
+
+def _dollar_quote(cmd: str) -> str:
+    """把任意文本转成 ``$'...'`` 形式：输出里不含任何裸控制字节。
+
+    ``$'...'`` 内部只解析反斜杠序列，``$``/反引号/``!`` 都是字面量。转义
+    规则：反斜杠和单引号各自加倍，换行/制表/回车写成 ``\\n``/``\\t``/
+    ``\\r``，其余 C0 与 DEL 写成 ``\\xHH``。NUL 无法表示，调用方应改用
+    base64。
+    """
+    out = []
+    for ch in str(cmd):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == "'":
+            out.append("\\'")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ord(ch) < 32 or ord(ch) == 127:
+            out.append("\\x%02x" % ord(ch))
+        else:
+            out.append(ch)
+    return "$'" + "".join(out) + "'"
+
+
+def _build_ai_run_line_dollar(cmd: str, begin_tag: str, end_tag: str) -> str:
+    """构造「多行命令仍可读」的命令行（**不含尾部回车**）。
+
+    ``$'...'`` 由交互 shell（bash/zsh）解析成一个字符串交给 ``sh -c``，所以
+    窗口里看到的是一条带 ``\\n`` 的可读单行，而不是 base64 密文；命令本体
+    不经过任何引号嵌套，特殊字符不会破裂。只对 :data:`_AI_DOLLAR_SHELLS`
+    里的 shell 使用（见 ``AIBridge._pick_encoding``）。
+    """
+    return (
+        "echo %s; sh -c %s; __ai_rc=$?; echo %s:$__ai_rc"
+        % (begin_tag, _dollar_quote(str(cmd)), end_tag)
     )
 
 
@@ -1424,7 +1963,7 @@ class AIBridge:
         ai_bridge.send("y\\n")      # 给交互提示喂键（密码/y/n）
         ai_bridge.status()          # 会话存活 / broker 在线数 / 是否忙
 
-    run() 把命令包在一对随机标记之间写入同一个常驻 shell，回收两个标记
+    run() 把命令包在一对带启动时间的标记之间写入同一个常驻 shell，回收两个标记
     之间的输出与退出码；输入回显和输出照样实时渲染在监控窗口。PTY 只有
     一个 shell，命令用锁串行化，重叠调用立刻拿到 busy 而不是互相串台。
     """
@@ -1435,12 +1974,78 @@ class AIBridge:
         self._listeners = []
         self._llock = threading.Lock()
         self._busy = threading.Lock()
+        # ---- AI 目标窗口（tmux）相关状态 ----
+        # _pane_id 是**固化后**的默认目标 pane（tmux 的 pane_id，形如 %2）。
+        # 为什么不存 "0:2" 这种 target：0 是 session 名、2 是 window_index，
+        # 二者都会被改名/重排（renumber-windows 在窗口关闭后会重排 index、
+        # base-index 可配成非 0、move-window/swap-window 会互换 index），
+        # 只有 pane_id（%N）在整个 tmux server 生命周期内稳定不变。
+        self._pane_id = None
+        self._pane_source = ""     # auto（首次解析）/ cli（--ai-pane）/ rpc（pty_pane）
+        # _tmux_ok 三态：None=尚未探测；True=可用；False=不可用（回落原生 PTY 投递）
+        self._tmux_ok = None
+        self._shell = None          # 延迟创建的 RemoteShell（只在 tmux 路径才需要）
+        # AI 命令编码：raw=命令原文直接可见（默认）；base64=旧严格编码兜底；
+        # dollar=$'...'  ANSI-C 引用（仅会话 shell 支持时才自动启用）
+        self._encoding = "raw"
+        # 会话启动时由 set_shell 从服务端登录 shell 推断，用于 $'...' 可用性判断
+        self._shell_name = ""
+        # ---- 服务端主动推送（流式）状态 ----
+        self._push_topic = None     # 本会话订阅的命令流 topic（首次 push 时创建）
+        self._push_runs = {}        # sid -> 该次 run 的收帧回调（网络线程读）
+        # 正在执行 AI 命令的 pane：命令跨窗口运行时（人不在该窗口）按键不能
+        # 写本 PTY，必须用 tmux send-keys 才能落到同一条前台作业上。
+        self._active_pane = None
+        # 实时预览：当前/最近一次命令已产出的输出（tail() 用，不占 busy 锁）
+        self._live = {"cmd": None, "buf": bytearray(), "start": None,
+                      "channel": None}
+        self._live_lock = threading.Lock()
 
     # ---- 会话侧调用（run_session 内挂载） ----
 
     def attach(self, pty, transport):
         self.pty = pty
         self.transport = transport
+        # 每次重新 attach 都要清掉上一个会话的 tmux 探测结果与固化窗口：
+        # 新会话可能连的是另一台机器/另一个 tmux server，旧 pane_id 必然失效。
+        self._shell = None
+        self._tmux_ok = None
+        self._pane_id = None
+        self._pane_source = ""
+        # 推送订阅属于 transport（新会话 = 新 transport），一并作废重订。
+        self._push_topic = None
+        self._push_runs = {}
+        self._active_pane = None
+        self._shell_name = ""  # 新会话的 shell 可能不同，等 set_shell 重新注入
+        with self._live_lock:
+            self._live = {"cmd": None, "buf": bytearray(), "start": None,
+                          "channel": None}
+
+    def configure(self, pane="", encoding="") -> None:
+        """会话启动时注入 CLI 配置（--ai-pane / --ai-encoding）。
+
+        pane 为空 = 保持 auto（首次 run 时解析「index 最小的窗口」并固化）；
+        非空 = 用户显式指定，直接固化为 CLI 来源，不再自动解析。
+        """
+        if pane is not None and str(pane).strip():
+            self._pane_id = str(pane).strip()
+            self._pane_source = "cli"
+        enc = str(encoding or "").strip().lower()
+        if enc in ("raw", "base64", "dollar"):
+            self._encoding = enc
+
+    def set_shell(self, shell) -> None:
+        """会话启动时记录远端登录 shell（pty.open 的 env['shell']）。
+
+        只用于判断 ``$'...'`` 是否可用：bash/zsh/ksh/mksh/ash 支持，dash 与
+        未知一律不猜（含控制字符的命令退回 base64）。在 attach 之后调用，
+        同一实例跨会话重连时由 attach 清空。
+        """
+        self._shell_name = _shell_basename(shell)
+
+    def _dollar_ok(self) -> bool:
+        """当前会话的交互 shell 是否支持 ANSI-C 引用 ``$'...'``。"""
+        return self._shell_name in _AI_DOLLAR_SHELLS
 
     def feed(self, chunk: bytes):
         """PTY 下行分流：主窗口渲染之外，给每个 run() 收集器一份副本。"""
@@ -1466,6 +2071,19 @@ class AIBridge:
             "brokers_online": online,
             "brokers_total": total,
             "brokers": hosts,
+            # AI 目标窗口：pane 为 None 说明 tmux 不可用或尚未探测，
+            # 此时 run() 会走原生 PTY 投递（等价改造前的行为）。
+            "ai_pane": self._pane_id,
+            "ai_pane_source": self._pane_source or "auto",
+            "ai_encoding": self._encoding,
+            # 会话 shell 名（bash/zsh/…）与 $'...' 可用性，便于排查为什么
+            # 多行命令走了 base64 而不是可读的 dollar 模式。
+            "ai_shell": self._shell_name,
+            "ai_dollar_ok": self._dollar_ok(),
+            "tmux_ok": self._tmux_ok,
+            # 最近一次命令实际走的通道：pty / tmux（轮询）/ tmux+push（推送）
+            "ai_channel": self._live["channel"],
+            "ai_stream_topic": self._push_topic,
             # 终端写线程卡滞秒数（窗口冻结的直接信号）；>2 建议 redraw
             "writer_stall": round(_OUT_WRITER.stall_seconds(), 2)
             if _OUT_WRITER is not None else 0.0,
@@ -1479,18 +2097,46 @@ class AIBridge:
                     "error": "pty 未连接或已结束: %s" % getattr(pty, "end_reason", None)}
         if isinstance(data, str):
             data = data.encode("utf-8")
+        # AI 命令正在**另一个 tmux 窗口**里执行时，Ctrl-C 只有送进那个 pane
+        # 才能打断前台作业；写本 PTY 只会把 ^C 打到人自己的 shell 上。
+        if b"\x03" in data and self._active_pane:
+            r = self._tmux(["send-keys", "-t", self._active_pane, "C-c"])
+            return {"ok": r is not None and r.rc == 0, "sent": len(data),
+                    "pane": self._active_pane, "interrupt": True}
         pty.send(bytes(data))
         return {"ok": True, "sent": len(data)}
 
-    def run(self, cmd, timeout: float = 60.0, acquire_timeout: float = 2.0) -> dict:
-        """在常驻 shell 里跑一条命令，等结束标记，返回 rc/输出；窗口全程可见。
+    def run(self, cmd, timeout: float = 60.0, acquire_timeout: float = 2.0,
+            pane=None, encoding=None, stream=None, on_output=None) -> dict:
+        """在常驻 shell / 指定 tmux 窗口里跑一条命令，返回 rc 与输出。
+
+        三条投递通道，同一套时间戳 marker：
+
+        1. **tmux 推送通道（默认，tmux 可用时）**：命令行经远端 ``tmux_stream``
+           一次下发，服务端把 pane 输出 pipe-pane 落盘后**本地增量读、逐帧
+           主动 publish**；客户端只订阅收流，不再"每读一次 = 一次完整 RPC"。
+           首字节延迟与总耗时都不随输出体积线性增长（大包 fetch 的节流跳变
+           被彻底绕开）。
+        2. **tmux 轮询通道（推送不可用时的回落）**：服务端不认识 ``tmux_stream``
+           （旧版本）或推送启动失败时，退回"客户端按 offset 轮询增量读"。
+        3. **原生 PTY 通道（tmux 不可用时的回落）**：命令行直接写入本 PTY 的
+           shell，输出从 feed 分流队列回收，行为与改造前一致。
+
+        参数 ``pane``：目标窗口；``None``/空 = 用固化的默认窗口（连接后首次
+        run 解析「index 最小的窗口」并固化），非空 = 本次临时指定，不改默认。
+        参数 ``encoding``：``raw``（默认自动：无控制字节原文直发；有裸换行且
+        会话 shell 为 bash/zsh 时用 ``$'...'`` 保持可读；否则 base64）、
+        ``dollar``（强制 ANSI-C 引用）、``base64``（强制严格编码）。
+        选择只看字符构成，与命令长度无关。
+        参数 ``stream``：``auto``（默认，按上面的三级回落）或 ``off``（强制
+        走轮询通道，便于对比/排障）。
+        参数 ``on_output``：可选回调 ``fn(chunk: bytes)``，命令执行过程中**边
+        产生边回调**（推送通道下在网络线程里调用，回调要足够快）；配合
+        :meth:`tail` 可让外部进程实时看到长命令进度，而不用等整条返回。
 
         - 超时只停止回收，不杀远端命令（输出继续在窗口里刷，可用 send 干预）；
-        - 退出码取自 ``sh -c "<cmd>"``；命令经 base64 严格编码后透传（见
-          :func:`_build_ai_run_line`），单双引号/``$``/反引号/裸换行等任意
-          特殊字符都不会让外层交互 shell 的引号嵌套破裂。前置条件：外层登录
-          shell 为 POSIX 系（sh/bash/ash/dash），远端有 base64/openssl/python
-          任一解码器。
+        - 退出码取自命令尾部 ``echo END:$?``（tmux 没有能取 pane 内子命令
+          rc 的 API；``#{pane_dead_status}`` 只在 pane 主进程死亡时才有值）。
         """
         pty = self.pty
         if pty is None:
@@ -1501,18 +2147,79 @@ class AIBridge:
             return {"ok": False, "busy": True,
                     "error": "busy：上一条 AI 命令尚未结束"}
 
-        tag = os.urandom(4).hex()
+        # 标记带**客户端本地时间**（精确到毫秒）而不是随机串：
+        # `__AI_BEGIN_20261028_141530_123__` 在窗口/日志/历史回看时能一眼看出
+        # 这条命令是什么时候开始跑的；毫秒级且命令串行执行，天然不重复。
+        _now = time.time()
+        tag = (time.strftime("%Y%m%d_%H%M%S", time.localtime(_now))
+               + "_%03d" % int((_now % 1) * 1000))
         begin = "__AI_BEGIN_%s__" % tag
         end = "__AI_END_%s__" % tag
+        with self._live_lock:
+            self._live = {"cmd": str(cmd), "buf": bytearray(),
+                          "start": time.monotonic(), "channel": None}
+        try:
+            target = self._pick_pane(pane)
+            self._active_pane = target
+            enc = self._pick_encoding(cmd, encoding)
+            if target is None:
+                return self._run_via_pty(str(cmd), float(timeout), begin, end, enc,
+                                         on_output)
+            if str(stream if stream is not None else "auto").lower() != "off":
+                res = self._run_via_tmux_push(target, str(cmd), float(timeout),
+                                              begin, end, enc, tag, on_output)
+                if res is not None:
+                    return res
+            return self._run_via_tmux(target, str(cmd), float(timeout),
+                                      begin, end, enc, tag, on_output)
+        finally:
+            self._active_pane = None
+            self._busy.release()
+
+    # ---- 实时预览：不占 busy 锁，命令执行期间随时可查 ----
+
+    def _live_add(self, chunk: bytes) -> None:
+        with self._live_lock:
+            buf = self._live["buf"]
+            buf += chunk
+            if len(buf) > _AI_LIVE_MAX:
+                del buf[:-_AI_LIVE_MAX]
+
+    def _live_channel(self, name: str) -> None:
+        with self._live_lock:
+            self._live["channel"] = name
+
+    def tail(self, max_bytes: int = 8000) -> dict:
+        """看**当前正在跑**（或刚跑完）命令的最新输出，不需要等它结束。
+
+        与 ``run`` 共用一份实时缓冲，但不占 busy 锁，所以长命令执行期间外部
+        可以并发轮询本方法观察进度（MCP 侧由 ``pty_tail`` 暴露）。
+        """
+        n = max(1, min(int(max_bytes or 8000), _AI_LIVE_MAX))
+        with self._live_lock:
+            buf = bytes(self._live["buf"])
+            elapsed = (round(time.monotonic() - self._live["start"], 2)
+                       if self._live["start"] else None)
+            info = {"cmd": self._live["cmd"],
+                    "channel": self._live["channel"],
+                    "elapsed": elapsed, "total": len(buf)}
+        info.update({"ok": True, "tail": _strip_ansi(buf[-n:])})
+        return info
+
+    # ---- 投递通道：原生 PTY（tmux 不可用时的回落，等价改造前行为） ----
+
+    def _run_via_pty(self, cmd, timeout, begin, end, enc, on_output=None) -> dict:
+        pty = self.pty
         q = self._add_listener()
-        line = _build_ai_run_line(str(cmd), begin, end)
+        line = self._build_line(cmd, begin, end, enc)
         buf = b""
         timed_out = False
         m_end = None
+        end_re = re.compile(re.escape(end.encode()) + rb":(\d+)")
+        self._live_channel("pty")
         try:
-            pty.send(line.encode("utf-8"))
-            deadline = time.monotonic() + float(timeout)
-            end_re = re.compile(re.escape(end.encode()) + rb":(\d+)")
+            pty.send((line + "\r").encode("utf-8"))
+            deadline = time.monotonic() + timeout
             while True:
                 if pty.end_reason:
                     break
@@ -1525,13 +2232,369 @@ class AIBridge:
                 except queue.Empty:
                     continue
                 buf += chunk
+                self._live_add(chunk)
+                if on_output is not None:
+                    try:
+                        on_output(chunk)
+                    except Exception:
+                        pass
                 m_end = end_re.search(buf)
                 if m_end:
                     break
         finally:
             self._remove_listener(q)
-            self._busy.release()
+        return self._pack_result(buf, m_end, begin, end, timed_out,
+                                 {"pane": None, "channel": "pty", "encoding": enc,
+                                  "end_reason": self.pty.end_reason})
 
+    # ---- 投递通道：tmux（send-keys 投递 + pipe-pane 增量收流） ----
+
+    def _run_via_tmux(self, target, cmd, timeout, begin, end, enc, tag,
+                      on_output=None) -> dict:
+        path = "%s/.pty_ai_%s.log" % (_AI_PIPE_DIR, tag)
+        end_re = re.compile(re.escape(end.encode()) + rb":(\d+)")
+        buf = b""
+        off = 0
+        timed_out = False
+        interrupted = False
+        interrupt_seen = False
+        grace_deadline = None
+        m_end = None
+        # 顺序必须是「先挂管道，再敲命令」：pipe-pane 只捕获挂载之后该 pane
+        # 产生的输出，反过来的话 BEGIN 附近的最早几行会丢。
+        started = self._pipe_start(target, path)
+        self._live_channel("tmux")
+        try:
+            if not started:
+                return {"ok": False, "pane": target, "channel": "tmux",
+                        "error": "tmux pipe-pane 失败（窗口不存在或 tmux 不可用）"}
+            if not self._send_keys(target, self._build_line(cmd, begin, end, enc)):
+                return {"ok": False, "pane": target, "channel": "tmux",
+                        "error": "tmux send-keys 失败（窗口不存在或 tmux 不可用）"}
+            deadline = time.monotonic() + timeout
+            while True:
+                if self.pty.end_reason:
+                    break
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    timed_out = True
+                    break
+                # 轮询而不是让远端长驻 tail -f：后者要额外管理生命周期与
+                # 清理，而 0.12s 一次的 MQTT 往返开销远小于一次整帧传输。
+                time.sleep(min(_AI_POLL, max(0.02, remain)))
+                chunk, off = self._pipe_read(path, off)
+                if chunk:
+                    buf += chunk
+                    self._live_add(chunk)
+                    if on_output is not None:
+                        try:
+                            on_output(chunk)
+                        except Exception:
+                            pass
+                    m_end = end_re.search(buf)
+                    if m_end:
+                        break
+                    # 尾部窗口比对：行首 ^C 可能跨两次读取，只看最后 128 字节。
+                    if not interrupt_seen and _AI_INTERRUPT_RE.search(buf[-128:]):
+                        interrupt_seen = True
+                        grace_deadline = time.monotonic() + _AI_INTERRUPT_GRACE
+                if grace_deadline is not None and time.monotonic() >= grace_deadline:
+                    interrupted = True
+                    break
+            # 命中 END 时最后一段可能还在管道缓冲里，再补读一次。
+            chunk, off = self._pipe_read(path, off)
+            buf += chunk
+            self._live_add(chunk)
+            m_end = m_end or end_re.search(buf)
+        finally:
+            if started:
+                self._pipe_stop(target)
+            self._run_shell("rm -f " + shlex.quote(path))
+        return self._pack_result(buf, m_end, begin, end, timed_out,
+                                 {"pane": target, "channel": "tmux",
+                                  "encoding": enc,
+                                  "interrupted": interrupted,
+                                  "end_reason": self.pty.end_reason})
+
+    # ---- 投递通道：tmux 服务端主动推送（流式响应，客户端零往返收流） ----
+
+    # 推送启动回包异常时，等一小段确认远端是否其实已在推流（回包丢/超时）。
+    _PUSH_START_WAIT = 1.5
+
+    def _push_ready(self) -> bool:
+        """确保本会话已在命令流 topic 上挂好分发。返回是否具备推送能力。"""
+        if self._push_topic:
+            return True
+        tr = self.transport
+        if tr is None or not callable(getattr(tr, "stream_subscribe", None)) \
+                or not callable(getattr(tr, "stream_unsubscribe", None)):
+            return False
+        topic = "%s/%s" % (_AI_STREAM_TOPIC_PREFIX, os.urandom(4).hex())
+        try:
+            tr.stream_subscribe(topic, self._on_push_frame)
+        except Exception:
+            return False
+        self._push_topic = topic
+        return True
+
+    def _on_push_frame(self, data) -> None:
+        """网络线程入口：按 sid 把帧转给对应 run 的收帧回调。"""
+        if not isinstance(data, dict):
+            return
+        sid = data.get("stream")
+        if not sid:
+            return
+        cb = self._push_runs.get(sid)
+        if cb is None:
+            return
+        try:
+            cb(data)
+        except Exception:
+            pass
+
+    def _run_via_tmux_push(self, target, cmd, timeout, begin, end, enc, tag,
+                           on_output=None):
+        """服务端主动推送通道；返回 None 表示**未执行命令**、可安全回落轮询。
+
+        安全性：只有"远端不认识本 op（旧版本）"才回落——此时没有任何副作用。
+        一旦命令可能已被敲进 pane（op 成功，或回包丢失但帧已到），本方法要么
+        继续收流，要么把错误结果返回给调用方，**绝不复用轮询再投一次**，
+        避免同一条命令被执行两遍。
+        """
+        if not self._push_ready():
+            return None
+        sid = "ai-%s" % tag
+        path = "%s/.pty_ai_%s.log" % (_AI_PIPE_DIR, tag)
+        end_re = re.compile(re.escape(end.encode()) + rb":(\d+)")
+        st = {"buf": bytearray(), "end": None, "rc": None, "frames": 0}
+        lock = threading.Lock()
+        wake = threading.Event()
+        bufs = []
+
+        def _on_chunks(chunks):
+            with lock:
+                bufs.extend(chunks)
+            wake.set()
+
+        # 复用 PTY 通道同一套重排器：同一帧会经每个 broker 各到一份，且路径
+        # 抖动会让后发的帧先到；输出必须按 seq 连续拼装才不串字。
+        reorder = _PtyReorderBuffer(_on_chunks)
+
+        def _on_frame(data):
+            if data.get("end"):
+                st["end"] = str(data.get("reason") or "end")
+                st["rc"] = data.get("rc")
+                wake.set()
+                return
+            chunk = data.get("d")
+            if isinstance(chunk, str):
+                chunk = chunk.encode("latin-1")
+            elif not isinstance(chunk, (bytes, bytearray)):
+                return
+            if not chunk:
+                return
+            st["frames"] += 1
+            try:
+                reorder.add(int(data.get("seq", 0)), bytes(chunk))
+            except (TypeError, ValueError):
+                reorder.add(0, bytes(chunk))
+
+        sh = self._shell_obj()
+        if sh is None:
+            return None
+        self._push_runs[sid] = _on_frame
+        self._live_channel("tmux+push")
+        started = False
+        try:
+            sh.tmux_stream(
+                sid=sid, pane=target,
+                line=self._build_line(cmd, begin, end, enc),
+                path=path, end_marker=end, topic=self._push_topic,
+                ttl=min(max(10.0, timeout + 30.0), 7200.0))
+            started = True
+        except Exception as e:
+            # 回包可能只是丢了（远端其实已在推流）：等一小段确认是否真有帧。
+            wait_until = time.monotonic() + self._PUSH_START_WAIT
+            while (time.monotonic() < wait_until and st["end"] is None
+                   and st["frames"] == 0):
+                wake.wait(0.1)
+                wake.clear()
+            if st["frames"] == 0 and st["end"] is None:
+                self._push_runs.pop(sid, None)
+                reorder.close()
+                try:
+                    sh.tmux_stream_stop(sid, req_timeout=5.0)
+                except Exception:
+                    pass
+                if isinstance(e, RemoteOpError) and "unknown op" in str(e):
+                    return None      # 旧服务端：无副作用，安全回落轮询
+                return {"ok": False, "pane": target, "channel": "tmux+push",
+                        "error": "推送通道启动失败: %s" % (e,),
+                        "encoding": enc}
+            started = True           # 帧已到：worker 活着，走正常收流
+
+        timed_out = False
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                if self.pty.end_reason:
+                    break
+                with lock:
+                    fresh = b"".join(bufs)
+                    del bufs[:]
+                if fresh:
+                    st["buf"] += fresh
+                    self._live_add(fresh)
+                    if on_output is not None:
+                        try:
+                            on_output(fresh)
+                        except Exception:
+                            pass
+                    if end_re.search(st["buf"]):
+                        break
+                if st["end"] is not None:
+                    # 结束帧可能先于乱序数据帧到达：短暂收尾，避免吃掉尾巴。
+                    wake.wait(0.25)
+                    wake.clear()
+                    with lock:
+                        fresh = b"".join(bufs)
+                        del bufs[:]
+                    if fresh:
+                        st["buf"] += fresh
+                        self._live_add(fresh)
+                        if on_output is not None:
+                            try:
+                                on_output(fresh)
+                            except Exception:
+                                pass
+                    break
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    timed_out = True
+                    break
+                wake.wait(min(0.1, remain))
+                wake.clear()
+        finally:
+            reorder.close()
+            self._push_runs.pop(sid, None)
+            # 命中 END（本地标记或远端结束帧）时服务端 worker 已自行退出并
+            # 清理管道，再发一次 stop 只是白白多一轮 RPC（实测约 0.4s）。
+            if started and st["end"] is None \
+                    and not end_re.search(bytes(st["buf"])):
+                sh.tmux_stream_stop(sid, req_timeout=5.0)
+        m_end = end_re.search(bytes(st["buf"]))
+        return self._pack_result(
+            bytes(st["buf"]), m_end, begin, end, timed_out,
+            {"pane": target, "channel": "tmux+push", "encoding": enc,
+             "frames": st["frames"],
+             "interrupted": st["end"] == "interrupted",
+             "stream_end": st["end"],
+             "end_reason": self.pty.end_reason})
+
+    # ---- 目标窗口解析 ----
+
+    def _pick_pane(self, pane):
+        """决定本次命令投递到哪个 pane；返回 None 表示走原生 PTY 通道。
+
+        优先级：显式参数 > 固化值（--ai-pane / pty_pane / 首次 auto 解析）>
+        现场解析。只有现场解析失败（tmux 不可用/没有 session）才回落。
+        """
+        explicit = str(pane or "").strip()
+        if explicit and explicit.lower() != "auto":
+            return explicit
+        if self._pane_id:
+            return self._pane_id
+        return self._resolve_pane()
+
+    def _resolve_pane(self):
+        """解析默认窗口：**session 内 window_index 最小的窗口的 active pane**。
+
+        为什么不能写死 "0:0"：
+        - ``base-index`` 可配成 1 或任意值，0 号窗口可能根本不存在；
+        - ``renumber-windows`` 打开时，窗口关闭后剩余窗口的 index 会被重排，
+          "0:0" 指向的 pane 会漂移；
+        - ``move-window`` / ``swap-window`` 也会改 index。
+        所以每次都按**当前实际列表**取最小 index，并把结果的 pane_id（%N）
+        固化下来——pane_id 在整个 tmux server 生命周期内不会变。
+
+        会话选择：优先 attached>0 且 ``session_last_attached`` 最大的会话。
+        实测同一台机器有 8 个 client attach 到同一 session，``select-window``
+        只改某个 client 的视图，与"人现在看哪个"不是一回事，而这个字段稳定。
+        """
+        r = self._tmux(["list-sessions", "-F",
+                        "#{session_name}|#{session_attached}|#{session_last_attached}"])
+        if r is None or r.rc != 0:
+            self._tmux_ok = False
+            return None
+        self._tmux_ok = True
+        rows = _tmux_rows(r.stdout, 3)
+        if not rows:
+            self._tmux_ok = False
+            return None
+        try:
+            session = max(rows, key=lambda x: (int(x[1] or 0), int(x[2] or 0)))[0]
+        except ValueError:
+            session = rows[0][0]
+        # -s 才是"整个 session 的所有 pane"；不带 -s 只列 target window 的 pane。
+        r = self._tmux(["list-panes", "-s", "-t", session, "-F",
+                        "#{window_index}|#{pane_index}|#{pane_id}|#{pane_active}"])
+        if r is None or r.rc != 0:
+            self._tmux_ok = False
+            return None
+        rows = _tmux_rows(r.stdout, 4)
+        if not rows:
+            self._tmux_ok = False
+            return None
+
+        def _key(x):
+            # 主键 window_index 数值最小；同窗口内 active pane 优先，再按 pane_index。
+            try:
+                return (int(x[0]), -int(x[3] or 0), int(x[1]))
+            except ValueError:
+                return (1 << 30, 0, 1 << 30)
+
+        rows.sort(key=_key)
+        self._pane_id = rows[0][2]
+        self._pane_source = self._pane_source or "auto"
+        return self._pane_id
+
+    def _pick_encoding(self, cmd, encoding) -> str:
+        """选本次命令的编码：raw / dollar / base64。
+
+        - ``raw``（默认）：命令**没有**控制字节就原样直发（窗口可见）；
+          有裸换行/控制字节时：会话 shell 属于 :data:`_AI_DOLLAR_SHELLS`
+          才转 ``$'...'``（窗口仍可读），否则退回 base64。dash 里 ``$'...'``
+          会静默变成字面量，所以**绝不猜**。
+        - ``dollar``：显式要求 ANSI-C 引用；NUL 无法表示，只能退 base64。
+        - ``base64``：强制严格编码。
+
+        选择只看字符构成，与命令长度无关（长度受 pty 单行上限影响，见
+        ``_build_ai_run_line_raw`` 的已知边界）。
+        """
+        text = str(cmd)
+        enc = str(encoding or self._encoding or "raw").strip().lower()
+        if enc not in ("raw", "base64", "dollar"):
+            enc = "raw"
+        if enc == "dollar":
+            return "base64" if "\x00" in text else "dollar"
+        if enc == "base64":
+            return "base64"
+        if not any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+            return "raw"  # 没有需要转义的字符：保持原文可见，别做无谓编码
+        if "\x00" in text:
+            return "base64"
+        return "dollar" if self._dollar_ok() else "base64"
+
+    @staticmethod
+    def _build_line(cmd, begin, end, enc) -> str:
+        if enc == "base64":
+            return _build_ai_run_line_b64(cmd, begin, end)
+        if enc == "dollar":
+            return _build_ai_run_line_dollar(cmd, begin, end)
+        return _build_ai_run_line_raw(cmd, begin, end)
+
+    @staticmethod
+    def _pack_result(buf, m_end, begin, end, timed_out, extra) -> dict:
         # 真起点是「独占一行的 BEGIN + 换行」；输入回显里 BEGIN 后面是 ';'，
         # 不会误中。结尾 END:<数字> 同理（回显里是 :$__ai_rc 字面量）。
         m_begin = re.search(re.escape(begin.encode()) + rb"\r?\n", buf)
@@ -1540,14 +2603,132 @@ class AIBridge:
             body, rc = buf[start:m_end.start()], int(m_end.group(1))
         else:
             body, rc = buf[start:], None
-        return {
+        res = {
             "ok": rc == 0 if rc is not None else False,
             "rc": rc,
             "timed_out": timed_out,
             "out": _strip_ansi(body).strip("\n"),
             "raw_len": len(body),
-            "end_reason": pty.end_reason,
         }
+        res.update(extra or {})
+        return res
+
+    # ---- 远端 tmux 辅助（全部走 RemoteShell 通道，不占本 PTY） ----
+
+    def _shell_obj(self):
+        if self._shell is None and self.transport is not None:
+            self._shell = RemoteShell(self.transport, timeout=30)
+        return self._shell
+
+    def _run_shell(self, cmd):
+        """在另一条远端命令通道执行普通 shell 命令，返回 CmdResult。
+
+        这条通道不占用本 PTY，所以不会干扰人在窗口里的输入；任何异常都吞掉
+        返回 None，让调用方走回落/报错分支。
+        """
+        sh = self._shell_obj()
+        if sh is None:
+            return None
+        try:
+            return sh.run(cmd)
+        except Exception:
+            return None
+
+    def _tmux(self, args):
+        """执行一条 tmux 子命令。
+
+        参数逐项 shlex.quote 后拼进远端 ``sh -c``：这里只有**一层** POSIX
+        单引号解析（远端 sh 剥掉引号后把原样字符串作为 argv 交给 tmux），
+        不存在旧实现"外层交互 shell + 命令替换 + 内层 sh -c"的多层嵌套，
+        因此任意特殊字符都不会被吃掉。
+        """
+        return self._run_shell("tmux " + " ".join(
+            shlex.quote(str(a)) for a in args))
+
+    def _pipe_start(self, pane, path) -> bool:
+        """把该 pane 的输出字节流 append 到 path（tmux 原生能力）。
+
+        与 capture-pane 的本质区别：capture-pane 只是把"当前屏幕"拍成快照
+        （受 history-limit 限制、丢失中间过程）；pipe-pane 是 tmux 在 pane
+        的 pty 输出处挂一根管道，拿到的是**完整、连续的字节流**。另一个关键
+        好处是它不含 tmux 客户端整屏重绘的回放字节——旧实现 run() 输出里
+        夹带大量历史与旧 marker，根因正是重绘混进了 PTY 流。
+
+        不能用 ``-o``（"仅在没有 pipe 时打开"）：每次 run 都换新文件，带 -o
+        会复用上一条管道继续写旧文件；不带 -o 时 tmux 先关旧管道再开新的，
+        正好是这里要的语义。
+        """
+        r = self._tmux(["pipe-pane", "-t", pane, "cat >> " + shlex.quote(path)])
+        return r is not None and r.rc == 0
+
+    def _pipe_stop(self, pane) -> None:
+        """关闭该 pane 的管道（命令留空 = 关闭）。失败忽略：下次 run 会重开。"""
+        self._tmux(["pipe-pane", "-t", pane])
+
+    def _pipe_read(self, path, off):
+        """从 path 的 off 偏移增量读取，返回 (新字节, 新偏移)。
+
+        ``tail -c +N`` 是 1 基偏移（+0 等于从头），所以传 off+1。单次用
+        ``head -c`` 截断，避免一条超大输出把一次 MQTT 往返撑爆；调用方在
+        轮询里继续补齐剩余部分。
+        """
+        cmd = ("tail -c +%d %s 2>/dev/null | head -c %d"
+               % (off + 1, shlex.quote(path), _AI_PIPE_READ_MAX))
+        r = self._run_shell(cmd)
+        data = r.stdout if r is not None else b""
+        return data, off + len(data)
+
+    def _send_keys(self, pane, line) -> bool:
+        """把命令行投递到指定 pane。
+
+        ``-l`` 必须加：不加时 tmux 会把参数里的 ``Enter``/``C-c`` 之类当**键名**
+        解析，命令文本里恰好含有这些单词就会被误解释成按键；``-l`` 禁用键名
+        解析，传入什么字符就敲什么字符。``--`` 防止命令行以 ``-`` 开头时被
+        tmux 当成选项。
+
+        回车单独发一个 ``Enter`` 键，而不是在文本尾部拼 ``\\r``：pane 里的
+        shell 处于规范模式/readline，单独按键的语义最接近真人敲回车。
+
+        注意 ``-l`` 只保证 tmux 层不做键名解析，字符进入 pane 的 pty 后仍要
+        被目标 shell 做一次词法解析——这正是命令本体必须用 ``sh -c`` + 单引号
+        包裹（或 base64）的原因，与"能否看到原文"无关。
+        """
+        r = self._tmux(["send-keys", "-t", pane, "-l", "--", line])
+        if r is None or r.rc != 0:
+            return False
+        r = self._tmux(["send-keys", "-t", pane, "Enter"])
+        return r is not None and r.rc == 0
+
+    # ---- RPC / MCP 动态调整默认窗口 ----
+
+    def get_pane(self) -> dict:
+        return {
+            "ok": True,
+            "pane": self._pane_id,
+            "pane_source": self._pane_source or "auto",
+            "tmux_ok": self._tmux_ok,
+            "encoding": self._encoding,
+        }
+
+    def set_pane(self, target="") -> dict:
+        """动态调整 AI 默认窗口。
+
+        ``""``/``auto`` = 清空固化值并立即按"index 最小"重新解析；
+        其他值 = 固化用户给的 target（``%N`` 最稳，也接受 ``0:2`` / 窗口名）。
+        """
+        t = str(target or "").strip()
+        if not t or t.lower() == "auto":
+            self._pane_id = None
+            self._pane_source = "auto"
+            p = self._resolve_pane()
+            res = self.get_pane()
+            res["ok"] = p is not None
+            if p is None:
+                res["error"] = "tmux 不可用或没有可解析的窗口"
+            return res
+        self._pane_id = t
+        self._pane_source = "rpc"
+        return self.get_pane()
 
     def _add_listener(self) -> queue.Queue:
         q = queue.Queue(maxsize=20000)
@@ -1622,6 +2803,1480 @@ def ai_pty_status(base=DEFAULT_AI_BASE, timeout=15):
     return _call_ai_bridge("ai_bridge.status()", base=base, timeout=timeout)
 
 
+# ==================== MCP 服务：把常驻 PTY 挂成标准 MCP 工具服务器 ====================
+#
+# 背景：本进程已通过 ai_bridge + 本地 HTTP RPC 口把常驻 PTY 暴露给外部进程，
+# 但 AI 客户端侧还缺一个标准工具协议入口。MCP（Model Context Protocol）是
+# 各 AI 客户端的通用工具协议；装好 ``pip install "mcp[cli]"`` 后，main 默认
+# 把 MCP 端点**挂在 --port 已起的 RPC 服务器上**（路径 /mcp，与 RPC / 浏览器
+# 日志台同口复用，不新开端口），AI 客户端即可把远端 shell 当普通 MCP 工具
+# 集持续使用：
+#
+#     claude mcp add --transport http pty http://192.168.1.3:1188/mcp
+#
+# 同口复用的做法（参考 HuggingFace app.py 的保留路径分流中间件）：给
+# server_http.RPCRequestHandler 包一层前置分发——命中 /mcp（sse 退回模式下
+# 是 /sse、/messages）的请求桥接给 MCP 的 ASGI 应用，其余路径原样走既有
+# RPC / WebSocket / 日志台逻辑。桥接要点：
+# - mcp 1.x/2.x 双兼容：2.x 把 FastMCP 改名 MCPServer，ASGI 应用从
+#   streamable_http_app()/sse_app() 取，SDK 不支持时逐级退回；
+# - ASGI 应用跑在本模块专用事件循环线程上；lifespan（session manager
+#   等启动上下文）手动驱动，等价 uvicorn 的启动阶段；
+# - MCP 工具只是 ai_bridge 的薄封装：与 HTTP RPC 口共用同一把 busy 锁与
+#   下行分流队列，MCP / RPC / 本地窗口三路调用看到的会话状态完全一致；
+# - mcp 包懒导入：没装包只记一条本地日志，PTY 本体功能零影响；
+# - 服务不碰主线程：桥接在 server_http 的请求线程 + 专用循环线程里完成。
+#
+# --mcp-port>0 时退回独立端口模式（自起 uvicorn，供 --port 0 关闭 RPC 口
+# 但仍要 MCP 的场景）；--no-mcp 完全关闭。
+
+import asyncio
+import functools
+import inspect
+import logging
+import time
+
+try:  # mcp 2.x：FastMCP 改名 MCPServer，Context 在同名包
+    from mcp.server.mcpserver import Context as _MCP_CTX
+except ImportError:  # mcp 1.x
+    try:
+        from mcp.server.fastmcp import Context as _MCP_CTX
+    except ImportError:  # 未安装 mcp：MCP 服务不会启动，工具也不会注册
+        _MCP_CTX = None
+
+_MCP_LOG_ARG_MAX = 400  # 开始行单个参数原始值最多保留的字符数
+_MCP_DONE_ARG_MAX = 60  # 完成行单个参数值最多保留的字符数
+_MCP_DONE_INDENT = "   "  # 完成行整行左缩进，视觉上从属于同 id 的开始行
+_MCP_CALL_PARAMS_MAX = 200  # 在途调用参数缓存上限，防止异常中断的调用无限堆积
+_MCP_CALL_PARAMS = globals().setdefault('_MCP_CALL_PARAMS', {})  # call_id -> 原始参数；跨 reload 保活，旧 wrapper 的完成行仍能取到
+_MCP_PROGRESS_TICK = 0.5  # 有 progressToken 时的进度上报间隔（秒）
+_MCP_PROGRESS_TAIL = 200  # 进度 message 里取实时缓冲尾部多少字节找最后一行
+_MCP_WAIT_START_GRACE = 0.2  # wait>=0 时给执行线程的启动宽限（秒），让 busy/未连接这类秒回错误先暴露
+_MCP_PARTIAL_OUT = 8000  # wait 到期提前返回时，out 取实时缓冲尾部多少字节
+
+
+
+def _mcp_short_arg(value) -> str:
+    text = repr(value)
+    if len(text) > _MCP_LOG_ARG_MAX:
+        return "%s…（共 %d 字符）" % (text[:_MCP_LOG_ARG_MAX], len(text))
+    return text
+
+
+def _mcp_done_arg(value) -> str:
+    """完成行的参数值：只留前 60 字符，保证整行紧凑。"""
+    text = repr(value)
+    if len(text) <= _MCP_DONE_ARG_MAX:
+        return text
+    clipped = text[:_MCP_DONE_ARG_MAX]
+    quote = text[0] if text[:1] in ("'", '"') else ""
+    if quote and text.endswith(quote) and not clipped.endswith(quote):
+        clipped = clipped[:-1] + "…" + quote  # 补回引号，避免截断值看起来没收尾
+    else:
+        clipped += "…"
+    return clipped
+
+
+def _mcp_log_begin(name, params) -> str:
+    """工具调用一开始就落一条完整参数的日志，返回本次调用 id。
+
+    id 由 os.urandom(3).hex() 生成，6 位十六进制，只用于把完成行和开始行
+    关联起来；两行各自都带工具名与参数，可独立阅读：
+        [MCP] 926fff 开始 fs_grep pattern='sherpa' path='/root/...' head_limit=30
+           [MCP] 926fff 完成 fs_grep pattern='sherpa' path='/root/...' ok 0.21s
+    记录的是客户端传进来的原始参数，不等远端返回；远端卡死/超时也能从
+    日志台看出这次调用要做什么。
+    """
+    call_id = os.urandom(3).hex()
+    try:
+        _MCP_CALL_PARAMS[call_id] = dict(params or {})
+        if len(_MCP_CALL_PARAMS) > _MCP_CALL_PARAMS_MAX:
+            # dict 保序：批量丢弃最早登记的在途调用，避免缓存无限增长
+            for stale in list(_MCP_CALL_PARAMS)[:_MCP_CALL_PARAMS_MAX // 2]:
+                _MCP_CALL_PARAMS.pop(stale, None)
+        parts = " ".join("%s=%s" % (key, _mcp_short_arg(value))
+                         for key, value in (params or {}).items())
+        _emit_local("[MCP] %s 开始 %s%s\n"
+                    % (call_id, name, (" " + parts) if parts else ""))
+    except Exception:
+        pass
+    return call_id
+
+
+def _mcp_log_end(call_id, name, elapsed, result=None, exc=None) -> None:
+    """与开始行同 id 的完成行：整行缩进，带参数短摘要、状态与耗时。"""
+    params = _MCP_CALL_PARAMS.pop(call_id, None)
+    try:
+        if exc is not None:
+            status = "FAIL %s: %s" % (type(exc).__name__, str(exc)[:200])
+        elif isinstance(result, dict) and result.get("ok") is False:
+            status = "FAIL %s" % str(result.get("error", ""))[:200]
+        else:
+            status = "ok"
+        args = " ".join("%s=%s" % (key, _mcp_done_arg(value))
+                        for key, value in (params or {}).items())
+        _emit_local("%s[MCP] %s 完成 %s%s %s %.2fs\n"
+                    % (_MCP_DONE_INDENT, call_id, name,
+                       (" " + args) if args else "", status, elapsed))
+    except Exception:
+        pass
+
+
+def _mcp_tool(fn):
+    """给工具函数包一层「收到即记 + 同 id 收尾」的结构化日志。
+
+    functools.wraps 保留 __wrapped__/__annotations__，FastMCP 仍能按原签名
+    生成 schema；日志发生在调用线程、进入 ai_bridge 之前，所以不受远端耗时影响。
+    同时支持同步与 async 工具：async 版本是新加的 pty_run 需要的（它要在等远端
+    命令期间 await 进度上报，不能把事件循环卡死）。
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        sig = None
+
+    def _bind(args, kwargs):
+        if sig is None:
+            return dict(kwargs)
+        try:
+            return dict(sig.bind_partial(*args, **kwargs).arguments)
+        except Exception:
+            return dict(kwargs)
+
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def async_wrapper(*args, **kwargs):
+            call_id = _mcp_log_begin(fn.__name__, _bind(args, kwargs))
+            started = time.monotonic()
+            try:
+                result = await fn(*args, **kwargs)
+            except Exception as exc:
+                _mcp_log_end(call_id, fn.__name__,
+                             time.monotonic() - started, exc=exc)
+                raise
+            _mcp_log_end(call_id, fn.__name__,
+                         time.monotonic() - started, result=result)
+            return result
+
+        return async_wrapper
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        call_id = _mcp_log_begin(fn.__name__, _bind(args, kwargs))
+        started = time.monotonic()
+        try:
+            result = fn(*args, **kwargs)
+        except Exception as exc:
+            _mcp_log_end(call_id, fn.__name__, time.monotonic() - started, exc=exc)
+            raise
+        _mcp_log_end(call_id, fn.__name__, time.monotonic() - started, result=result)
+        return result
+
+    return wrapper
+
+
+def _mcp_progress_token(ctx):
+    """本次调用请求里的 ``_meta.progressToken``：有 = 客户端愿收进度通知。
+
+    MCP 客户端能力（initialize.capabilities）里没有 progress 项，进度是**按
+    单次请求**协商的：只有请求带 progressToken，服务端才允许回
+    ``notifications/progress`` 并由 SDK 绑定到该 token；不带 token 时 SDK 的
+    ``report_progress`` 本身就是 no-op，这里直接判空可以连轮询都省掉。
+    """
+    if ctx is None:
+        return None
+    try:
+        meta = ctx.request_context.meta
+    except Exception:  # 没有请求上下文（本地直调）或 SDK 版本字段不同
+        return None
+    if meta is None:
+        return None
+    if isinstance(meta, dict):
+        # mcp 2.x 收进来的是 RequestParamsMeta（TypedDict），SDK 用
+        # RequestParams.model_validate(..., by_name=False) 归一化，线上键
+        # progressToken 落成 progress_token；1.x/裸 dict 则保持原样。
+        for key in ("progressToken", "progress_token"):
+            if key in meta:
+                return meta.get(key)
+        return None
+    return (getattr(meta, "progressToken", None)
+            or getattr(meta, "progress_token", None))
+
+
+def _mcp_last_line(text: str, limit: int = 80) -> str:
+    """进度 message 里附带的最后一行输出：取最后一段非空文本并截断。"""
+    lines = [ln.strip() for ln in (text or "").replace("\r", "\n").split("\n")]
+    lines = [ln for ln in lines if ln]
+    if not lines:
+        return ""
+    return lines[-1][:limit]
+
+
+def _mcp_partial_result(st, wait) -> dict:
+    """``wait`` 到期但命令未结束时的返回：任何字段都不允许被误读成"跑完了"。
+
+    ``out`` 只是实时缓冲的最新一段，不是完整结果；``rc`` 必然是 None，
+    ``completed/partial/running/wait_exceeded`` 四个标志互相印证，再加
+    一条 ``next_action`` 指明唯一正确的后续动作（pty_tail 轮询到 END 标记）。
+    """
+    st = st or {}
+    out = st.get("tail") or ""
+    # 与完整结果的 _pack_result 对齐：从最后一条 BEGIN 标记行之后取正文，
+    # 否则 tmux 原始回显里的 "echo __AI_BEGIN__; ... __AI_END_...:$__ai_rc"
+    # 会留在 out 开头，容易被误读成"已有结束标记"。
+    idx = out.rfind("__AI_BEGIN_")
+    if idx >= 0:
+        nl = out.find("\n", idx)
+        if nl >= 0:
+            out = out[nl + 1:]
+    out = out.strip("\r\n")
+    return {
+        "ok": False,
+        "completed": False,
+        "partial": True,
+        "running": True,
+        "wait_exceeded": True,
+        "wait_seconds": wait,
+        "rc": None,
+        "out": out,
+        "elapsed": st.get("elapsed"),
+        "total": st.get("total"),
+        "channel": st.get("channel"),
+        "error": ("wait %gs 到期但命令未结束：out 只是不完整片段（%d 字节），"
+                  "rc 未知，命令仍在远端继续执行" % (wait, len(out))),
+        "next_action": ("用 pty_tail(max_bytes=4000) 反复轮询查看最新输出，"
+                        "直到 tail 中出现 __AI_END_<时间戳>__:<rc> 标记才表示命令结束；"
+                        "在此之前再调 pty_run 会返回 busy。"),
+    }
+
+
+def _mcp_run_orphan(fut) -> None:
+    """wait 提前返回后，执行线程还在跑：挂回调消费结果/异常，只落本地日志。
+
+    不消费的话 executor future 的异常会变成 "exception was never retrieved"
+    噪音；消费了还能在日志台看到这条命令最终跑成什么样。
+    """
+    def _done(f):
+        try:
+            res = f.result()
+        except Exception as exc:
+            _emit_local("[MCP] wait 提前返回的任务最终异常: %s: %s\n"
+                        % (type(exc).__name__, str(exc)[:200]))
+            return
+        if isinstance(res, dict):
+            _emit_local(
+                "[MCP] wait 提前返回的任务最终完成 rc=%s timed_out=%s out=%d 字节\n"
+                % (res.get("rc"), res.get("timed_out"),
+                   len(res.get("out") or "")))
+    try:
+        fut.add_done_callback(_done)
+    except Exception:
+        pass
+
+
+async def _mcp_await_run(fut, wait, token, ctx, tail_fn=None):
+    """等执行线程的 future，按 ``wait`` 决定最多等多久。
+
+    返回 ``(result, st)``：``result`` 非 None = 命令已结束（含 ai_bridge
+    自己的 timeout 到达，此时 result 里 ``timed_out=True``）；``result`` 为
+    None = ``wait`` 到期、命令仍在跑，``st`` 是 tail() 快照。
+
+    ``wait < 0``：等到 future 完成（原阻塞行为）；``wait = 0``：立即返回；
+    ``wait > 0``：最多等这么多秒。带 progressToken 时每 0.5s 上报一条进度。
+    """
+    wait = float(wait)
+    tail = tail_fn or ai_bridge.tail
+    loop = asyncio.get_running_loop()
+
+    async def _report():
+        st = tail(_MCP_PROGRESS_TAIL)
+        last = _mcp_last_line(st.get("tail") or "")
+        try:
+            await ctx.report_progress(
+                float(st.get("total") or 0), None,
+                "已运行 %ss，已收 %d 字节%s"
+                % (st.get("elapsed"), st.get("total") or 0,
+                   (": " + last) if last else ""))
+        except Exception:
+            pass  # 客户端断开/不支持时不影响命令本身
+
+    if wait < 0:
+        if token is None:
+            await asyncio.wait([fut])
+            return fut.result(), None
+        while True:
+            await asyncio.wait([fut], timeout=_MCP_PROGRESS_TICK)
+            if fut.done():
+                return fut.result(), None
+            await _report()
+
+    # wait>=0 也留一小段启动宽限：不然 busy / 未连接这类秒回错误会被当成
+    # "已启动并在跑"，白白返回一个空的不完整快照。
+    deadline = loop.time() + max(wait, _MCP_WAIT_START_GRACE)
+    while True:
+        remain = deadline - loop.time()
+        if remain <= 0:
+            break
+        step = min(_MCP_PROGRESS_TICK, remain) if token is not None else remain
+        await asyncio.wait([fut], timeout=step)
+        if fut.done():
+            return fut.result(), None
+        if token is not None:
+            await _report()
+    # 到点边界上刚好完成也算完成，避免把成功结果误报成不完整
+    if fut.done():
+        return fut.result(), None
+    return None, tail(_MCP_PARTIAL_OUT)
+
+
+
+def _mcp_quiet_sdk_logs() -> None:
+    """压掉无状态 streamable-http 的 INFO 噪音。
+
+    stateless 模式每请求新建一个临时 session，SDK 在拆 session 时打
+    "Terminating session: None"，既没有 id 也没法跟工具调用对应，只会把
+    真正的日志冲散。只降这一条 logger 的级别，WARNING 以上照常输出。
+    """
+    logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
+
+
+_MCP_SERVER = globals().setdefault('_MCP_SERVER', None)  # 启动/挂载成功后保存 MCP server 实例（诊断/测试用）；setdefault 防 reload 重绑丢引用
+_MCP_ASGI_APP = globals().setdefault('_MCP_ASGI_APP', None)  # 挂 1188 口模式下的 ASGI 应用。最要命的一个：已打进 RPCRequestHandler 的前置分发 wrapper 运行期按模块全局名查本变量，reload 把名字重绑回 None 后 /mcp 请求静默回落成普通 RPC 执行——setdefault 让旧钩子跨 reload 继续拿到活应用
+_MCP_HTTP_PATHS = globals().setdefault('_MCP_HTTP_PATHS', frozenset())  # 需在 RPC 口上拦截分流的路径集合；与 _MCP_ASGI_APP 同生共死，reload 丢集合同样让分流失效
+_MCP_LOOP = globals().setdefault('_MCP_LOOP', None)  # ASGI 专用事件循环（后台线程）；reload 丢引用会让 _mcp_ensure_loop 再起第二条循环线程
+_MCP_LOOP_LOCK = globals().setdefault('_MCP_LOOP_LOCK', threading.Lock())  # 循环线程启动互斥锁；reload 重造新锁 + _MCP_LOOP 名字回 None = 判空双起循环线程，锁必须与引用一起跨 reload 保活
+
+_MCP_INSTRUCTIONS = (
+    "远端服务器的常驻交互 PTY。pty_run 跑非交互命令并回收 rc/输出"
+    "（wait>=0 会提前返回不完整结果，此时 completed=false，用 pty_tail 续看）；"
+    "交互提示（密码/y/n）用 pty_send 喂键；pty_status 看会话与 broker "
+    "状态；pty_log 看本地诊断日志；画面冻结时 pty_redraw 自愈。"
+    "同一 shell 串行执行，重叠调用返回 busy。"
+    "文件工具经 MQTT RPC 在远端 server 进程里执行，路径语义是远端机器的"
+    "路径（不是 pty 客户端本机），默认允许任意路径：fs_read/fs_ls/"
+    "fs_glob/fs_grep 只读；fs_write/fs_edit/fs_mkdir/fs_move/fs_delete 可写，"
+    "仅 --fs-read-only 时整体禁用写操作。")
+
+
+def _mcp_pick_transport(server, prefer: str) -> str:
+    """选 HTTP transport：显式指定优先；自动时按 SDK 能力选。"""
+    if prefer in ("streamable-http", "sse"):
+        return prefer
+    return "streamable-http" if hasattr(server, "streamable_http_app") else "sse"
+
+
+def _new_mcp_server(host=None, port=None):
+    """构造 MCP server 实例（mcp 1.x/2.x 双兼容），返回 (server, kind)。
+
+    mcp 2.x 把 FastMCP 改名 MCPServer 且 host/port 移进 run() 参数；1.x
+    的 host/port 在构造器 Settings 里。host/port 仅独立端口模式需要。
+    不可用时返回 (None, None)。
+    """
+    try:
+        try:  # mcp 2.x
+            from mcp.server.mcpserver import MCPServer as _K
+            kind = "2"
+        except ImportError:  # mcp 1.x
+            from mcp.server.fastmcp import FastMCP as _K
+            kind = "1"
+        try:
+            if kind == "1" and port is not None:
+                return _K("pty", instructions=_MCP_INSTRUCTIONS,
+                          host=str(host), port=int(port)), kind
+            return _K("pty", instructions=_MCP_INSTRUCTIONS), kind
+        except TypeError:  # 构造器不收 instructions/host/port 的老版本
+            server = _K("pty")
+            if kind == "1" and port is not None:
+                try:
+                    server.settings.instructions = _MCP_INSTRUCTIONS
+                    server.settings.host = str(host)
+                    server.settings.port = int(port)
+                except Exception:
+                    pass
+            return server, kind
+    except Exception as exc:
+        _emit_local('[pty][MCP] mcp 包不可用，跳过（pip install "mcp[cli]" 启用）: %s\n' % exc)
+        return None, None
+
+
+def _mcp_register_tools(server) -> None:
+    """注册 MCP 工具：7 个 PTY 工具（直通 ai_bridge）+ 9 个文件工具（远端执行）。"""
+    _mcp_quiet_sdk_logs()
+
+    @server.tool()
+    @_mcp_tool
+    async def pty_run(cmd: str, timeout: float = 60.0,
+                      acquire_timeout: float = 2.0, pane: str = "",
+                      wait: float = -1.0, encoding: str = "",
+                      ctx: _MCP_CTX = None) -> dict:
+        """在常驻远程 shell 里跑一条命令，等结束标记并回收输出与退出码。
+
+        返回 {"ok", "rc", "out", "timed_out", "pane", "channel", ...}；
+        命令串行执行，上一条未结束时立刻返回 {"ok": False, "busy": True}
+        （可加大 acquire_timeout 或稍后重试）。超时只停止回收，远端命令继续
+        跑，可用 pty_send 干预或再 pty_run 收尾。
+
+        ``wait``：本次调用最多阻塞多久（秒）。默认 -1 = 一直等到命令结束或
+        ``timeout`` 上限（原行为）；0 = 启动后立即返回；正数 = 最多等这么久。
+        提前返回时**结果一定不完整**，返回里明确标注
+        ``completed=False / partial=True / running=True / wait_exceeded=True``
+        且 ``rc=None``，``out`` 只是最新一段输出；此时按 ``next_action`` 用
+        ``pty_tail`` 轮询到 ``__AI_END_<时间戳>__:<rc>`` 标记为止（这之前再调
+        pty_run 会 busy）。不要把它当成命令失败或已完成。
+
+        投递窗口：默认用会话启动时固化的 tmux 窗口（session 内 window_index
+        最小的窗口，可用 pty_pane 或 --ai-pane 改）；pane 传 "%2"/"0:2"/窗口名
+        可临时改本次目标。tmux 不可用时自动回落为直写本 PTY。
+
+        ``encoding``：留空 = 自动（无控制字符原文直发；有裸换行且会话 shell
+        是 bash/zsh 时用 ``$'...'`` 保持窗口可读；否则 base64）；``dollar``
+        强制 ANSI-C 引用；``base64`` 强制严格编码。选择只看字符构成，与命令
+        长短无关；多行命令在 Windows/未知 shell 上会自动走 base64，窗口里
+        看到的是密文，这是预期行为。
+
+        进度上报：客户端在本次请求里带 ``_meta.progressToken`` 时，命令执行
+        期间每 0.5 秒回一条 notifications/progress，message 带已运行时长、
+        已收字节数和最后一行输出；没带 token 就完全不开轮询（零额外开销）。
+        注意进度只是**中途预览**，完整结果仍以本调用最终返回的 out/rc 为准。
+        """
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(
+            None,
+            functools.partial(
+                ai_bridge.run, str(cmd), timeout=float(timeout),
+                acquire_timeout=float(acquire_timeout),
+                pane=(str(pane) if pane else None),
+                encoding=(str(encoding) if encoding else None)))
+        token = _mcp_progress_token(ctx)
+        result, st = await _mcp_await_run(fut, wait, token, ctx)
+        if result is None:
+            # 调用先返回，后台线程继续跑：挂回调消费结果/异常，避免
+            # "exception was never retrieved" 并且日志台仍能看到最终 rc。
+            _mcp_run_orphan(fut)
+            return _mcp_partial_result(st, float(wait))
+        return result
+
+    @server.tool()
+    @_mcp_tool
+    def pty_pane(pane: str = "") -> dict:
+        """查询或设置 AI 命令的默认 tmux 窗口。
+
+        pane 留空 = 只查询当前值；"auto" = 清空固化值并按「index 最小的窗口」
+        重新解析；其他值 = 固化为该 target（%2 最稳，也接受 0:2 / 窗口名）。
+        返回 {"ok", "pane", "pane_source", "tmux_ok", "encoding"}。
+        """
+        if not str(pane or "").strip():
+            return ai_bridge.get_pane()
+        return ai_bridge.set_pane(pane)
+
+    @server.tool()
+    @_mcp_tool
+    def pty_tail(max_bytes: int = 8000) -> dict:
+        """查看**正在跑**的长命令已产出的输出（不占 busy 锁，可与 pty_run 并发）。
+
+        pty_run 要等命令结束才返回；长任务期间用本工具反复调用即可看到最新
+        进度（服务端推送通道边产生边累积）。返回 {"ok", "tail", "cmd",
+        "channel", "elapsed", "total"}；channel 为 pty / tmux / tmux+push。
+        """
+        return ai_bridge.tail(max_bytes=int(max_bytes))
+
+    @server.tool()
+    @_mcp_tool
+    def pty_send(data: str) -> dict:
+        """向常驻 PTY 原样喂键，不回收输出：回答密码/y/n、发 Ctrl-C 等。
+
+        例："y\\n" 确认提示、"\\x03" Ctrl-C、"vim file\\r" 打开编辑器。
+        """
+        return ai_bridge.send(data)
+
+    @server.tool()
+    @_mcp_tool
+    def pty_status() -> dict:
+        """查询常驻会话状态：是否 attached/已结束、是否忙、broker 在线数、
+        终端写线程卡滞秒数（>2 建议 pty_redraw）等。"""
+        return ai_bridge.status()
+
+    @server.tool()
+    @_mcp_tool
+    def pty_log(n: int = 100) -> str:
+        """读最近 n 行本地诊断日志（broker 连接/RPC 请求/告警），n 夹在 1~500。"""
+        return get_log(max(1, min(int(n), 500)))
+
+    @server.tool()
+    @_mcp_tool
+    def pty_redraw() -> dict:
+        """终端写线程卡滞自愈：必要时切换本地写线程，并通知远端整屏重绘。"""
+        steps = []
+        if _OUT_WRITER is not None and _OUT_WRITER.stall_seconds() > 2.0:
+            steps.append(reset_out_writer())
+        pty = getattr(ai_bridge, "pty", None)
+        if pty is None or getattr(pty, "end_reason", None):
+            return {"ok": False, "error": "pty 未连接或已结束", "steps": steps}
+        try:
+            pty.configure(redraw=True)
+        except Exception as exc:
+            steps.append({"redraw": False, "error": str(exc)})
+            return {"ok": False, "steps": steps}
+        steps.append({"redraw": True})
+        return {"ok": True, "steps": steps}
+
+    # 文件工具（098_mcp_files）：经 transport.request 在远端执行，不经过 PTY shell
+    _mcp_register_fs_tools(server)
+
+
+def _mcp_loop_main(loop):
+    """ASGI 专用事件循环线程体。"""
+    global _MCP_LOOP
+    asyncio.set_event_loop(loop)
+    _MCP_LOOP = loop
+    loop.run_forever()
+
+
+def _mcp_ensure_loop():
+    """懒启动专用事件循环线程，返回 loop（桥接与 lifespan 共用）。"""
+    global _MCP_LOOP
+    with _MCP_LOOP_LOCK:
+        if _MCP_LOOP is None or _MCP_LOOP.is_closed():
+            loop = asyncio.new_event_loop()
+            threading.Thread(target=_mcp_loop_main, args=(loop,),
+                             name="pty-mcp-loop", daemon=True).start()
+            while _MCP_LOOP is None:
+                time.sleep(0.01)
+    return _MCP_LOOP
+
+
+def _mcp_drive_lifespan(app, loop) -> None:
+    """手动驱动 ASGI lifespan（等价 uvicorn 启动阶段）：起 session manager 等。
+
+    只发 startup 不发 shutdown：常驻服务随进程退出（线程为 daemon）。
+    """
+    q = asyncio.Queue()
+
+    async def receive():
+        return await q.get()
+
+    async def send(message):
+        if message.get("type") == "lifespan.startup.failed":
+            _emit_local("[pty][MCP] MCP lifespan 启动失败: %s\n"
+                        % message.get("message", "?"))
+
+    async def _drive():
+        await q.put({"type": "lifespan.startup"})
+        await app({"type": "lifespan", "asgi": {"version": "3.0",
+                                                "spec_version": "2.0"},
+                   "state": {}}, receive, send)
+
+    asyncio.run_coroutine_threadsafe(_drive(), loop)
+
+
+class _MCPHttpBridge:
+    """1188 口 /mcp 请求 -> MCP ASGI 应用的同步桥。
+
+    server_http 每请求一线程；ASGI 应用跑在专用事件循环线程上：请求体
+    一次性读齐，receive 首次返回后即挂起；send 的响应字节由循环线程直接
+    写回（此刻请求线程正阻塞等待，单写者安全）。无 content-length 的流式
+    响应按 Connection: close 收尾；SSE 长连接由客户端断开，写失败即整条
+    请求结束。
+    """
+
+    def __init__(self, handler):
+        self.h = handler
+
+    def run(self, app) -> None:
+        h = self.h
+        path, _, query = h.path.partition("?")
+        try:
+            length = int(h.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        body = h.rfile.read(length) if length > 0 else b""
+        body_state = {"sent": False}
+        state = {"started": False, "streaming": False}
+
+        async def receive():
+            if not body_state["sent"]:
+                body_state["sent"] = True
+                return {"type": "http.request", "body": body,
+                        "more_body": False}
+            await asyncio.Event().wait()  # 请求已完整读入：挂起等断开
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                state["started"] = True
+                h.log_request(message["status"])
+                h.send_response_only(message["status"])
+                has_len = False
+                for k, v in message.get("headers", []):
+                    name = bytes(k).decode("latin-1")
+                    value = bytes(v).decode("latin-1")
+                    low = name.lower()
+                    if low in ("connection", "transfer-encoding"):
+                        continue  # 由桥统一决定：流式时补 Connection: close
+                    if low == "content-length":
+                        has_len = True
+                    h.send_header(name, value)
+                state["streaming"] = not has_len
+                if state["streaming"]:
+                    h.send_header("Connection", "close")
+                h.end_headers()
+            elif message["type"] == "http.response.body":
+                chunk = message.get("body", b"") or b""
+                if chunk:
+                    h.wfile.write(chunk)
+                    h.wfile.flush()
+                if state["streaming"] and not message.get("more_body"):
+                    h.close_connection = True
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": h.request_version.rsplit("/", 1)[-1] or "1.1",
+            "method": h.command,
+            "scheme": "http",
+            "path": path,
+            "query_string": query.encode("latin-1"),
+            "root_path": "",
+            "server": (h.server.server_address[0], h.server.server_address[1]),
+            "client": (h.client_address[0], h.client_address[1]),
+            "headers": [(k.lower().encode("latin-1"), v.encode("latin-1"))
+                        for k, v in h.headers.items()],
+        }
+        try:
+            fut = asyncio.run_coroutine_threadsafe(app(scope, receive, send),
+                                                   _mcp_ensure_loop())
+            fut.result()
+        except (ConnectionError, BrokenPipeError, OSError):
+            h.close_connection = True  # 客户端断开：正常收尾
+        except Exception as exc:
+            _emit_local("[pty][MCP] /mcp 桥接异常: %r\n" % exc)
+            h.close_connection = True
+            if not state["started"]:
+                try:
+                    h.send_error(502, "MCP bridge error")
+                except Exception:
+                    pass
+
+
+def _mcp_hook_handler(Handler) -> None:
+    """给 RPCRequestHandler 打前置分发钩子（幂等）：保留路径分流给 ASGI 桥。"""
+    if not hasattr(Handler, "do_DELETE"):
+        # BaseHTTPRequestHandler 对未实现方法回 501；补上让 /mcp 的 DELETE
+        # （MCP 会话结束信号）有机会被钩子接管，其余 DELETE 维持 501 原状。
+        def _do_delete(self):
+            self.send_error(501, "Unsupported method (%r)" % self.command)
+        Handler.do_DELETE = _do_delete
+
+    def _wrap(fn):
+        def wrapper(self, *args, **kwargs):
+            if (_MCP_ASGI_APP is not None
+                    and self.path.split("?", 1)[0] in _MCP_HTTP_PATHS):
+                _MCPHttpBridge(self).run(_MCP_ASGI_APP)
+                return None
+            return fn(self, *args, **kwargs)
+        wrapper.__name__ = getattr(fn, "__name__", "handler")
+        wrapper.__doc__ = getattr(fn, "__doc__", None)
+        wrapper._mcp_wrapped = True  # 幂等键挂在被包装函数上而非模块级 _MCP_HOOKED 标志：标志在 reload 后重置 False 会把同一个类再包一层（请求链上叠双层路径检查），而函数对象自带标记跨 reload 永不失真
+        return wrapper
+
+    for name in ("do_GET", "do_POST", "do_DELETE"):
+        base = getattr(Handler, name, None)
+        # 已带 _mcp_wrapped 的（含 reload 前包过的旧类）直接跳过；server_http 被
+        # reload 出新类时此处自然给新类补钩子，旧类旧钩子经 setdefault 保住的
+        # _MCP_ASGI_APP 继续工作，两边都不脱靶
+        if base is not None and not getattr(base, "_mcp_wrapped", False):
+            setattr(Handler, name, _wrap(base))
+
+
+def mount_mcp_on_rpc(prefer: str = "", host: str = "0.0.0.0") -> dict:
+    """把 MCP 端点挂到 --port 已起的 HTTP RPC 服务器上（同口复用，不新开端口）。
+
+    1188 一个口上 RPC / 浏览器日志台 / MCP 三种服务并存；返回启动结果
+    dict；任何失败只进本地日志，不影响 PTY 会话。
+    """
+    global _MCP_SERVER, _MCP_ASGI_APP, _MCP_HTTP_PATHS  # 原 _MCP_HOOKED 模块标志已删除：幂等改由被包装函数上的 _mcp_wrapped 标记承担，标志在 reload 后重置 False 会失真
+    if _MCP_ASGI_APP is not None:
+        return {"ok": True, "already": True, "paths": sorted(_MCP_HTTP_PATHS)}
+    try:
+        import server_http
+    except Exception as exc:
+        return {"ok": False, "error": "server_http 不可用: %s" % exc}
+    server, kind = _new_mcp_server()
+    if server is None:
+        return {"ok": False, "error": "mcp 包不可用"}
+    _mcp_register_tools(server)
+
+    app, paths = _mcp_build_asgi(server, prefer, host)
+    if app is None or not paths:
+        return {"ok": False, "error": "当前 mcp SDK 未提供可挂载的 HTTP 应用"}
+
+    _mcp_hook_handler(server_http.RPCRequestHandler)  # 无条件调用：钩子按 fn._mcp_wrapped 自幂等，不再依赖会被 reload 重置的模块标志
+    loop = _mcp_ensure_loop()
+    _mcp_drive_lifespan(app, loop)
+    _MCP_SERVER = server
+    _MCP_HTTP_PATHS = frozenset(paths)
+    _MCP_ASGI_APP = app
+    _emit_local("[pty][MCP] MCP 工具服务已挂到 RPC 口：路径 %s（与 RPC/日志台同口复用）"
+                "  工具：pty_run/pty_send/pty_status/pty_log/pty_redraw + "
+                "fs_read/fs_write/fs_edit/fs_glob/fs_grep/fs_ls/fs_mkdir/fs_move/fs_delete\n"
+                % "、".join(sorted(paths)))
+    return {"ok": True, "paths": sorted(paths)}
+
+
+def _mcp_build_asgi(server, prefer: str, host: str):
+    """按 SDK 能力取 ASGI 应用与它占用的 HTTP 路径（优先 streamable-http）。"""
+    if prefer != "sse" and hasattr(server, "streamable_http_app"):
+        try:
+            try:
+                # 无状态模式：每请求新建 transport，不校验 Mcp-Session-Id。
+                # 有状态会话只存在进程内存里，pty 重启即整体失效；客户端断线后
+                # 往往只重连 SSE、不重新 initialize，会持续拿旧 session id 请求
+                # 并被 404 "Session not found" 拒绝，表现为「list tools failed」。
+                # 无状态下旧 id 直接忽略，重启不再断链。
+                app = server.streamable_http_app(host=str(host), stateless_http=True)
+            except TypeError:  # 旧版 SDK 不认 stateless_http：退回有状态模式
+                try:
+                    app = server.streamable_http_app(host=str(host))
+                except TypeError:
+                    app = server.streamable_http_app()
+            base = str(getattr(getattr(server, "settings", None),
+                               "streamable_http_path", None) or "/mcp").rstrip("/")
+            return app, {base, base + "/"}
+        except Exception as exc:
+            _emit_local("[pty][MCP] streamable-http 应用创建失败，改试 sse: %r\n" % exc)
+    if hasattr(server, "sse_app"):
+        try:
+            try:
+                app = server.sse_app(host=str(host))
+            except TypeError:
+                app = server.sse_app()
+            st = getattr(server, "settings", None)
+            sse = str(getattr(st, "sse_path", None) or "/sse").rstrip("/")
+            msg = str(getattr(st, "message_path", None) or "/messages").rstrip("/")
+            return app, {sse, sse + "/", msg, msg + "/"}
+        except Exception as exc:
+            _emit_local("[pty][MCP] sse 应用创建失败: %r\n" % exc)
+    return None, set()
+
+
+def start_mcp_server(port, host="0.0.0.0", prefer: str = "") -> dict:
+    """独立端口模式：在 daemon 线程里自起 MCP HTTP 服务（--mcp-port>0 时用）。
+
+    挂 1188 口的常规路径见 mount_mcp_on_rpc。返回启动结果 dict；任何失败
+    只进本地日志，不影响 PTY 会话。
+    """
+    global _MCP_SERVER
+    port = int(port)
+    if port <= 0:
+        return {"ok": False, "error": "mcp_port<=0，独立 MCP 服务未开启"}
+    if _MCP_SERVER is not None:
+        return {"ok": True, "already": True, "port": port}
+    server, kind = _new_mcp_server(host=host, port=port)
+    if server is None:
+        return {"ok": False, "error": "mcp 包不可用"}
+    _mcp_register_tools(server)
+    _MCP_SERVER = server
+
+    transport = _mcp_pick_transport(server, (prefer or "").strip().lower())
+
+    def _serve():
+        try:
+            if kind == "2":  # 2.x：host/port 是 run() 的 transport 参数
+                server.run(transport=transport, host=str(host), port=port)
+            else:
+                server.run(transport=transport)
+        except Exception as exc:
+            _emit_local("[pty][MCP] MCP 服务异常退出: %s\n" % exc)
+
+    threading.Thread(target=_serve, name="pty-mcp", daemon=True).start()
+    path = "/mcp" if transport == "streamable-http" else "/sse"
+    _emit_local("[pty][MCP] MCP 工具服务已开启（%s 独立端口）：http://%s:%d%s  "
+                "工具：pty_run/pty_send/pty_status/pty_log/pty_redraw + 9 个 fs_* 文件工具\n"
+                % (transport, host, port, path))
+    return {"ok": True, "transport": transport, "port": port, "path": path}
+
+
+# ==================== MCP 文件工具：经 MQTT RPC 在「远端」读写/编辑 ====================
+#
+# 结构说明（与 pty_* 工具的区别）：
+#   - pty 通道：ai_bridge.run() 把命令行敲进远端交互 shell（占 busy 锁、
+#     受 TTY 行规程与引号影响）；
+#   - rpc 通道：ai_bridge.transport.request(code) 把 Python 源码发到远端
+#     server_mqtt.py，在远端进程里 exec 并回传 r。不经过 shell、不占 busy
+#     锁，就是 client_mqtt.rpc(code, topic) 使用的同一条路；
+#   - 本文件的 fs_* 工具走第二条：实现函数（_fs_op_*）由客户端打包成源码，
+#     首次调用在远端 exec 并缓存，之后每次只发少量的调用参数。因此路径
+#     语义完全是**远端机器**的路径（例如 /root/build_xime_home/...），
+#     而不是 pty 客户端本机。
+#
+# 权限模型：
+#   - 读写默认都可作用于远端任意路径。pty_run 本就能执行任意代码，给写操作
+#     加根限制没有实际意义；
+#   - --fs-read-only：可选的全局只读开关（默认关闭），写家族全部禁用；
+#   - 单次读写上限 5MB；grep 有文件数与耗时上限，避免拖死远端进程。
+
+import base64
+import fnmatch
+import glob as _globmod
+import hashlib
+import inspect
+import json
+
+_FS_READ_ONLY = globals().setdefault('_FS_READ_ONLY', False)  # 只读模式：写家族一律拒绝
+_FS_LOCK = globals().setdefault('_FS_LOCK', threading.RLock())  # 客户端串行化打包/配置
+_FS_READ_MAX_BYTES = 5 * 1024 * 1024
+_FS_WRITE_MAX_BYTES = 5 * 1024 * 1024
+_FS_READ_MAX_LINES = 5000
+_FS_LINE_MAX_CHARS = 2000
+_FS_GREP_MAX_BYTES = 2 * 1024 * 1024
+_FS_GREP_MAX_FILES = 20000
+_FS_GREP_MAX_SECONDS = 5.0
+_FS_GREP_SKIP_DIRS = frozenset((
+    ".git", ".hg", ".svn", "__pycache__", ".venv", "venv", "node_modules",
+    ".gradle", "build", "dist", ".idea", ".mypy_cache", ".pytest_cache",
+))
+# 单次远端请求的超时（含 grep 的 5 秒扫描窗口与网络往返）
+_FS_CALL_TIMEOUT = globals().setdefault('_FS_CALL_TIMEOUT', 60.0)
+# 远端源码包缓存：第一次调用时打包并缓存，避免每次 inspect 重新拼
+_FS_SRC_CACHE = globals().setdefault('_FS_SRC_CACHE', None)
+
+
+def _fs_fail(msg):
+    return {"ok": False, "error": str(msg)}
+
+
+def _fs_abs(path, base=None):
+    """相对路径按 base（默认进程 cwd）解析成绝对路径。
+
+    这段代码在远端执行，所以 cwd 就是远端 server_mqtt.py 进程的工作目录。
+    """
+    p = str(path or "").strip() or "."
+    p = os.path.expanduser(p)
+    if not os.path.isabs(p):
+        p = os.path.join(base or os.getcwd(), p)
+    return os.path.abspath(p)
+
+
+def _fs_configure(read_only=False):
+    """配置只读开关（main 在挂载 MCP 前调用；也可 RPC 热调）。"""
+    global _FS_READ_ONLY
+    _FS_READ_ONLY = bool(read_only)
+    return {"ok": True, "read_only": _FS_READ_ONLY}
+
+
+def _fs_require_writable():
+    """写家族统一入口：只读模式返回错误文本，否则 None。"""
+    if _FS_READ_ONLY:
+        return "只读模式（--fs-read-only）：写操作已禁用"
+    return None
+
+
+def _fs_require_file(path):
+    real = os.path.realpath(_fs_abs(path))
+    if not os.path.exists(real):
+        return "文件不存在: %s" % real
+    if not os.path.isfile(real):
+        return "不是普通文件: %s" % real
+    return None
+
+
+def _fs_decode(data, path):
+    if b"\x00" in data[:8192]:
+        return None, "看起来是二进制文件（含 NUL 字节），拒绝按文本处理: %s" % path
+    try:
+        return data.decode("utf-8"), None
+    except UnicodeDecodeError as exc:
+        return None, "不是 UTF-8 文本，拒绝按文本处理: %s (%s)" % (path, exc)
+
+
+def _fs_clip_line(line):
+    if len(line) <= _FS_LINE_MAX_CHARS:
+        return line
+    return line[:_FS_LINE_MAX_CHARS] + "…[本行超长已截断]"
+
+
+def _fs_count_lines(text):
+    if not text:
+        return 0
+    return len(text.splitlines())
+
+
+def _fs_walk_files(base, name_glob=""):
+    """遍历待搜索文件：单文件直接返回，目录按跳过表剪枝。"""
+    if os.path.isfile(base):
+        yield base
+        return
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d not in _FS_GREP_SKIP_DIRS]
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            if name_glob:
+                rel = os.path.relpath(full, base).replace(os.sep, "/")
+                if not (fnmatch.fnmatch(name, name_glob)
+                        or fnmatch.fnmatch(rel, name_glob)):
+                    continue
+            yield full
+
+
+# ---------------- 实现层（在远端 exec 执行，勿依赖客户端状态） ----------------
+
+def _fs_op_read(file_path, offset=0, limit=2000):
+    err = _fs_require_file(file_path)
+    if err:
+        return _fs_fail(err)
+    real = os.path.realpath(_fs_abs(file_path))
+    try:
+        size = os.path.getsize(real)
+        if size > _FS_READ_MAX_BYTES:
+            return _fs_fail("文件过大（%d 字节，上限 %d）：请用 fs_grep 定位后分段读取"
+                            % (size, _FS_READ_MAX_BYTES))
+        with open(real, "rb") as f:
+            data = f.read(_FS_READ_MAX_BYTES + 1)
+    except OSError as exc:
+        return _fs_fail("读取失败: %s" % exc)
+    text, err = _fs_decode(data, real)
+    if err:
+        return _fs_fail(err)
+    lines = text.splitlines()
+    total = len(lines)
+    off = max(0, int(offset))
+    lim = max(1, min(int(limit), _FS_READ_MAX_LINES))
+    chunk = lines[off:off + lim]
+    content = "\n".join("%6d→%s" % (off + i + 1, _fs_clip_line(line))
+                        for i, line in enumerate(chunk))
+    return {
+        "ok": True,
+        "file_path": real,
+        "content": content,
+        "start_line": off + 1 if chunk else 0,
+        "total_lines": total,
+        "returned_lines": len(chunk),
+        "truncated": off + lim < total,
+        "bytes": len(data),
+    }
+
+
+def _fs_op_ls(path=".", show_hidden=True):
+    root = _fs_abs(path)
+    if not os.path.isdir(root):
+        return _fs_fail("不是目录或不存在: %s" % root)
+    entries = []
+    try:
+        with os.scandir(root) as it:
+            for entry in it:
+                if not show_hidden and entry.name.startswith("."):
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    size, mtime = st.st_size, st.st_mtime
+                except OSError:
+                    size, mtime = None, None
+                if entry.is_symlink():
+                    kind = "link"
+                elif entry.is_dir():
+                    kind = "dir"
+                elif entry.is_file():
+                    kind = "file"
+                else:
+                    kind = "other"
+                entries.append({"name": entry.name, "type": kind,
+                                "size": size, "mtime": mtime})
+    except OSError as exc:
+        return _fs_fail("读取目录失败: %s" % exc)
+    entries.sort(key=lambda x: (x["type"] != "dir", x["name"].lower()))
+    text = "\n".join(e["name"] + ("/" if e["type"] == "dir" else "") for e in entries)
+    return {"ok": True, "path": root, "total": len(entries),
+            "entries": entries, "text": text}
+
+
+def _fs_op_glob(pattern, path=".", max_results=200):
+    if not str(pattern or "").strip():
+        return _fs_fail("pattern 不能为空")
+    root = _fs_abs(path)
+    pat = str(pattern)
+    full = pat if os.path.isabs(pat) else os.path.join(root, pat)
+    cap = max(1, min(int(max_results), 1000))
+    try:
+        found = _globmod.glob(full, recursive=True)
+    except OSError as exc:
+        return _fs_fail("查找失败: %s" % exc)
+    items = []
+    for p in found:
+        if not os.path.isfile(p):
+            continue
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        items.append({"path": os.path.abspath(p),
+                      "size": st.st_size, "mtime": st.st_mtime})
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    total = len(items)
+    items = items[:cap]
+    return {"ok": True, "path": root, "pattern": pat, "total": total,
+            "matches": items, "truncated": total > cap,
+            "text": "\n".join(x["path"] for x in items)}
+
+
+def _fs_op_grep(pattern, path=".", glob="", ignore_case=False,
+                output_mode="content", context=0, head_limit=100, offset=0):
+    mode = str(output_mode or "content").strip().lower()
+    if mode not in ("content", "files_with_matches", "count"):
+        return _fs_fail("output_mode 只能是 content / files_with_matches / count")
+    try:
+        rx = re.compile(str(pattern), re.IGNORECASE if ignore_case else 0)
+    except re.error as exc:
+        return _fs_fail("正则无效: %s" % exc)
+    base = _fs_abs(path)
+    if not os.path.exists(base):
+        return _fs_fail("路径不存在: %s" % base)
+    cap = max(1, min(int(head_limit), 500))
+    skip = max(0, int(offset))
+    ctx = max(0, min(int(context), 20))
+    deadline = time.monotonic() + _FS_GREP_MAX_SECONDS
+    rows = []
+    files_hit = []
+    counts = []
+    scanned = 0
+    truncated = False
+
+    for fp in _fs_walk_files(base, str(glob or "")):
+        if scanned >= _FS_GREP_MAX_FILES or time.monotonic() > deadline:
+            truncated = True
+            break
+        scanned += 1
+        try:
+            if os.path.getsize(fp) > _FS_GREP_MAX_BYTES:
+                continue
+            with open(fp, "rb") as f:
+                data = f.read(_FS_GREP_MAX_BYTES + 1)
+        except OSError:
+            continue
+        if b"\x00" in data[:4096]:
+            continue
+        text = data.decode("utf-8", "replace")
+        lines = text.splitlines()
+        hit_lines = [i for i, line in enumerate(lines) if rx.search(line)]
+        if not hit_lines:
+            continue
+        real = os.path.abspath(fp)
+        files_hit.append(real)
+        counts.append((real, len(hit_lines)))
+        if mode != "content":
+            continue
+        hit_set = set(hit_lines)
+        keep = set()
+        for i in hit_lines:
+            keep.update(range(max(0, i - ctx), min(len(lines), i + ctx + 1)))
+        last = None
+        for i in sorted(keep):
+            if last is not None and i != last + 1:
+                rows.append("--")
+            mark = ":" if i in hit_set else "-"
+            rows.append("%s%s%d%s%s" % (real, mark, i + 1, mark, lines[i]))
+            last = i
+
+    if mode == "files_with_matches":
+        rows = files_hit
+    elif mode == "count":
+        rows = ["%s:%d" % (p, n) for p, n in counts]
+    total = len(rows)
+    picked = rows[skip:skip + cap]
+    return {
+        "ok": True,
+        "mode": mode,
+        "pattern": pattern,
+        "path": base,
+        "scanned_files": scanned,
+        "matched_files": len(files_hit),
+        "total": total,
+        "returned": len(picked),
+        "truncated": truncated or total > skip + cap,
+        "text": "\n".join(picked),
+    }
+
+
+def _fs_op_write(file_path, content):
+    target = _fs_abs(file_path)
+    err = _fs_require_writable()
+    if err:
+        return _fs_fail(err)
+    if not isinstance(content, str):
+        return _fs_fail("content 必须是字符串")
+    data = content.encode("utf-8")
+    if len(data) > _FS_WRITE_MAX_BYTES:
+        return _fs_fail("内容过大（%d 字节，上限 %d）" % (len(data), _FS_WRITE_MAX_BYTES))
+    parent = os.path.dirname(target) or os.getcwd()
+    if not os.path.isdir(parent):
+        return _fs_fail("父目录不存在: %s" % parent)
+    if os.path.isdir(target):
+        return _fs_fail("目标是目录，不能整体写入: %s" % target)
+    created = not os.path.exists(target)
+    try:
+        with _FS_LOCK:
+            with open(target, "wb") as f:
+                f.write(data)
+    except OSError as exc:
+        return _fs_fail("写入失败: %s" % exc)
+    return {"ok": True, "file_path": target, "bytes": len(data),
+            "created": created, "total_lines": _fs_count_lines(content)}
+
+
+def _fs_op_edit(file_path, old_string, new_string, replace_all=False):
+    err = _fs_require_file(file_path)
+    if err:
+        return _fs_fail(err)
+    err = _fs_require_writable()
+    if err:
+        return _fs_fail(err)
+    if not isinstance(old_string, str) or old_string == "":
+        return _fs_fail("old_string 不能为空")
+    if not isinstance(new_string, str):
+        return _fs_fail("new_string 必须是字符串")
+    real = os.path.realpath(_fs_abs(file_path))
+    try:
+        with open(real, "rb") as f:
+            data = f.read(_FS_READ_MAX_BYTES + 1)
+    except OSError as exc:
+        return _fs_fail("读取失败: %s" % exc)
+    text, err = _fs_decode(data, real)
+    if err:
+        return _fs_fail(err)
+    count = text.count(old_string)
+    if count == 0 and "\r\n" in text:
+        # 文件是 CRLF、调用方给的是 LF：先改写成 CRLF 再匹配，写回仍保持 CRLF
+        alt_old = old_string.replace("\r\n", "\n").replace("\n", "\r\n")
+        if alt_old != old_string and text.count(alt_old):
+            old_string = alt_old
+            new_string = new_string.replace("\r\n", "\n").replace("\n", "\r\n")
+            count = text.count(alt_old)
+    if count == 0:
+        return _fs_fail("未找到 old_string（文件 %d 字节；空白、缩进、换行必须完全一致）"
+                        % len(data))
+    if count > 1 and not replace_all:
+        return _fs_fail("old_string 命中 %d 处，未开 replace_all 拒绝替换：请补充上下文使其唯一"
+                        % count)
+    idx = text.find(old_string)
+    first_line = text.count("\n", 0, idx) + 1
+    if replace_all:
+        new_text = text.replace(old_string, new_string)
+    else:
+        new_text = text.replace(old_string, new_string, 1)
+    out = new_text.encode("utf-8")
+    try:
+        with _FS_LOCK:
+            with open(real, "wb") as f:
+                f.write(out)
+    except OSError as exc:
+        return _fs_fail("写回失败: %s" % exc)
+    return {"ok": True, "file_path": real,
+            "replacements": count if replace_all else 1,
+            "first_line": first_line, "bytes": len(out)}
+
+
+def _fs_op_mkdir(path, parents=True):
+    target = _fs_abs(path)
+    err = _fs_require_writable()
+    if err:
+        return _fs_fail(err)
+    if os.path.isdir(target):
+        return {"ok": True, "path": target, "created": False}
+    if os.path.exists(target):
+        return _fs_fail("已存在同名非目录: %s" % target)
+    try:
+        with _FS_LOCK:
+            if parents:
+                os.makedirs(target, exist_ok=True)
+            else:
+                os.mkdir(target)
+    except OSError as exc:
+        return _fs_fail("创建目录失败: %s" % exc)
+    return {"ok": True, "path": target, "created": True}
+
+
+def _fs_op_move(src, dst, overwrite=False):
+    s = _fs_abs(src)
+    d = _fs_abs(dst)
+    if not os.path.exists(s) and not os.path.islink(s):
+        return _fs_fail("源不存在: %s" % s)
+    err = _fs_require_writable()
+    if err:
+        return _fs_fail(err)
+    try:
+        with _FS_LOCK:
+            if os.path.exists(d) or os.path.islink(d):
+                if not overwrite:
+                    return _fs_fail("目标已存在（overwrite=true 可覆盖）: %s" % d)
+                if os.path.isdir(d) and not os.path.islink(d):
+                    shutil.rmtree(d)
+                else:
+                    os.remove(d)
+            shutil.move(s, d)
+    except OSError as exc:
+        return _fs_fail("移动失败: %s" % exc)
+    return {"ok": True, "src": s, "dst": d}
+
+
+def _fs_op_delete(path, recursive=False):
+    target = _fs_abs(path)
+    err = _fs_require_writable()
+    if err:
+        return _fs_fail(err)
+    if not os.path.lexists(target):
+        return _fs_fail("不存在: %s" % target)
+    is_dir = os.path.isdir(target) and not os.path.islink(target)
+    if is_dir and not recursive:
+        return _fs_fail("目标是目录，需 recursive=true 才能删除: %s" % target)
+    try:
+        with _FS_LOCK:
+            if is_dir:
+                shutil.rmtree(target)
+            else:
+                os.remove(target)
+    except OSError as exc:
+        return _fs_fail("删除失败: %s" % exc)
+    return {"ok": True, "path": target, "type": "dir" if is_dir else "file"}
+
+
+# ---------------- 远端源码打包与调用 ----------------
+
+# 远端执行的源码包含：固定 import 前导 + 上述常量/函数源码。注意不能包含
+# 客户端专有的东西（_FS_SRC_CACHE、_FS_CALL_TIMEOUT、MCP 注册、日志出口）。
+_FS_REMOTE_PREAMBLE = (
+    "import fnmatch, os, re, shutil, threading, time\n"
+    "import glob as _globmod\n"
+    "_FS_LOCK = threading.RLock()\n"
+)
+_FS_REMOTE_NAMES = (
+    "_FS_READ_ONLY",
+    "_FS_READ_MAX_BYTES", "_FS_WRITE_MAX_BYTES",
+    "_FS_READ_MAX_LINES", "_FS_LINE_MAX_CHARS",
+    "_FS_GREP_MAX_BYTES", "_FS_GREP_MAX_FILES", "_FS_GREP_MAX_SECONDS",
+    "_FS_GREP_SKIP_DIRS",
+    "_fs_fail", "_fs_abs", "_fs_require_writable", "_fs_require_file",
+    "_fs_decode", "_fs_clip_line", "_fs_count_lines", "_fs_walk_files",
+    "_fs_op_read", "_fs_op_ls", "_fs_op_glob", "_fs_op_grep",
+    "_fs_op_write", "_fs_op_edit", "_fs_op_mkdir", "_fs_op_move",
+    "_fs_op_delete",
+)
+
+
+def _fs_remote_source():
+    """把实现层源码打包成可远端 exec 的字符串，返回 (源码, 哈希)。"""
+    cached = globals().get('_FS_SRC_CACHE')
+    if cached:
+        return cached
+    with _FS_LOCK:
+        cached = globals().get('_FS_SRC_CACHE')
+        if cached:
+            return cached
+        chunks = [_FS_REMOTE_PREAMBLE]
+        for name in _FS_REMOTE_NAMES:
+            obj = globals().get(name)
+            if obj is None:
+                raise RuntimeError("远端文件工具源码缺少 %s" % name)
+            if callable(obj):
+                chunks.append(inspect.getsource(obj))
+            else:
+                chunks.append("%s = %r" % (name, obj))
+        src = "\n\n".join(chunks)
+        cached = (src, hashlib.sha256(src.encode("utf-8")).hexdigest())
+        globals()['_FS_SRC_CACHE'] = cached
+        return cached
+
+
+def _fs_remote_code(op, params):
+    """构造发往远端的 Python：按需 exec 源码，再调用指定实现并回传 JSON。"""
+    src, src_hash = _fs_remote_source()
+    b64_src = base64.b64encode(src.encode("utf-8")).decode("ascii")
+    payload = json.dumps(params, ensure_ascii=False)
+    b64_params = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+    return (
+        "import base64 as _b64, json as _json\n"
+        "if globals().get('_FS_SRC_HASH') != %r:\n"
+        "    exec(_b64.b64decode(%r).decode('utf-8'), globals())\n"
+        "    _FS_SRC_HASH = %r\n"
+        "_fs_out = globals()[%r](**_json.loads(_b64.b64decode(%r).decode('utf-8')))\n"
+        "r = _b64.b64encode(_json.dumps(_fs_out, ensure_ascii=False, default=str)"
+        " .encode('utf-8')).decode('ascii')\n"
+        % (src_hash, b64_src, src_hash, op, b64_params)
+    )
+
+
+def _fs_remote(op, params, write=False, timeout=None):
+    """把一次文件操作发到远端执行，返回远端返回的 dict。
+
+    走 ai_bridge.transport.request：与 client_mqtt.rpc 同一条 MQTT 一问一答
+    通道，不占用 PTY 交互 shell 的 busy 锁，也不受 TTY 行规程影响。
+    """
+    if write:
+        err = _fs_require_writable()
+        if err:
+            return _fs_fail(err)
+    transport = getattr(ai_bridge, "transport", None)
+    if transport is None:
+        return _fs_fail("PTY 会话未建立：文件工具需要经 MQTT 在远端执行，请先连上远端")
+    try:
+        resp = transport.request(_fs_remote_code(op, params),
+                                 timeout=timeout or _FS_CALL_TIMEOUT)
+    except Exception as exc:
+        return _fs_fail("远端请求异常: %r" % (exc,))
+    if not resp:
+        return _fs_fail("远端无响应（超时 %g 秒）" % (timeout or _FS_CALL_TIMEOUT))
+    err = resp.get("error") or ""
+    if err:
+        return _fs_fail("远端执行失败: %s" % err)
+    raw = resp.get("r")
+    if not raw:
+        return _fs_fail("远端返回为空")
+    try:
+        result = json.loads(base64.b64decode(raw).decode("utf-8"))
+    except Exception:
+        return _fs_fail("远端返回值无法解析: %.200r" % (raw,))
+    if write and isinstance(result, dict) and result.get("ok"):
+        if op == "_fs_op_move":
+            _emit_local("[fs] move %s -> %s\n" % (result.get("src"), result.get("dst")))
+        else:
+            _emit_local("[fs] %s %s\n" % (
+                op[len("_fs_op_"):],
+                result.get("file_path") or result.get("path") or ""))
+    return result
+
+
+# ---------------- MCP 工具层（参数校验 + 发远端） ----------------
+
+def fs_read(file_path: str, offset: int = 0, limit: int = 2000) -> dict:
+    """读取远端 UTF-8 文本文件的一段，返回带行号前缀的内容（只读）。
+
+    :param file_path: 远端机器上的文件路径（绝对路径，或相对远端进程工作目录）
+    :param offset: 起始行，0 基（默认 0，即第一行）
+    :param limit: 最多返回行数（默认 2000，上限 5000）
+    返回 {ok, file_path, content, start_line, total_lines, returned_lines,
+    truncated, bytes}；二进制或非 UTF-8 文件拒绝按文本读取。
+    """
+    return _fs_remote("_fs_op_read", {"file_path": file_path,
+                                      "offset": offset, "limit": limit})
+
+
+def fs_ls(path: str = ".", show_hidden: bool = True) -> dict:
+    """列出远端目录条目（只读）：名称/类型/大小/修改时间，目录排在前面。
+
+    :param path: 远端目录路径（默认远端进程工作目录）
+    :param show_hidden: 是否包含点开头条目（默认 true）
+    """
+    return _fs_remote("_fs_op_ls", {"path": path, "show_hidden": show_hidden})
+
+
+def fs_glob(pattern: str, path: str = ".", max_results: int = 200) -> dict:
+    """在远端按 glob 模式查找文件（只读，支持 ** 递归），按修改时间倒序返回。
+
+    :param pattern: 模式，如 "**/*.py"；也可传绝对路径模式
+    :param path: 远端基准目录（默认远端进程工作目录）
+    :param max_results: 最多返回条数（默认 200，上限 1000）
+    """
+    return _fs_remote("_fs_op_glob", {"pattern": pattern, "path": path,
+                                      "max_results": max_results})
+
+
+def fs_grep(pattern: str, path: str = ".", glob: str = "",
+            ignore_case: bool = False, output_mode: str = "content",
+            context: int = 0, head_limit: int = 100, offset: int = 0) -> dict:
+    """在远端按正则搜索文件内容（只读），自动跳过 .git/__pycache__ 与二进制。
+
+    :param pattern: Python 正则表达式
+    :param path: 远端文件或目录（默认远端进程工作目录）
+    :param glob: 可选文件名过滤，如 "*.py"（对文件名与相对路径都匹配）
+    :param ignore_case: 忽略大小写
+    :param output_mode: content=逐行结果；files_with_matches=仅文件路径；count=每文件命中数
+    :param context: content 模式每处命中前后附加的行数（默认 0，上限 20）
+    :param head_limit: 最多返回结果条数（默认 100，上限 500）
+    :param offset: 跳过前面多少条结果
+    """
+    return _fs_remote("_fs_op_grep", {
+        "pattern": pattern, "path": path, "glob": glob,
+        "ignore_case": ignore_case, "output_mode": output_mode,
+        "context": context, "head_limit": head_limit, "offset": offset,
+    })
+
+
+def fs_write(file_path: str, content: str) -> dict:
+    """整文件覆盖写入远端 UTF-8 文本（父目录必须已存在，不自动建目录）。
+
+    :param file_path: 远端目标文件路径
+    :param content: 完整文件内容
+    """
+    return _fs_remote("_fs_op_write", {"file_path": file_path,
+                                       "content": content}, write=True)
+
+
+def fs_edit(file_path: str, old_string: str, new_string: str,
+            replace_all: bool = False) -> dict:
+    """在远端精确替换字符串（old_string 必须唯一，除非 replace_all=true）。
+
+    :param file_path: 远端目标文件路径
+    :param old_string: 要替换的原文（不能为空；必须与文件内容逐字符一致）
+    :param new_string: 替换后的文本
+    :param replace_all: 是否替换全部命中（默认 false，多命中会报错）
+    CRLF 文件允许传 LF 版本的 old_string，写回时自动保持 CRLF。
+    """
+    return _fs_remote("_fs_op_edit", {
+        "file_path": file_path, "old_string": old_string,
+        "new_string": new_string, "replace_all": replace_all,
+    }, write=True)
+
+
+def fs_mkdir(path: str, parents: bool = True) -> dict:
+    """在远端创建目录（默认递归创建父目录；已存在视为成功）。
+
+    :param path: 远端目录路径
+    :param parents: true=递归建父目录，false=父目录必须已存在
+    """
+    return _fs_remote("_fs_op_mkdir", {"path": path, "parents": parents},
+                      write=True)
+
+
+def fs_move(src: str, dst: str, overwrite: bool = False) -> dict:
+    """在远端移动/重命名文件或目录。
+
+    :param src: 远端源路径
+    :param dst: 远端目标路径
+    :param overwrite: 目标已存在时是否覆盖（默认 false）
+    """
+    return _fs_remote("_fs_op_move", {"src": src, "dst": dst,
+                                      "overwrite": overwrite}, write=True)
+
+
+def fs_delete(path: str, recursive: bool = False) -> dict:
+    """删除远端文件或目录（目录需 recursive=true）。
+
+    :param path: 远端目标路径
+    :param recursive: 是否递归删除目录
+    """
+    return _fs_remote("_fs_op_delete", {"path": path, "recursive": recursive},
+                      write=True)
+
+
+# ---------------- MCP 注册 ----------------
+
+_FS_TOOLS = (
+    fs_read, fs_write, fs_edit, fs_glob, fs_grep, fs_ls,
+    fs_mkdir, fs_move, fs_delete,
+)
+
+
+def _mcp_register_fs_tools(server) -> None:
+    """把 9 个文件工具注册到 MCP server（与 pty_* 工具同一个 server 实例）。
+
+    统一包一层 _mcp_tool：请求到达时先写本地日志（原始参数），不等执行完。
+    """
+    for fn in _FS_TOOLS:
+        try:
+            server.tool()(_mcp_tool(fn))
+        except Exception as exc:  # 老版本 SDK 没有 tool() 工厂时退回 add_tool
+            try:
+                server.add_tool(_mcp_tool(fn))
+            except Exception:
+                _emit_local("[pty][MCP] 文件工具注册失败 %s: %r\n"
+                            % (getattr(fn, "__name__", "?"), exc))
 # ============================ PTY 会话 ============================
 
 # 可设置参数规格表（唯一真相源；别名表在文件前面统一声明）：
@@ -1748,23 +4403,42 @@ def _run_magic(line, ctx):
         except RemoteError as exc:
             return False, ["设置失败: %s" % exc]
         live[canon] = applied[remote_key]
-        return False, ["%s <- %s 秒（已通知服务端热调）"
-                       % (canon, applied[remote_key])]
+        lines = ["%s <- %s 秒（已通知服务端热调）"
+                 % (canon, applied[remote_key])]
+        if canon == "heartbeat":
+            # 与会话建立时（run_session 开局）同一规则联动 dead_timeout：
+            # hb<=0 → 停止判死（静默 shell 与服务器已死无法区分，不误杀）；
+            # hb>0 且判死已开启 → 下限 3×心跳。旧实现不联动：热调
+            # heartbeat 0 或调大后，静默 shell 超过陈旧的 dead_timeout 即
+            # 被误判"服务器已死"强制退出，退出路径还顺手发 stop 杀远端。
+            _hb = live["heartbeat"]
+            if _hb <= 0:
+                live["dead_timeout"] = 0.0
+                lines.append("心跳已关闭：dead_timeout 自动置 0（不再判死）")
+            elif live["dead_timeout"] > 0:
+                live["dead_timeout"] = max(live["dead_timeout"], _hb * 3)
+                lines.append("dead_timeout 联动 <- %g 秒（不小于 3×心跳）"
+                             % live["dead_timeout"])
+        return False, lines
     return False, ["未知本地命令: %s（输入 help 查看）" % cmd]
 
 
-def _hard_exit(console, code: int, message: str, pty=None):
+def _hard_exit(console, code: int, message: str, pty=None, leave=False):
     """学 client_mqtt.py 的退出风格：直接 ``os._exit``，干脆不拖泥带水。
 
     旧路径退出时要 pty.close() 干等 end 帧 1.5s + join 输入线程 2s +
     transport.stop() 逐个 broker disconnect——服务器已死时这些等待全都
     纯属浪费，界面就是这样"卡住"的。``os._exit`` 会跳过所有 finally，
-    所以这里必须自己先把终端模式恢复；stop 帧只 fire-and-forget（能发
-    出去就让远端顺手收尸，发不出去也不等）。
+    所以这里必须自己先把终端模式恢复。
+
+    leave=True（Ctrl-]/命令栏 detach 的本地脱离路径）：走 pty.leave()，
+    只清本地订阅、不发 stop——远端 shell/tmux 按承诺继续运行，孤儿会话
+    由服务端 TTL 收割。leave=False（判死/会话已结束/中断等退出路径）：
+    stop 帧只 fire-and-forget（能发出去就让远端顺手收尸，发不出去也不等）。
     """
     if pty is not None:
         try:
-            pty.detach()
+            pty.leave() if leave else pty.detach()
         except Exception:
             pass
     try:
@@ -1802,6 +4476,12 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     # 挂到 AI 桥：外部经本地 HTTP RPC 调用 ai_bridge 即复用本 PTY，
     # attach 放在 open 之前，保证最早的握手回显也能被 feed 分流到。
     ai_bridge.attach(pty, transport)
+    # 注入 AI 投递配置：--ai-pane 为空时保持 auto——这里**不能**立刻解析默认
+    # 窗口，因为 attach 发生在 pty.open 之前，远端 tmux 还没被前置命令
+    # （如 "tmux at"）启动；首次 run() 时才解析并按需固化。
+    # --ai-encoding 默认 raw：命令原文直接在窗口里可见。
+    ai_bridge.configure(getattr(args, "ai_pane", ""),
+                        getattr(args, "ai_encoding", "raw"))
     outq: "queue.Queue[bytes]" = queue.Queue()
     stop_ev = threading.Event()
     term = args.term or os.environ.get("TERM") or "xterm-256color"
@@ -1856,11 +4536,15 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                    on_responders=lambda rs: _emit_local(
                        _responders_warning(rs)))
 
+    # 会话启动时把远端登录 shell 记入 AI 桥：多行命令能否用可读的 $'...'
+    # 编码取决于它，探测不到（dash/未知）就由 _pick_encoding 退回 base64。
+    ai_bridge.set_shell(env.get("shell") if env else None)
+
     banner = (
         f"[{stime()}] connected shell={env['shell']} pid={env['pid']} "
         f"({env['rows']}x{env['cols']}, interval={env['flush_interval']})\t"
         f"{env['in_topic']}\t{env['out_topic']}\n"
-        f"[pty] {_describe_key(detach_key)} 本地脱离（远端 tmux 不受影响）；"
+        f"[pty] {_describe_key(detach_key)} 本地脱离（远端 shell/tmux 继续运行）；"
         f"{_describe_key(menu_key)} 本地命令栏（detach/status/时间参数）；"
         f"远端 exit/Ctrl-D 结束会话\n")
     if env.get("cwd_warning"):
@@ -1898,10 +4582,12 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     console = _make_raw_console()
     # 终端输出全部交给异步写线程：唯一可能阻塞的原生控制台 IO 只发生在
     # 那个可牺牲线程上，渲染主线程 / RPC 线程再也不会被控制台堵死。
-    # term_out 仍锁定真实二进制流（RPC 线程会把 sys.stdout 换成 StringIO）。
-    term_out = _bin_stdout()
-    if term_out is not None:
-        _OUT_WRITER = _TerminalWriter(term_out, name="pty-out")
+    # 通道用 _ConsoleSink（Win32 WriteConsoleW + 自有锁），彻底绕开
+    # sys.stdout.buffer 那个共享 BufferedWriter——它的 flush 在遇到半截
+    # UTF-8 时会零进度死循环并占死锁（2026-10-25 实证）。
+    if _bin_stdout() is not None:
+        _OUT_WRITER = _TerminalWriter(_new_console_sink("pty-out"),
+                                      name="pty-out")
 
     def _out_write(data: bytes) -> None:
         if _OUT_WRITER is not None:
@@ -2128,7 +4814,8 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     # 主线程：远端输出原样渲染；任何退出路径都走 _hard_exit 立即收场
     held = bytearray()  # 本地命令栏打开期间暂存远端输出，关闭后补画
     last_stall_warn = [0.0]  # 卡滞告警节流（每 30s 一条）
-    auto_unstick_done = [False]  # 本轮冻结是否已自动解除（解冻后重新武装）
+    last_unstick_ts = [0.0]  # 上次尝试自动解除的时间（每 30s 重试直到成功）
+    last_writer_reset_ts = [0.0]  # 上次自动切换写线程的时间（每 60s 一次）
     try:
         while not stop_ev.is_set():
             try:
@@ -2146,21 +4833,46 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                           if _OUT_WRITER is not None else 0.0)
                 if _stall > 10 and (time.monotonic() - last_stall_warn[0]) > 30:
                     last_stall_warn[0] = time.monotonic()
+                    _snap = _writer_sink_snapshot()
                     _emit_local(
-                        "[pty][WARN] 终端写卡滞 %.0fs：若窗口处于选择/"
-                        "标记模式请按 ESC 解除，或命令栏执行 redraw "
-                        "切换写线程\n" % _stall)
+                        "[pty][WARN] 终端写卡滞 %.0fs（通道=%s 零进度=%s次 "
+                        "carry=%sB 持锁线程=%s）：窗口选择/标记模式请先点"
+                        "本窗口再按 ESC；否则 60s 后自动换新输出通道\n"
+                        % (_stall, _snap.get("kind"),
+                           _snap.get("zero_progress"),
+                           _snap.get("carried_bytes"),
+                           _snap.get("holder")))
                 # 长时间冻结（通常是选了文本忘记退出标记模式）：前台时
-                # 合成 ESC 自动解除，鼠标左键选择/右键粘贴照常保留
+                # 合成 ESC 自动解除，鼠标左键选择/右键粘贴照常保留。
+                # 每 30s 重试直到成功：解除仅在窗口前台时生效，用户切到
+                # 别的窗口时一次尝试必然失败，旧的一次性设计会让冻结
+                # 一直挂到手工干预（实证：卡滞 7 分钟未自愈）。
                 if _stall >= _SELECTION_STALL_AUTO_UNSTICK \
-                        and not auto_unstick_done[0]:
+                        and (time.monotonic() - last_unstick_ts[0]) > 30:
+                    last_unstick_ts[0] = time.monotonic()
                     if _cancel_console_selection():
-                        auto_unstick_done[0] = True
                         _emit_local(
                             "[pty] 窗口选择模式冻结输出超过 %.0f 秒，"
                             "已自动解除\n" % _SELECTION_STALL_AUTO_UNSTICK)
-                if auto_unstick_done[0] and _stall == 0.0:
-                    auto_unstick_done[0] = False  # 解冻恢复，允许处理下次冻结
+                # 写线程活锁兜底（2026-10-25 实证）：源头是半截 UTF-8 让
+                # BufferedWriter.flush 零进度死循环并占死共享锁。现在新通道
+                # 换的是新锁 + 新 CONOUT$ 句柄，旧实例卡死也拖不住新写线程。
+                if _stall >= 60.0 \
+                        and (time.monotonic() - last_writer_reset_ts[0]) > 60:
+                    last_writer_reset_ts[0] = time.monotonic()
+                    # 换新通道（新锁 + 新 CONOUT$ 句柄）才真正有效；次数
+                    # 封顶防止"换了也没用"的极端场景无限堆线程。
+                    if _WRITER_RESETS >= _AUTO_RESET_MAX:
+                        _emit_local("[pty] 写卡滞 %.0fs，自愈已尝试 %d 次，"
+                                    "停止自动换通道（需人工介入）\n"
+                                    % (_stall, _WRITER_RESETS))
+                    else:
+                        _r = reset_out_writer()
+                        _emit_local("[pty] 写卡滞 %.0fs，自动换输出通道: "
+                                    "ok=%s resets=%s零进度=%s\n"
+                                    % (_stall, _r.get("ok"),
+                                       _r.get("resets"),
+                                       (_r.get("old") or {}).get("sink")))
                 if pty.end_reason is not None:
                     _hard_exit(
                         console, 0,
@@ -2183,8 +4895,11 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     except KeyboardInterrupt:
         _hard_exit(console, 130, "\r\n[pty] interrupted\r\n", pty)
 
-    # input_loop 结束：Ctrl-] 本地脱离 / 本地 stdin 关闭
-    _hard_exit(console, 0, "\r\n[pty] session ended: detached\r\n", pty)
+    # input_loop 结束：Ctrl-] 本地脱离 / 本地 stdin 关闭。
+    # leave=True：只清本地订阅不发 stop，远端 shell/tmux 继续运行
+    # （与 banner/帮助文案的承诺一致；裸 shell 前台作业不再被误杀）。
+    _hard_exit(console, 0, "\r\n[pty] session ended: detached\r\n", pty,
+               leave=True)
     return 0  # 不可达：_hard_exit 不返回；仅为类型/静态检查保留
 
 
@@ -2242,6 +4957,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(*_cm._cli_opts(*alias_rpc_host), dest="host",
                    default="0.0.0.0",
                    help="本地 AI 控制口绑定地址（默认 0.0.0.0）；仅本机调用建议 127.0.0.1")
+    p.add_argument(*_cm._cli_opts(*alias_mcp_port), dest="mcp_port",
+                   type=int, default=0,
+                   help="MCP 工具服务：0=自动（默认，挂在 --port 的 RPC 口 /mcp 路径，"
+                        "不新开端口）；>0=另起独立端口（--port 0 关闭 RPC 口时仍要 "
+                        "MCP 用）；需 pip install \"mcp[cli]\"，未装包仅记日志")
+    p.add_argument(*_cm._cli_opts(*alias_no_mcp), dest="no_mcp",
+                   action="store_true",
+                   help="完全关闭 MCP 工具服务（默认开启并复用 --port 的口）")
+    p.add_argument(*_cm._cli_opts(*alias_mcp_transport), dest="mcp_transport",
+                   default="",
+                   help="MCP 传输类型：留空自动（优先 streamable-http，旧版 mcp 包 "
+                        "退回 sse），可显式 streamable-http / sse")
+    p.add_argument(*_cm._cli_opts(*alias_fs_read_only), dest="fs_read_only",
+                   action="store_true",
+                   help="MCP 文件工具全只读：禁用 fs_write/fs_edit/fs_mkdir/"
+                        "fs_move/fs_delete（默认关闭，允许写任意路径）")
+    p.add_argument(*_cm._cli_opts(*alias_ai_pane), dest="ai_pane",
+                   default="",
+                   help="AI 命令默认投递到哪个 tmux 窗口：留空 = 自动按「session "
+                        "内 window_index 最小的窗口」解析并固化；也可传 pane_id "
+                        "（百分号前缀，如 2）或 0:2 / 窗口名（RPC 的 pty_pane 可运行时改）")
+    p.add_argument(*_cm._cli_opts(*alias_ai_encoding), dest="ai_encoding",
+                   default="raw",
+                   help="AI 命令编码：raw = 自动（默认，无控制字符原文直发；有裸"
+                        "换行且 shell 为 bash/zsh 时用 $'...' 保持可读；否则 "
+                        "base64）；dollar = 强制 ANSI-C 引用；base64 = 强制严格"
+                        "编码")
     # SSH 式可选位置参数：连接成功后自动敲进常驻 shell 的前置命令，如
     # ``pty_client_mqtt.py -t q -k *** "tmux at"``；REMAINDER 保证命令自身
     # 的 -x 选项（tmux attach -d）不会被本客户端解析。命令结束后会话继续，
@@ -2272,6 +5014,8 @@ def main(argv=None) -> int:
         return 2
     
     _enable_output_vt()
+    # 启动自检：本文件是否仍是 pty/parts 分片重组出来的最新版（不同步只告警）
+    check_parts_sync()
     signed = bool(str(args.key or "").strip())
     t_conn = time.monotonic()
     _info("正在并发连接 %d 个公共 MQTT broker（多路径冗余，首个连上即继续，通常不足 1 秒）..."
@@ -2315,7 +5059,26 @@ def main(argv=None) -> int:
         lan = _lan_ip()
         _info(f"本地 AI 控制口已开启：http://{lan}:{args.port}/"
               f"根路径自动跳转 /log_html(p)")
-    
+
+    # MCP 文件工具权限：默认读写任意路径，--fs-read-only 才全禁写。
+    # 必须在挂载 MCP 前配置好。
+    _fs_configure(getattr(args, "fs_read_only", False))
+
+    # MCP 工具服务：默认复用 --port 的 HTTP 口（路径 /mcp，与 RPC/日志台
+    # 同口并存，不新开端口）；--mcp-port>0 才另起独立端口（--port 0 时仍要
+    # MCP 的场景）；--no-mcp 全关。没装 mcp 包只记日志，PTY 照常工作。
+    if not getattr(args, "no_mcp", False):
+        _prefer = getattr(args, "mcp_transport", "") or ""
+        if int(getattr(args, "mcp_port", 0) or 0) > 0:
+            start_mcp_server(port=int(args.mcp_port), host=args.host,
+                             prefer=_prefer)
+        elif args.port:
+            _mcp = mount_mcp_on_rpc(prefer=_prefer, host=args.host)
+            if _mcp.get("ok") and not _mcp.get("already"):
+                _info(f"MCP 工具服务已挂到 RPC 口：http://{_lan_ip()}:{args.port}/mcp  "
+                      f"AI 客户端：claude mcp add --transport http pty "
+                      f"http://{_lan_ip()}:{args.port}/mcp")
+
     try:
         return run_session(transport, args, rows, cols)
     except RemoteError as exc:

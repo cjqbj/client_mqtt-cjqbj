@@ -348,6 +348,61 @@ class Socks5TemplateLiveTests(unittest.TestCase):
             timeout=5)
         self.assertTrue(ok, "stop 后未广播 end 帧")
 
+    # ---- R2：_in_loop 单帧异常不得带死会话（畸形帧防护） ----
+
+    def test_malformed_frames_do_not_kill_session(self):
+        """畸形 seq / 缺 port 的 open 帧只丢帧计数，会话继续可用。
+
+        旧行为：int(seq) / int(port None) 的异常直接打死 _in_loop 线程，
+        跳过全部收尾——心跳照发、会话表面健康，上行彻底黑洞直到 TTL。
+        """
+        srv = _OneShotServer(echo=True, close_delay=0.2)
+        srv.start()
+        try:
+            self._start()
+            # 1) 畸形 seq：非数字
+            self._send({"d": "x"}, seq="abc", cid=50)
+            self._send({"d": "x"}, seq=None, cid=50)   # None 走无 seq 宽松路径
+            # 2) open 帧缺 port：_deliver 建线程参数 int(None) 抛
+            self._send({"open": {"host": "127.0.0.1"}}, seq=0, cid=51)
+            # open 解析失败必须按 deliver_error 收尾该 cid（条目已建、
+            # worker 没起来），客户端能看到 closed 帧
+            closed = self._wait_frame(51, "closed", timeout=5.0)[0]
+            self.assertEqual(closed.get("reason"), "deliver_error")
+            # 3) 会话仍健康：正常 open+回显一条真实连接
+            self._open(52, srv.port)
+            opened = self._wait_frame(52, "opened", timeout=5.0)[0]["opened"]
+            self.assertTrue(opened.get("ok"), opened)
+            self._send({"d": "alive-after-garbage"}, seq=1, cid=52)
+            ok = _wait_for(lambda: srv.got == b"alive-after-garbage", timeout=5)
+            self.assertTrue(ok, "垃圾帧后上行数据未被送达目标：_in_loop 已死？")
+            # 4) 心跳捎带 fe（帧错误计数）>0
+            ok = _wait_for(
+                lambda: any(isinstance(d.get("fe"), int) and d["fe"] >= 1
+                            for _, d in self.net.frames(self.out_t)
+                            if d.get("hb") is not None),
+                timeout=5)
+            self.assertTrue(ok, "心跳未捎带 fe 帧错误计数")
+            # 5) stop 收尾照常（end 帧可发出=收尾路径未被破坏）
+            self._send({"stop": True})
+            ok = _wait_for(
+                lambda: any(d.get("end") for _, d in self.net.frames(self.out_t)),
+                timeout=5)
+            self.assertTrue(ok, "垃圾帧后 stop 未能正常收尾")
+        finally:
+            srv.shutdown()
+            srv.join(timeout=3)
+
+    def test_garbage_non_dict_and_wrong_sid_ignored(self):
+        """非 dict 帧 / 错 sid 帧被静默忽略且不影响后续处理。"""
+        self._start()
+        self.net.deliver(self.in_t, {"not": "a socks5 frame"})
+        self._send({"s5": "other-sid", "d": "x"}, seq=0, cid=60)
+        dead_port = _free_tcp_port()
+        self._open(61, dead_port)
+        closed = self._wait_frame(61, "closed", timeout=6.0)[0]
+        self.assertEqual(closed.get("reason"), "connect_failed")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

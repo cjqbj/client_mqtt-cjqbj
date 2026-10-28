@@ -305,6 +305,9 @@ def _cmq_socks5_start():
         # 上一会话的累计错误数和 last 文案，客户端据此误判新链路质量。
         _pub_err = 0
         _pub_last = None
+        # _in_loop 单帧处理异常计数（畸形帧防护，见 _in_loop_run）：经心跳
+        # fe 字段暴露给客户端，>0 说明有上行帧被丢弃，应排查数据完整性。
+        _fr_errs = 0
 
         def _pub_fail(_msg):
             # 注意 paho 在断连 client 上 publish() 通常**不抛异常**，而是
@@ -794,14 +797,14 @@ def _cmq_socks5_start():
                 except Exception:
                     _close_conn(_cid, "backpressure")
 
-        def _in_loop():
+        def _in_loop_run():
             # 上行重组：同一帧被每个 broker 各投递一次且会乱序。按 per-cid
             # seq 连续放行；缺口超 _GAP 秒判真丢帧——SOCKS5 承载 TCP 流，
             # 跳号=数据损坏，必须断连而不是像 PTY 那样跳号放行。
             # nonlocal：_pb/_pace_intv 必须与 _bulk_pub/_bsend_loop 读的
             # 是同一个闭包单元；global 会让 pb 写进模块全局而 bulk 路径
             # 永远读到空名单（大帧全部退回 13 broker 广播）。
-            nonlocal _pb, _pace_intv
+            nonlocal _pb, _pace_intv, _fr_errs
             while not _end.is_set():
                 try:
                     _fr = _inq.get(timeout=0.25)
@@ -829,7 +832,11 @@ def _cmq_socks5_start():
                                 _NACK_INTV * (1.5 ** _s2.get("nr", 0)), 3.0)
                             _s2["nr"] = _s2.get("nr", 0) + 1
                 for _c2 in _gaps:
-                    _close_conn(_c2, "uplink_gap")
+                    # 收尾路径异常不允许带死会话单点线程：计数后继续
+                    try:
+                        _close_conn(_c2, "uplink_gap")
+                    except Exception:
+                        _fr_errs += 1
                 for _c2, _seqs in _nacks:
                     # 上行缺口：让客户端从它的 per-conn 缓存补发（全 broker
                     # 控制帧）；硬超时仍补不齐才 uplink_gap 断连。
@@ -876,11 +883,17 @@ def _cmq_socks5_start():
                     continue
                 _nkv = _fr.get("nack")
                 if isinstance(_nkv, (list, tuple)):
-                    _retrans(_cid, _nkv)  # 下行缺帧补发请求
+                    try:
+                        _retrans(_cid, _nkv)  # 下行缺帧补发请求
+                    except Exception:
+                        _fr_errs += 1
                     continue
                 _sq = _fr.get("seq")
                 if _sq is None:
-                    _deliver(_cid, _fr)  # 无 seq 帧宽松放行（兼容）
+                    try:
+                        _deliver(_cid, _fr)  # 无 seq 帧宽松放行（兼容）
+                    except Exception:
+                        _fr_errs += 1
                     continue
                 _ready = []
                 with _lock:
@@ -889,7 +902,12 @@ def _cmq_socks5_start():
                         _st = {"next": 0, "pending": {}, "deadline": None,
                                "nd": None, "nr": 0}
                         _ingress[_cid] = _st
-                    _sq = int(_sq)
+                    try:
+                        _sq = int(_sq)
+                    except Exception:
+                        # 畸形 seq（非数字字符串等）：丢帧计数，绝不带死会话
+                        _fr_errs += 1
+                        continue
                     if _sq >= _st["next"]:
                         if len(_st["pending"]) < 128:
                             _st["pending"][_sq] = _fr
@@ -907,13 +925,29 @@ def _cmq_socks5_start():
                             _st["nr"] = 0
                     # _sq < next：多 broker 重复副本，丢弃
                 for _f2 in _ready:
-                    _deliver(_cid, _f2)
+                    try:
+                        _deliver(_cid, _f2)
+                    except Exception:
+                        # open 帧的 int(port) 解析等可抛路径发生在 _deliver
+                        # 内：丢帧计数，并按连接级错误收尾该 cid（_conns 条
+                        # 目此时可能已建而 worker 线程没起来，不收尾会挂到
+                        # 会话结束）
+                        _fr_errs += 1
+                        try:
+                            _close_conn(_cid, "deliver_error")
+                        except Exception:
+                            pass
 
-            # 会话结束：关全部连接、退订、弹注册表、发 end 帧
+        def _teardown():
+            # 会话结束：关全部连接、退订、弹注册表、发 end 帧。
+            # 单步全部兜异常：收尾路径的任何失败不允许短路后续步骤。
             with _lock:
                 _all = list(_conns.keys())
             for _c3 in _all:
-                _close_conn(_c3, "session_end")
+                try:
+                    _close_conn(_c3, "session_end")
+                except Exception:
+                    pass
             try:
                 _net._cmq_pty_router.pop(_in_topic, None)
             except Exception:
@@ -944,6 +978,17 @@ def _cmq_socks5_start():
                 _bq.put_nowait(None)   # 停平滑发送线程
             except Exception:
                 pass
+
+        def _in_loop():
+            # 会话单点守卫：_in_loop_run 抛任何未预见异常也必须走完收尾。
+            # 原先收尾块跟在 while 后面，线程一死全部跳过——心跳照发、
+            # 会话表面健康，上行却彻底黑洞，_inq 无界堆积直到 24h TTL。
+            # 线程 target 名保持 _in_loop：e2e 测试按函数名从其闭包向下
+            # 钻取会话私有状态（_in_loop_run/_teardown 的 cell 可达）。
+            try:
+                _in_loop_run()
+            finally:
+                _teardown()
 
         # ---- 路由安装：与 PTY 共用同一份 _cmq_pty_* 基建（按 topic 分发到
         # 各自队列）。哪个模板先握手就由谁安装，后到者只注册 topic；
@@ -1039,6 +1084,7 @@ def _cmq_socks5_start():
                           "srv": _srv_brokers(),
                           "c": _srv_conns(),
                           "pe": _pub_err,
+                          "fe": _fr_errs,
                           "pl": _pub_last})
                 except Exception:
                     pass

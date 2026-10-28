@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-import sys, io, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, asyncio, textwrap, inspect, ast
+import sys, io, re, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, asyncio, textwrap, inspect, ast, hmac, weakref
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 import rpc_executor
-
-_stdout_lock = threading.Lock()
+from rpc_executor import PythonExecutor, format_result ,stime
 
 
 def get_bmp_bytes(rgb=None, size=(16, 16)):
@@ -30,29 +29,27 @@ def get_bmp_bytes(rgb=None, size=(16, 16)):
     return bmp_header + bmp_info + pixels
 
 
-def pretty_format(obj, width=120):
-    if isinstance(obj, str):
-        return obj
-    try:
-        from IPython.lib.pretty import pretty
-        return pretty(obj, max_width=width)
-    except ImportError:
-        try:
-            from pprint import pformat
-            return pformat(obj, width=width)
-        except Exception:
-            return repr(obj)
-
-
-def stime():
-    import time
-    ft = time.time()
-    return time.strftime('%Y-%m-%d__%H.%M.%S', time.localtime(ft)) + '__.' + f"{ft:.3f}".split('.')[1]
-
-
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # 每服务器独立的 RPC 配置快照，由 start_rpc_server 在绑定后写入；
+    # handler 经 _conf(self, name) 读取。None 表示走类属性回退。
+    rpc_config = None
+    # Windows 的 SO_REUSEADDR 与 Linux 语义不同：Linux 只允许复用 TIME_WAIT
+    # 状态的端口，Windows 却允许两个都设了该选项的 socket 同时 bind 同一
+    # 监听端口（已实测复现：第二次 bind 静默成功，netstat 出现两个
+    # LISTENING）。旧实例没退干净时新实例照常"启动成功"，但新连接可能被
+    # 投递给旧 listener 的内核 backlog——客户端表现为 TCP 连上、请求发出
+    # 后永远无响应。Windows 改用 SO_EXCLUSIVEADDRUSE 占住端口：端口被占
+    # 时启动立即报 WinError 10013/10048，快速失败而不是静默双绑挂死。
+    if sys.platform == 'win32':
+        allow_reuse_address = False  # 与 SO_EXCLUSIVEADDRUSE 互斥，必须关闭
+    else:
+        allow_reuse_address = True   # POSIX 保持原语义：仅复用 TIME_WAIT
+
+    def server_bind(self):
+        if sys.platform == 'win32':
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 class WebSocket:
@@ -136,8 +133,105 @@ class WebSocket:
         return data
 
 
+def _split_code_strings(code):
+    """按字符串字面量边界切段，返回 [(片段, 是否字符串), ...]。
+
+    裸路径救援只允许改写字符串外的部分，因此先把 'xxx' / "xxx" / 三引号
+    （含转义）整段切出来跳过，避免把字符串内容里的路径再包一层引号。
+    """
+    segments = []
+    buf = []
+    i, n = 0, len(code)
+    while i < n:
+        ch = code[i]
+        if ch in '\'"':
+            triple = code[i:i + 3]
+            if triple in ('"""', "'''"):
+                end = code.find(triple, i + 3)
+                end = n if end == -1 else end + 3
+            else:
+                j = i + 1
+                while j < n and code[j] != ch:
+                    j += 2 if code[j] == '\\' else 1
+                end = min(j + 1, n)
+            segments.append((''.join(buf), False))
+            buf = []
+            segments.append((code[i:end], True))
+            i = end
+        else:
+            buf.append(ch)
+            i += 1
+    segments.append((''.join(buf), False))
+    return segments
+
+
+# 表达式起始位置：前一个非空白字符是这些（或整段开头）时，token 才可能被救援。
+# mid 表达式的 a/b 是合法除法，轮不到救援；能走到救援的前提是整段已 SyntaxError。
+_EXPR_START_CTX = '=(,[{;'
+# POSIX 绝对路径 /a/b.txt 与盘符路径 C:/a/b.txt、C:\\a\\b.txt（段内无空白）
+_PATH_TOKEN_RE = re.compile(r'(?:[A-Za-z]:)?(?:[/\\][\w.\-]+)+[/\\]?')
+
+
+def _rescue_path_syntax(code):
+    """给裸路径 token 补引号，如 ``file=/tmp/txt`` → ``file='/tmp/txt'``。
+
+    URL 即代码场景里手输路径常不带引号，而 /tmp/txt 在 Python 里是语法错误。
+    仅当整段代码已 SyntaxError 时由 handle_rpc 调用本函数重试：跳过字符串
+    字面量内部；只处理位于表达式起始位置（见 _EXPR_START_CTX）的路径 token，
+    避免误伤除法与 http:// 协议头；含反斜杠的 Windows 路径转义后按普通串包。
+    无法安全改写时原样返回，由调用方保留原始报错。
+    """
+    out = []
+    changed = False
+    for segment, is_string in _split_code_strings(code):
+        if is_string or not segment:
+            out.append(segment)
+            continue
+        pos = 0
+        for m in _PATH_TOKEN_RE.finditer(segment):
+            token = m.group(0)
+            context = ''.join(out) + segment[:m.start()]
+            prev = next((c for c in reversed(context) if not c.isspace()), '')
+            if prev and prev not in _EXPR_START_CTX:
+                continue
+            literal = token.replace('\\', '\\\\')
+            out.append(segment[pos:m.start()])
+            out.append("'" + literal + "'")
+            pos = m.end()
+            changed = True
+        out.append(segment[pos:])
+    return ''.join(out) if changed else code
+
+
+# 同进程内活着的 RPC 服务器（弱引用）：set_basic_auth 等运行期开关需要
+# 同步推进每台服务器自己的 rpc_config，只改类属性碰不到它们。
+# setdefault 而非直接赋值：importlib.reload 复用同一模块 __dict__ 重新
+# 执行顶层代码，直接赋值会把名字重绑到全新空集，reload 前启动的服务器
+# 全部失联（新代码 set_basic_auth 广播不到它们）；setdefault 在 reload
+# 后取回旧 WeakSet，配合挂在服务器实例上的 rpc_config，跨 reload 的
+# 动态开关依然完整生效。
+_rpc_servers = globals().setdefault('_rpc_servers', weakref.WeakSet())
+
+
+def _conf(handler, name):
+    """按优先级取 RPC 配置：所属 server 的 rpc_config → handler 属性 → 类属性。
+
+    配置快照挂在 ThreadedHTTPServer 实例上后，同进程第二次 start_rpc_server
+    不再抢走第一个服务器的 key/executor/favicon 等状态。WSGI 垫片没有
+    server 对象（listen=False 路径只写类属性），自然落到后面的回退级。
+    """
+    config = getattr(getattr(handler, 'server', None), 'rpc_config', None)
+    if isinstance(config, dict) and name in config:
+        return config[name]
+    if hasattr(handler, name):
+        return getattr(handler, name)
+    return getattr(RPCRequestHandler, name)
+
+
 class RPCRequestHandler(BaseHTTPRequestHandler):
     key = ''
+    # HTTP Basic 认证凭据 'user:password'；空串不启用认证
+    basic_auth = ''
     # 复用一个持久化的执行器实例；请求级上下文通过 execute(globals=...) 注入。
     executor = None
     favicon_bytes = None
@@ -150,10 +244,41 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
     # 线程上，避免控制台堵塞时 BaseHTTPRequestHandler 的 print 拖死请求线程
     log_sink = None
 
+    @classmethod
+    def set_basic_auth(cls, user='', pw=''):
+        """传入 user/pw 即开启 HTTP Basic 认证；都为空则关闭。
+
+        供 RPC 动态调用（如 /RPCRequestHandler.set_basic_auth('admin','123')），
+        也可在代码里直接调用。除类属性外还要推进每台活服务器自己的
+        rpc_config——native 请求优先读服务器快照，只改类属性碰不到它们。
+        """
+        value = f"{user}:{pw}" if (user or pw) else ''
+        cls.basic_auth = value
+        for server in list(_rpc_servers):
+            config = getattr(server, 'rpc_config', None)
+            if isinstance(config, dict):
+                config['basic_auth'] = value
+        return value or 'basic auth disabled'
+
     def log_message(self, format, *args):
+        try:
+            text = format % args
+        except Exception:
+            text = str(format)
+        # /mcp 的一次工具调用在 HTTP 层会伴随 initialize/notifications/tool
+        # call 多条 POST，2xx 访问行既无工具名也无参数，只会把日志冲散；
+        # 真正的调用轨迹由 pty 侧 [MCP] <id> ┌/└ 首尾配对承担。这里只在
+        # 4xx/5xx 保留访问行，便于排查协议层失败。
+        if '/mcp' in text:
+            try:
+                code = int(text.rsplit('"', 1)[-1].split()[0])
+            except Exception:
+                code = 0
+            if 200 <= code < 400:
+                return
         line = (f"[RPC] {stime()[12:]}  {self.client_address[0]}:"
-                f"{self.client_address[1]} {format % args}\n")
-        sink = self.log_sink
+                f"{self.client_address[1]} {text}")
+        sink = _conf(self, 'log_sink')
         if sink is not None:
             try:
                 sink(line)
@@ -162,26 +287,59 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 pass  # sink 挂了退回 print，不能让日志本身打挂请求
         print(line)
 
+    def check_basic_auth(self):
+        """basic_auth 非空时校验 Authorization 头；未通过则回 401 挑战。
+
+        浏览器收到 401 + WWW-Authenticate 会弹登录框，且同源的 WebSocket
+        升级请求会自动带上凭据，因此校验统一放在 do_GET/do_POST 入口，
+        RPC、重定向、favicon、WebSocket 全部被同一层拦截。
+        """
+        basic_auth = _conf(self, 'basic_auth')
+        if not basic_auth:
+            return True
+        expected = b'Basic ' + base64.b64encode(basic_auth.encode('utf-8'))
+        # 头字段由 http.server 按 latin-1 解码，编码回去做恒定时间比较，
+        # 避免逐字节时序侧信道
+        authorization = self.headers.get('Authorization', '').encode('latin-1', 'replace')
+        if hmac.compare_digest(authorization, expected):
+            return True
+        body = b'401 Unauthorized: basic auth required'
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="RPC"')
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return False
+
     def do_GET(self):
+        if not self.check_basic_auth():
+            return
         websocket_path = self.path.split('?', 1)[0]
-        websocket_handler = self.websocket_handlers.get(websocket_path, self.websocket_handler)
-        if (websocket_handler and (websocket_path == self.websocket_path or websocket_path in self.websocket_handlers)
+        websocket_handlers = _conf(self, 'websocket_handlers')
+        websocket_handler = websocket_handlers.get(websocket_path, _conf(self, 'websocket_handler'))
+        if (websocket_handler and (websocket_path == _conf(self, 'websocket_path') or websocket_path in websocket_handlers)
                 and self.headers.get('Upgrade', '').lower() == 'websocket'):
             self.handle_websocket(websocket_handler)
             return
-        if self.path == '/' and self.redirect_root:
+        redirect_root = _conf(self, 'redirect_root')
+        if self.path == '/' and redirect_root:
             self.send_response(302)
-            self.send_header('Location', self.redirect_root)
+            self.send_header('Location', redirect_root)
             self.send_header('Content-Length', '0')
             self.end_headers()
             return
-        if self.path == '/favicon.ico' and self.favicon_bytes:
+        favicon_bytes = _conf(self, 'favicon_bytes')
+        if self.path == '/favicon.ico' and favicon_bytes:
             self.send_response(200)
             self.send_header('Content-Type', 'image/x-icon')
             self.send_header('Cache-Control', 'max-age=86400')
-            self.send_header('Content-Length', str(len(self.favicon_bytes)))
+            self.send_header('Content-Length', str(len(favicon_bytes)))
             self.end_headers()
-            self.wfile.write(self.favicon_bytes)
+            self.wfile.write(favicon_bytes)
             return
         self.handle_rpc()
 
@@ -221,10 +379,12 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 pass
 
     def do_POST(self):
+        if not self.check_basic_auth():
+            return
         self.handle_rpc()
 
     def _execute_coroutine(self, coro, exec_globals):
-        target_loop = self.main_loop
+        target_loop = _conf(self, 'main_loop')
         if not target_loop or not target_loop.is_running():
             for value in exec_globals.values():
                 if hasattr(value, '_loop') and isinstance(value._loop, asyncio.AbstractEventLoop) and value._loop.is_running():
@@ -244,10 +404,15 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             loop.close()
 
     def handle_rpc(self):
+        # 认证门必须放在 handle_rpc 内部而不只是 do_GET/do_POST：WSGI 垫片、
+        # Range 捕获等路径直接调用本方法，不经过 do_*，放在外面会被绕过。
+        if not self.check_basic_auth():
+            return
         try:
             raw_path = self.path
-            if self.key:
-                prefix = self.key + '/'
+            key = _conf(self, 'key')
+            if key:
+                prefix = key + '/'
                 if not raw_path.startswith(prefix):
                     self.send_error(403, "Forbidden")
                     return
@@ -266,6 +431,19 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 code = code_str
             else:
                 code = urllib.parse.unquote(code_str)
+
+            # 裸路径救援：URL 里 file=/tmp/txt 不带引号是 SyntaxError，
+            # 补引号后能通过语法检查才采用，否则保留原始报错。
+            try:
+                ast.parse(code)
+            except SyntaxError:
+                rescued = _rescue_path_syntax(code)
+                if rescued is not code and rescued != code:
+                    try:
+                        ast.parse(rescued)
+                        code = rescued
+                    except SyntaxError:
+                        pass
 
             class ResponseWrapper:
                 """RPC 代码里的 response/p 对象。
@@ -318,18 +496,17 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 'p': response,
             }
 
-            executor = self.executor
+            executor = _conf(self, 'executor')
             try:
-                with _stdout_lock:
-                    old_stdout = sys.stdout
-                    sys.stdout = io.StringIO()
-                    try:
-                        execution = executor.execute(code, globals=context)
-                        output = execution['stdout']
-                        if not execution['ok']:
-                            raise RuntimeError(execution['error'])
-                    finally:
-                        sys.stdout = old_stdout
+                # stdout 捕获由 PythonExecutor 内部的 _redirect_stdout 完成
+                # （execution['stdout'] 即输出），外层不再包 _stdout_lock +
+                # 二次重定向——那会把整个执行串成全局临界区，一条慢请求
+                # （长任务/死循环）就冻结全部 HTTP RPC（含日志台/诊断口）。
+                # 执行的串行化与超时守卫由执行器自身的锁与 timeout 保证。
+                execution = executor.execute(code, globals=context)
+                output = execution['stdout']
+                if not execution['ok']:
+                    raise RuntimeError(execution['error'])
 
                 # 流式响应：状态头与分块都已直接写出，跳过收尾逻辑。
                 if getattr(response, '_streamed', False):
@@ -338,6 +515,10 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 namespace = executor.globals_dict
                 if response.data is not None:
                     result_obj = response.data
+                elif execution.get('r') is not None:
+                    # 尾表达式求值结果：与 MQTT 通道对齐，让 1+1 这类代码
+                    # 直接返回 2，不再要求显式赋值 r 或 print
+                    result_obj = execution['r']
                 elif 'r' in namespace:
                     result_obj = namespace['r']
                 elif output:
@@ -345,7 +526,7 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 else:
                     result_obj = f"no 'r' variable, locals keys: {list(namespace.keys())}"
 
-                result_str = pretty_format(result_obj)
+                result_str = format_result(result_obj)
                 self.send_response(response.status)
                 for key, value in response.headers.items():
                     self.send_header(key, value)
@@ -388,22 +569,12 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
 def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None, daemon=True,
                      favicon_rgb=None, favicon_size=16, websocket_handler=None,
                      websocket_path='/ws', redirect_root=None, websocket_handlers=None,
-                     main_loop=None, listen=True, log_sink=None):
+                     main_loop=None, listen=True, log_sink=None, basic_auth=''):
     if not key:
         key = ''
-    RPCRequestHandler.key = key
-    # 普通函数直接挂类属性会触发描述符协议：self.log_sink 取到的是
-    # bound method func(handler, line)，log_message 里 sink(line) 必抛
-    # TypeError（被 except 吞掉），于是每笔请求都静默退回 print(line)
-    # 直写终端——pty_client_mqtt 场景下就是插进远端 shell 画面。包一层
-    # staticmethod 后 self.log_sink 取回原函数；bound method/实例级赋值不受影响。
-    RPCRequestHandler.log_sink = (staticmethod(log_sink)
-                                  if callable(log_sink) else log_sink)
-    RPCRequestHandler.websocket_handler = websocket_handler
-    RPCRequestHandler.websocket_path = websocket_path
-    RPCRequestHandler.websocket_handlers = websocket_handlers or {}
-    RPCRequestHandler.redirect_root = redirect_root
-    RPCRequestHandler.main_loop = main_loop
+    # basic_auth 接受 'user:password' 或 (user, password)，统一成前者；空则不启用认证
+    if isinstance(basic_auth, (tuple, list)):
+        basic_auth = ':'.join(str(item) for item in basic_auth)
 
     # 持久命名空间：默认零拷贝，直接持有调用方传入的 globals 字典引用，
     # 不做任何浅拷贝。这样服务器启动之后调用方才赋值的名字（例如 MQTT
@@ -418,24 +589,51 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
     else:
         persistent_ns = None
 
-    # 只创建一个 PythonExecutor，请求级上下文通过 execute(globals=...) 注入。
-    # 不在这里强写 __name__：执行器内部用 setdefault，模块字典自带 __name__
-    # 不会被覆盖；自建空字典时由执行器补成 __rpc_exec__。
-    RPCRequestHandler.executor = rpc_executor.PythonExecutor(
-        globals=persistent_ns,
-        main_loop=main_loop,
-    )
-
     if favicon_rgb is None:
         favicon_rgb = (port // 100, port % 100, 0)
-    RPCRequestHandler.favicon_bytes = get_bmp_bytes(rgb=favicon_rgb, size=favicon_size)
+
+    # 配置快照：每台服务器一份独立 dict，含各自的 executor（REPL 命名
+    # 空间与 alias 注册随之隔离）。旧实现全部写 RPCRequestHandler 类属性，
+    # 同进程第二次 start_rpc_server 会把第一个服务器的 key / executor /
+    # favicon / basic_auth 等整体抢走，且旧命名空间与别名静默蒸发。
+    config = {
+        'key': key,
+        'basic_auth': basic_auth or '',
+        # 每服务器一个 PythonExecutor；不在这里强写 __name__：执行器内部
+        # 用 setdefault，模块字典自带 __name__ 不会被覆盖；自建空字典时
+        # 由执行器补成 __rpc_exec__。
+        'executor': PythonExecutor(globals=persistent_ns, main_loop=main_loop),
+        'favicon_bytes': get_bmp_bytes(rgb=favicon_rgb, size=favicon_size),
+        'websocket_handler': websocket_handler,
+        'websocket_path': websocket_path,
+        'redirect_root': redirect_root,
+        'main_loop': main_loop,
+        # dict 里存原函数即可；只有挂到类属性才需要 staticmethod 包一层
+        # （描述符协议会把普通函数变成 bound method，sink(line) 必抛
+        # TypeError 被静默吞掉，每笔请求退回 print 直写终端）。
+        'log_sink': log_sink,
+    }
+    for name, value in config.items():
+        if name == 'log_sink' and callable(value):
+            value = staticmethod(value)
+        setattr(RPCRequestHandler, name, value)
+
+    # websocket_handlers 是运行期共享注册表（realtime_editor 等直接在类
+    # dict 上动态增删）：只合并、不替换对象。旧实现每次整体换新 dict，
+    # 把已注册的处理器冲掉，realtime_editor.py:341 只能靠"必须在
+    # start_rpc_server 之后注册"的顺序约定绕坑。
+    if websocket_handlers:
+        RPCRequestHandler.websocket_handlers.update(websocket_handlers)
 
     # listen=False：只初始化 RPCRequestHandler 的类级状态，不做 socket 绑定。
-    # 供 WSGI / ASGI / 测试等外部容器复用全部 RPC 逻辑。
+    # 供 WSGI / ASGI / 测试等外部容器复用全部 RPC 逻辑（无 server 对象，
+    # 请求期经 _conf 回退读类属性）。
     if not listen:
         return None
 
     server = ThreadedHTTPServer((ip, port), RPCRequestHandler)
+    server.rpc_config = config
+    _rpc_servers.add(server)
     thread = threading.Thread(target=server.serve_forever, name='RPC_Server', daemon=daemon)
     thread.start()
     server.thread = thread
