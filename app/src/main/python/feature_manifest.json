@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "generated": "2026-10-29T05:52:33Z",
+  "generated": "2026-10-29T06:40:20Z",
   "features": [
     {
       "name": "audio",
@@ -21,14 +21,14 @@
       "name": "camera",
       "filename": "feature_camera.py",
       "title": "Camera",
-      "version": 5,
+      "version": 7,
       "actions": [
         "probe",
         "capture"
       ],
       "ui": "python",
-      "sha256": "6cb22af79307433b9a87613d9cbbb9c9bf746f1d11952f054599be0671ac0de6",
-      "size": 18007,
+      "sha256": "0d2dbd82de9a96e43e998cf0b46c7ff2ce295fc517e14fa77fc7504613caa0ec",
+      "size": 18587,
       "url": "feature_camera.py"
     },
     {

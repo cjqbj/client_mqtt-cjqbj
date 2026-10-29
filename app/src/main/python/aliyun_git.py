@@ -5,6 +5,23 @@ requests.packages.urllib3.disable_warnings()
 
 _py_repr = repr  # 保存内置 repr，防止后面形参遮蔽
 
+
+def _console_output():
+    """终端面向的进度/统计行只在真实终端输出。
+
+    RPC 执行时 stdout 被重定向到 StringIO 并作为响应的一部分回传，
+    回车进度动画和「服务端处理延时」这类终端输出混进响应就成了页面上的
+    噪声（例如「OpenAPI上行」里的 2.34MB 是 base64 请求体，不是文件大小）。
+    需要强制输出时设置环境变量 CMQ_PROGRESS=1。
+    """
+    if os.environ.get("CMQ_PROGRESS") == "1":
+        return True
+    try:
+        return bool(sys.stdout.isatty())
+    except BaseException:
+        return False
+
+
 # ============================================================
 # 配置加载
 # 优先级：sys._qgb_dict 注入 > 命令行参数 > 脚本同目录 !config.json
@@ -246,8 +263,9 @@ class _ProgressStream:
         self.offset += len(chunk)
         elapsed = time.time() - self.start_time
         speed = (self.offset / 1024 / 1024) / elapsed if elapsed > 0 else 0
-        print(f"\r{self.prefix}:{self.offset/1024/1024:.2f}/{self.length/1024/1024:.2f}MB "
-              f"{speed:.2f}MB/s", end="", flush=True)
+        if _console_output():
+            print(f"\r{self.prefix}:{self.offset/1024/1024:.2f}/{self.length/1024/1024:.2f}MB "
+                  f"{speed:.2f}MB/s", end="", flush=True)
 
         if self.offset >= self.length:
             self.finish_time = time.time()
@@ -561,17 +579,20 @@ def upload_openapi(data, repo_name=DEFAULT_REPO, file_path=None, token=None, dom
         r = _req("POST", f"{base}/repositories/{rid}/files",
                  data=stream, headers=h, verify=False, timeout=timeout)
     except requests.RequestException as e:
-        print()
+        if _console_output():
+            print()
         raise CodeupError(f"网络上传失败: {e}")
 
     delay = (time.time() - stream.finish_time) * 1000
-    print(f"\n[-] 服务端处理延时: {delay:.2f}ms")
+    if _console_output():
+        print(f"\n[-] 服务端处理延时: {delay:.2f}ms")
 
     if r.status_code in (200, 201):
         return _make_url(dom, rid, file_path, branch)
 
     if r.status_code in (400, 409) and overwrite:
-        print("[*] 已存在，覆盖上传...")
+        if _console_output():
+            print("[*] 已存在，覆盖上传...")
         url_put = (f"{base}/repositories/{rid}/files/"
                    f"{requests.utils.quote(file_path, safe='')}")
         stream2 = _ProgressStream(payload_json, prefix="↑[OpenAPI上行]")
@@ -579,9 +600,11 @@ def upload_openapi(data, repo_name=DEFAULT_REPO, file_path=None, token=None, dom
             r2 = _req("PUT", url_put, data=stream2, headers=h,
                       verify=False, timeout=timeout)
         except requests.RequestException as e:
-            print()
+            if _console_output():
+                print()
             raise CodeupError(f"覆盖网络失败: {e}")
-        print(f"\n[-] 覆盖服务端延时: {(time.time()-stream2.finish_time)*1000:.2f}ms")
+        if _console_output():
+            print(f"\n[-] 覆盖服务端延时: {(time.time()-stream2.finish_time)*1000:.2f}ms")
         if r2.status_code in (200, 201):
             return _make_url(dom, rid, file_path, branch)
         raise CodeupError(f"覆盖失败 [{r2.status_code}]: {r2.text[:300]}")
@@ -733,7 +756,7 @@ def download_openapi(file_path=None, repo_name=None, token=None, domain=None,
             _fire_progress(progress, downloaded, total)
             el = time.time() - t0
             sp = (downloaded / 1024 / 1024) / el if el > 0 else 0
-            if total > 50000:
+            if total > 50000 and _console_output():
                 print(f"\r↓[OpenAPI下行]:{downloaded/1024/1024:.2f}/{total/1024/1024:.2f}MB "
                       f"{sp:.2f}MB/s", end="", flush=True)
 
@@ -825,10 +848,12 @@ def download_lfs(file_path=None, repo_name=DEFAULT_REPO, token=None, domain=None
                 _fire_progress(progress, downloaded, total)
                 el = time.time() - t0
                 sp = (downloaded / 1024 / 1024) / el if el > 0 else 0
-                print(f"\r↓[LFS下行]:{downloaded/1024/1024:.2f}/{total/1024/1024:.2f}MB "
-                      f"{sp:.2f}MB/s", end="", flush=True)
+                if _console_output():
+                    print(f"\r↓[LFS下行]:{downloaded/1024/1024:.2f}/{total/1024/1024:.2f}MB "
+                          f"{sp:.2f}MB/s", end="", flush=True)
 
-        print()
+        if _console_output():
+            print()
         if save_to:
             f_out.close()
             print(f"[+] LFS 文件已保存到 {save_to}")

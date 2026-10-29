@@ -6,7 +6,7 @@ import time
 
 import client_service
 
-FEATURE = {"name": "camera", "title": "Camera", "version": 5,
+FEATURE = {"name": "camera", "title": "Camera", "version": 7,
            "actions": ["probe", "capture"],
            "ui": "python", "icon": "camera",
            # 可调参数：主界面只留按钮，默认值全收进长按 → Setting 的设置页。
@@ -27,7 +27,7 @@ FEATURE = {"name": "camera", "title": "Camera", "version": 5,
 IMAGE_FORMATS = ("jpeg", "png")
 FORMAT_SUFFIX = {"jpeg": "jpg", "png": "png"}
 
-_PHOTO_TEMPLATE = r'''import base64, json, os, sys, tempfile, time
+_PHOTO_TEMPLATE = r'''import base64, contextlib, io, json, os, sys, tempfile, time
 
 from android.hardware import Camera
 from android.graphics import Bitmap, BitmapFactory, SurfaceTexture
@@ -111,7 +111,12 @@ try:
     upload_error = ""
     if use_aliyun and aliyun_git is not None:
         try:
-            url = aliyun_git.upload(data, file_path=file_path)
+            # aliyun_git.upload 会往 stdout 打「回车进度条 + 服务端处理延时」，
+            # 那是给终端看的动画；RPC 的 stdout 会被当成响应的一部分回传，
+            # 页面原样显示时就成了噪声（里面的 2.34MB 是 base64 请求体大小，
+            # 不是照片大小）。这里只取 url，上传进度一律丢弃。
+            with contextlib.redirect_stdout(io.StringIO()):
+                url = aliyun_git.upload(data, file_path=file_path)
         except BaseException as exc:
             upload_error = repr(exc)
     elif use_aliyun:
@@ -346,9 +351,17 @@ def build_view(context):
         def work():
             raw = bootstrap.call_feature("camera", "capture", facing, image_format,
                                          label, transport)
-            result = json.loads(raw)
-            if not result.get("ok"):
-                return (pyui_kit.render_result(raw), None)
+            # 只把 feature 返回的响应原样显示，不再额外拼 "Saved <path> · <size> KB
+            # · <transport>" 摘要：响应里本来就有 file_path / size / transport，
+            # 重复一行反而误导（aliyun 的 2.34MB 是参与上传的 base64 请求体，
+            # 不是文件大小）。内部解析只用于拿 url / path 下载图片。
+            text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+            try:
+                result = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, ValueError):
+                return (text, None)
+            if not isinstance(result, dict) or not result.get("ok"):
+                return (text, None)
             url = result.get("url")
             remote_path = str(result.get("path") or "")
             data = None
@@ -377,18 +390,11 @@ def build_view(context):
                 except Exception:
                     pass
             else:
-                return ("Capture finished but no url/path in response\n\n"
-                        + pyui_kit.render_result(raw), None)
+                return (text, None)
             bitmap = None
             if data is not None:
                 bitmap = BitmapFactory.decodeByteArray(data, 0, len(data))
-            path = str(result.get("file_path") or "")
-            head = "Saved %s \u00b7 %.1f KB \u00b7 %s" % (
-                path or "on target", (result.get("size") or 0) / 1024.0,
-                "aliyun" if url else "mqtt")
-            if result.get("upload_error"):
-                head += " \u00b7 fallback: %s" % str(result["upload_error"])[:100]
-            return (head + "\n\n" + pyui_kit.render_result(raw), bitmap)
+            return (text, bitmap)
 
         def apply_ok(payload):
             st["status"], st["bitmap"] = payload
