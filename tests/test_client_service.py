@@ -719,7 +719,7 @@ class ClientServiceTests(unittest.TestCase):
         ast.parse(code)
         self.assertIn("has_more", code)
         self.assertIn("next_offset", code)
-        self.assertIn("seen < start", code)
+        self.assertIn("position < start", code)
 
     def test_scan_returns_directories_first_and_pages_without_skipping(self):
         with tempfile.TemporaryDirectory() as root:
