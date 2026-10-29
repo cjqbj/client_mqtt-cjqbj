@@ -1189,8 +1189,12 @@ class ClientServiceTests(unittest.TestCase):
                     return {"filename": filename, "ok": True}
 
                 builtin_count = len(bootstrap.BUILTIN_FEATURES)
+                # 版本清单来自网络：固定为空，用例只验证「文件已存在就跳过」的本地判断，
+                # 不受 GitHub 可达性 / 远端版本是否已更新（manifest 是否命中缓存）影响。
                 with mock.patch.object(bootstrap, "install_feature", side_effect=install) as download, \
-                        mock.patch.object(bootstrap, "_purge_feature_pyc") as purge:
+                        mock.patch.object(bootstrap, "_purge_feature_pyc") as purge, \
+                        mock.patch.object(client_service, "fetch_feature_manifest",
+                                          return_value={"features": []}):
                     result = json.loads(client_service.install_builtin_features(script_root))
                     self.assertTrue(result["ok"])
                     self.assertFalse(result["force"])

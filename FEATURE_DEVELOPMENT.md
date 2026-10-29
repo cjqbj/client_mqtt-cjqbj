@@ -18,8 +18,30 @@ FEATURE = {
     "actions": ["run"],      # ui=compose 时生成动作按钮；ui=python 可留空
     "icon": "terminal",      # 可选
     "ui": "python",          # 缺省 "compose"
+    # 可调参数：长按 feature -> Setting 打开独立设置页（规则见 2.1）
+    "settings": [
+        {"key": "page_size", "label": "单次文件个数", "type": "int",
+         "default": 100, "min": 1, "max": 10000, "scope": "topic",
+         "help": "每次扫描 / 加载更多读多少条目录项"},
+    ],
 }
 ```
+
+### 2.1 每 feature 参数（FEATURE["settings"]）
+
+- **声明字段**（dict 列表，`key` 必填且唯一，重复/缺 key/非法项自动忽略）：
+  - `label`：设置页显示名，缺省用 `key`。
+  - `type`：`int` / `float` / `bool` / `text`，缺省 `text`，非法值回退 `text`。`int`/`float` 写入时按 `min`/`max` 夹取（int 四舍五入，float 保留 3 位）。
+  - `default`：未保存时的回落值；`None` = 没有默认，运行时用调用点默认值。
+  - `scope`：**`global`（全局）或 `topic`（分 topic）**，缺省 `topic`；设置页每行都显示对应徽标。
+  - `help`：设置页该行下方的说明文本。
+- **存储位置**（APK 统一管理，feature 不要自己读写配置文件）：
+  - `scope="global"` → `settings/global.json` 的 `feature_global_settings[feature][key]`，所有目标共用一份。
+  - `scope="topic"` → 当前目标 `settings/topics/<safe-topic>/device.json` 的 `feature_settings[device_id][feature][key]`，每个目标各存一份。
+- **不做跨作用域回退**：标 `global` 只读全局、标 `topic` 只读当前目标；没有保存值就用声明 `default`。保证设置页标注的“全局 / 分 topic”与真实取值来源一致。
+- **读取**：`client_service.feature_setting(feature, key, default)` 返回 Python 值（未知 key / 加载失败 / 脏数据一律回退 `default`，不打断业务）。
+- **入口**：长按 feature → 弹窗 `Reload`（重载脚本）/ `Setting`（打开该 feature 参数页）。页面由 `pyui_feature_settings.build_view` 通用渲染（逐行 Save / Reset / Refresh），新增参数只改 feature 声明，不用改 APK 主界面。
+- **超时**：约定参数 `timeout`（`type` int/float，`scope` topic），动作里写 `timeout=client_service.feature_timeout(feature, 调用点默认)`；未配置沿用调用点默认，最终裁剪到 [1, 600]。
 
 ## 3. 两种 UI 模式
 
@@ -90,6 +112,7 @@ client_service.rpc(code, device=None, timeout=None)
 
 - `timeout=None`：用目标设备配置的 timeout（默认 10s），**它只是默认值**。
 - feature 按操作显式传秒数覆盖，范围裁剪到 [1, 600]：如 wifi=10、scan=20、拍照=45、上传=120。新照此约定。
+- **可配置超时**：动作里统一写 `timeout=client_service.feature_timeout("<feature>", <调用点默认>)`（并在 `FEATURE["settings"]` 声明 `timeout`，见 2.1）。用户在长按 → Setting 里填了就覆盖，留空沿用调用点默认，最终仍裁剪到 [1, 600]。
 - 需要更底层控制（如 probe 的 2s 自定义）可直调 `client_service._mqtt_client_module().rpc(...)`，自带 `request_topic/timeout/client_private_key_bytes` 参数。
 - 大数据走目标端 Aliyun 上传/下载，MQTT 只传短元数据，禁止传大字节。
 - 返回给 UI 必须是 JSON 字符串（`json.dumps(..., ensure_ascii=False)`），不能返回 dict（执行器会 repr 成单引号）。
@@ -116,11 +139,11 @@ https://ghfast.top/https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/ref
   - `update_feature(name)` / `update_features(names=None)`：按清单 URL 下载，`bootstrap.install_feature` 做 compile + sha256 校验 + 临时文件原子替换，然后清 pyc 并 `reload_feature` 热加载。
   - `install_builtin_features(force=False)` 已是版本感知：文件缺失/版本落后/sha 不同才下载，其余 skip；设置页现有 “Download missing feature scripts” 按钮因此能直接升级旧脚本。`force=True` 仍为全量重下。
 - **发现机制**：catalog 合并 `BUILTIN_FEATURES` + 扫描两个目录，每 3 秒自动轮询；设置页"Refresh feature list"调 `rescan_features()` 立即重扫。手动放进 py_updates 的文件刷新后即出现，下次动作按需 import；删除文件重扫后运行时模块清出 sys.modules。
-- 已加载模块常驻缓存：线上改文件后让用户长按 feature → reload（`reload_feature(name)`）；唯一自动重载是 py_updates 文件首次遮蔽内置模块。
+- 已加载模块常驻缓存：线上改文件后让用户长按 feature → `Reload`（`reload_feature(name)`；旁边的 `Setting` 打开该 feature 参数页）；唯一自动重载是 py_updates 文件首次遮蔽内置模块。
 
 ## 8. 每目标持久化（不要自己读写 client_mqtt.json）
 
-- `client_service.feature_settings(name)` / `update_feature_settings(name, values)`：按当前选中目标存 feature 自己的扁平 JSON（浅合并，别放秘钥/大 blob）。
+- `client_service.feature_settings(name)` / `update_feature_settings(name, values)`：按当前选中目标存 feature 自己的扁平 JSON（浅合并，别放秘钥/大 blob）。**用户可调参数不要走这两个裸接口**，按 2.1 声明到 `FEATURE["settings"]`，由 APK 设置页按 `scope` 落盘。
 - 当前选中目标 tab 由外壳自动记忆（`selected_feature`），feature 不用管。
 - 当前目标配置：`client_service.selected_config()`（pyui_kit 内同名便捷封装）。
 - **每目标 feature 生效列表**（`enabled_features`）：
@@ -130,7 +153,7 @@ https://ghfast.top/https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/ref
 
 ## 9. 自检
 
-- 新 feature 至少能被桌面 import 并走通 `bootstrap.describe_features()`；测试放仓库 `tests/`，本地：
+- 新 feature 至少能被桌面 import 并走通 `bootstrap.describe_features()`；测试放仓库 `tests/`。每 feature 参数机制的单测在 `tests/test_feature_settings.py`（声明规范化 / scope 落盘 / 默认回退 / 超时裁剪），本地：
 
 ```powershell
 $env:PYTHONPATH="."; python -m unittest discover -s tests   # cwd=app/src/main/python

@@ -14,10 +14,16 @@ import time
 import client_service
 
 FEATURE = {
-    "version": 1,
+    "version": 2,
     "actions": ["dial", "hangup", "state"],
     "icon": "phone",
     "ui": "python",
+    # 可调参数（长按 feature → Setting 的独立设置页，不占主界面）。
+    "settings": [
+        {"key": "timeout", "label": "RPC 超时（秒）", "type": "int",
+         "default": None, "min": 1, "max": 600, "scope": "topic",
+         "help": "留空 = dial 20s / hangup 15s / state 10s；填了则三个动作统一用该值。"},
+    ],
 }
 
 # 显式超时，符合 §6 的 [1,600] 范围
@@ -191,17 +197,19 @@ else:
 # ---------------------------------------------------------------------------
 
 def dial(number):
-    result = client_service.rpc(build_dial_code(str(number)), timeout=DIAL_TIMEOUT)
+    result = client_service.rpc(
+        build_dial_code(str(number)), timeout=client_service.feature_timeout("dialer", DIAL_TIMEOUT)
+    )
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 
 def hangup():
-    result = client_service.rpc(build_hangup_code(), timeout=HANGUP_TIMEOUT)
+    result = client_service.rpc(build_hangup_code(), timeout=client_service.feature_timeout("dialer", HANGUP_TIMEOUT))
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 
 def state():
-    result = client_service.rpc(build_state_code(), timeout=STATE_TIMEOUT)
+    result = client_service.rpc(build_state_code(), timeout=client_service.feature_timeout("dialer", STATE_TIMEOUT))
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 

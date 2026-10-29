@@ -3,8 +3,13 @@
 import json
 import client_service
 
-FEATURE = {"name": "wifi", "title": "Wi-Fi", "version": 1, "actions": ["info"],
-           "ui": "python", "icon": "wifi"}
+FEATURE = {"name": "wifi", "title": "Wi-Fi", "version": 2, "actions": ["info"],
+           "ui": "python", "icon": "wifi",
+           "settings": [
+               {"key": "timeout", "label": "RPC 超时（秒）", "type": "int",
+                "default": None, "min": 1, "max": 600, "scope": "topic",
+                "help": "留空 = 10s；填了则所有动作统一用该值。"},
+           ]}
 
 
 def run():
@@ -38,7 +43,7 @@ r = json.dumps({"ok": True, "wifi": {
 
 def info():
     # 设备配置 timeout 只是默认值；Wi-Fi 查询很快，固定 10s 上限。
-    result = client_service.rpc(build_wifi_code(), timeout=10)
+    result = client_service.rpc(build_wifi_code(), timeout=client_service.feature_timeout("wifi", 10))
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 

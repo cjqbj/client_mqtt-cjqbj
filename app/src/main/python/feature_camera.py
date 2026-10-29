@@ -6,9 +6,21 @@ import time
 
 import client_service
 
-FEATURE = {"name": "camera", "title": "Camera", "version": 4,
+FEATURE = {"name": "camera", "title": "Camera", "version": 5,
            "actions": ["probe", "capture"],
-           "ui": "python", "icon": "camera"}
+           "ui": "python", "icon": "camera",
+           # 可调参数：主界面只留按钮，默认值全收进长按 → Setting 的设置页。
+           "settings": [
+               {"key": "timeout", "label": "RPC 超时（秒）", "type": "int",
+                "default": None, "min": 1, "max": 600, "scope": "topic",
+                "help": "留空 = probe 15s / capture 60s；填了则两个动作统一用该值。"},
+               {"key": "lens_facing", "label": "默认镜头", "type": "int",
+                "default": 0, "min": 0, "max": 1, "scope": "topic",
+                "help": "0 = 后置，1 = 前置；与页面上镜头按钮共用同一份分 topic 配置。"},
+               {"key": "image_format", "label": "默认图片格式", "type": "text",
+                "default": "jpeg", "scope": "topic",
+                "help": "jpeg 或 png；与页面上格式按钮共用同一份分 topic 配置。"},
+           ]}
 
 # 可选输出格式（界面按钮 + 落盘扩展名）。JPEG 是相机原生格式，
 # PNG 在目标端用 Bitmap.compress 转码后上传。
@@ -146,7 +158,7 @@ def build_probe_code():
 
 def probe():
     """探测目标能否 import aliyun_git；不按操作系统写死。"""
-    result = client_service.rpc(build_probe_code(), timeout=15)
+    result = client_service.rpc(build_probe_code(), timeout=client_service.feature_timeout("camera", 15))
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 
@@ -174,10 +186,10 @@ def label_from(cfg, topic):
 
 
 def capture(facing=0, image_format="jpeg", name_prefix="", transport="aliyun"):
-    # 拍照 + (PNG 转码) + aliyun 或临时落盘约 5~35s；给 60s 固定超时。
+    # 拍照 + (PNG 转码) + aliyun 或临时落盘约 5~35s；默认 60s 上限。
     result = client_service.rpc(
         build_photo_code(int(facing), image_format, name_prefix, transport),
-        timeout=60
+        timeout=client_service.feature_timeout("camera", 60)
     )
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 

@@ -25,9 +25,15 @@ import client_service
 FEATURE = {
     "actions": ["run"],
     "icon": "bug",
-    "version": 1,
+    "version": 2,
     # 界面由本脚本用 Chaquopy 自绘（见 build_view），APK 只有通用宿主。
     "ui": "python",
+    # 与页面上的 timeout 输入框共用同一个分 topic 键，两处看到的值永远一致。
+    "settings": [
+        {"key": "timeout", "label": "探针超时（秒）", "type": "float",
+         "default": None, "min": 1, "max": 600, "scope": "topic",
+         "help": "留空 = 2s（内置轻探针默认）；与探针页面上的 timeout 输入框是同一份值。"},
+    ],
 }
 
 DEFAULT_TIMEOUT = client_service.PROBE_TIMEOUT

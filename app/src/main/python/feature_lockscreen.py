@@ -20,13 +20,19 @@ import client_service
 FEATURE = {
     "name": "lockscreen",
     "title": "Lock Screen",
-    "version": 2,
+    "version": 3,
     "actions": [
         "lock", "unlock", "status",
         "probe", "schedule", "unschedule",
     ],
     "ui": "python",
     "icon": "lock",
+    # 可调参数（长按 feature → Setting 的独立设置页，不占主界面）。
+    "settings": [
+        {"key": "timeout", "label": "RPC 超时（秒）", "type": "int",
+         "default": None, "min": 1, "max": 600, "scope": "topic",
+         "help": "留空 = 各动作 30s；填了则锁屏/解锁/状态查询统一用该值。"},
+    ],
 }
 
 DEFAULT_TEXT = """因为你长时间没有敬礼， 屏幕已锁定
@@ -434,7 +440,10 @@ def _normalize_seconds(value):
 
 
 def _exec_target(code, timeout=30):
-    result = client_service.rpc(code, timeout=timeout)
+    # 设置页配了 lockscreen.timeout 就优先用它，否则用各动作的默认值。
+    result = client_service.rpc(
+        code, timeout=client_service.feature_timeout("lockscreen", timeout)
+    )
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 

@@ -220,6 +220,9 @@ private fun ClientMqttScreen() {
     var permissions by remember { mutableStateOf(false) }
     var reloadTarget by remember { mutableStateOf<FeatureDescriptor?>(null) }
     var reloadFileInfo by remember { mutableStateOf("Loading file metadata...") }
+    // 长按 feature 菜单里的 Setting 入口：非 null 时整屏覆盖一张该 feature
+    // 的参数设置页（Python 自绘）；参数含单次文件个数、RPC 超时等，不再占主界面。
+    var featureSettingsTarget by remember { mutableStateOf<FeatureDescriptor?>(null) }
     var featureReloadVersions by remember { mutableStateOf(emptyMap<String, Int>()) }
     // 冷启动恢复闸门：Python 端 selected_device_id 恢复完成前，
     // 轮询协程不得用 Kotlin 占位 topic 匹配并覆盖持久化选择。
@@ -458,8 +461,9 @@ private fun ClientMqttScreen() {
         }
     }
 
-    BackHandler(enabled = permissions || targetSettings || settings || diagnostics) {
+    BackHandler(enabled = permissions || targetSettings || settings || diagnostics || featureSettingsTarget != null) {
         when {
+            featureSettingsTarget != null -> featureSettingsTarget = null
             permissions -> permissions = false
             targetSettings -> targetSettings = false
             settings -> settings = false
@@ -473,7 +477,7 @@ private fun ClientMqttScreen() {
     var lastFeatureBackAt by remember { mutableLongStateOf(0L) }
     val currentFeatureName = visibleFeatures.getOrNull(pagerState.currentPage)?.name
     LaunchedEffect(currentFeatureName) { lastFeatureBackAt = 0L }
-    BackHandler(enabled = !permissions && !targetSettings && !settings && !diagnostics) {
+    BackHandler(enabled = !permissions && !targetSettings && !settings && !diagnostics && featureSettingsTarget == null) {
         val consumed = currentFeatureName?.let { name ->
             // 纯查询/轻量 View 操作，在主线程快速返回；feature 异常时按未消费处理。
             runCatching { service.callAttr("handle_feature_back", name).toBoolean() }
@@ -491,7 +495,7 @@ private fun ClientMqttScreen() {
 
     ModalNavigationDrawer(
         drawerState = drawerState,
-        gesturesEnabled = !settings && !targetSettings && !permissions,
+        gesturesEnabled = !settings && !targetSettings && !permissions && featureSettingsTarget == null,
         drawerContent = {
             ModalDrawerSheet {
                 Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
@@ -599,7 +603,7 @@ private fun ClientMqttScreen() {
                             }
                         },
                         actions = {
-                            if (!settings && !targetSettings && !permissions) {
+                            if (!settings && !targetSettings && !permissions && featureSettingsTarget == null) {
                                 TextButton(onClick = { diagnostics = true }) {
                                     Text("RPC logs")
                                 }
@@ -613,7 +617,7 @@ private fun ClientMqttScreen() {
                                     Icon(Icons.Outlined.Tune, contentDescription = "Target settings")
                                 }
                             }
-                            if (!settings && !targetSettings && !permissions) {
+                            if (!settings && !targetSettings && !permissions && featureSettingsTarget == null) {
                                 IconButton(onClick = { settings = true }) {
                                     Icon(Icons.Outlined.Settings, contentDescription = "App settings")
                                 }
@@ -628,7 +632,7 @@ private fun ClientMqttScreen() {
             },
             snackbarHost = {},
             bottomBar = {
-                if (!settings && !targetSettings && !permissions && !diagnostics && visibleFeatures.isNotEmpty()) {
+                if (!settings && !targetSettings && !permissions && !diagnostics && featureSettingsTarget == null && visibleFeatures.isNotEmpty()) {
                     val selectedPage = pagerState.currentPage.coerceIn(0, visibleFeatures.lastIndex)
                     NavigationBar {
                         // 每项固定 72dp：一屏平铺约 6 个；feature 更多时整条横向滚动，
@@ -735,6 +739,16 @@ private fun ClientMqttScreen() {
                 }
                 // 覆盖页：不透明背景全盖住底层 pager，但不销毁它。
                 when {
+                    // 长按 feature → Setting：该 feature 专属的参数页（Python 自绘）。
+                    featureSettingsTarget != null -> Box(
+                        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
+                    ) {
+                        FeatureSettingsPage(
+                            modifier = Modifier.padding(padding),
+                            feature = featureSettingsTarget!!,
+                            onBack = { featureSettingsTarget = null }
+                        )
+                    }
                     diagnostics -> Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
                         DiagnosticsPage(
                             modifier = Modifier.padding(padding),
@@ -785,16 +799,19 @@ private fun ClientMqttScreen() {
     reloadTarget?.let { feature ->
         AlertDialog(
             onDismissRequest = { reloadTarget = null },
-            icon = { Icon(Icons.Outlined.Refresh, contentDescription = null) },
-            title = { Text("Reload feature module") },
+            icon = { Icon(Icons.Outlined.Tune, contentDescription = null) },
+            title = { Text("feature_${feature.name}.py") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("feature_${feature.name}.py")
                     SelectionContainer {
                         Text(reloadFileInfo, style = MaterialTheme.typography.bodySmall)
                     }
                     Text(
-                        "Drops sys.modules cache and pyc, then re-imports from py_updates.",
+                        "Reload: drop sys.modules cache + pyc and re-import from py_updates.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        "Setting: this feature's own parameters (page size, RPC timeout …), kept in global.json or the current topic's device.json.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -830,7 +847,16 @@ private fun ClientMqttScreen() {
                 }) { Text("Reload") }
             },
             dismissButton = {
-                TextButton(onClick = { reloadTarget = null }) { Text("Cancel") }
+                Row {
+                    TextButton(onClick = {
+                        val target = feature
+                        reloadTarget = null
+                        // 覆盖页不重建 feature 页面，但设置页会换掉整屏内容，先清焦点。
+                        clearContentFocus()
+                        featureSettingsTarget = target
+                    }) { Text("Setting") }
+                    TextButton(onClick = { reloadTarget = null }) { Text("Cancel") }
+                }
             }
         )
     }
@@ -861,6 +887,53 @@ private fun PythonViewPage(feature: FeatureDescriptor, service: PyObject) {
         // 兜底：页面被移除时再清一次 View 焦点，避免 rootViewRequestFocus。
         onRelease = { it.clearFocus() }
     )
+}
+
+/**
+ * 某个 feature 的参数设置页（长按 feature → Setting）。
+ *
+ * 参数声明在 feature 脚本自己的 FEATURE["settings"] 里（key/label/type/
+ * default/min/max/scope/help），这里只负责把 Python 自绘的 View 挂进 Compose：
+ * 表单渲染、保存、作用域标注（全局 / 分 topic）全在 Python 侧，新增参数不用改 APK。
+ */
+@Composable
+private fun FeatureSettingsPage(
+    modifier: Modifier = Modifier,
+    feature: FeatureDescriptor,
+    onBack: () -> Unit
+) {
+    val service = remember { Python.getInstance().getModule("client_service") }
+    Column(modifier = modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            TextButton(onClick = onBack) { Text("Back") }
+            Column(Modifier.weight(1f)) {
+                Text(feature.title, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "feature_${feature.name}.py \u00b7 per-feature settings",
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+        }
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { context ->
+                runCatching {
+                    service.callAttr("build_feature_settings_view", feature.name, context)
+                        .toJava(android.view.View::class.java)
+                }.getOrElse { error ->
+                    android.widget.TextView(context).apply {
+                        text = "Settings UI failed to build:\n${error.javaClass.simpleName}: ${error.message}"
+                        setPadding(48, 48, 48, 48)
+                        setTextIsSelectable(true)
+                    }
+                }
+            },
+            onRelease = { it.clearFocus() }
+        )
+    }
 }
 
 @Composable

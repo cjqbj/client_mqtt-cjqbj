@@ -122,6 +122,9 @@ _GLOBAL_FIELDS = (
     # feature_settings 各 feature 按目标的持久设置（拨号历史等）、
     # selected_feature 各目标最后选中的标签、known_features 本机特性启用名单
     "feature_settings",
+    # 每 feature 参数的 global 作用域值（所有 topic 共用一份）。
+    # topic 作用域仍走上面的 feature_settings（按 device id 分开存）。
+    "feature_global_settings",
     "selected_feature",
     "known_features",
 )
@@ -781,6 +784,45 @@ def build_feature_view(feature, context):
             % (feature, traceback.format_exc()[-1500:])
         )
         # traceback 常超过一屏，套一层可滚动容器
+        scroll = ScrollView(context)
+        scroll.addView(
+            error_view,
+            ScrollView.LayoutParams(pyui_kit.match(), pyui_kit.wrap()),
+        )
+        return scroll
+
+
+def build_feature_settings_view(feature, context):
+    """宿主桥：构建某个 feature 的参数设置页（Python 自绘，长按 → Setting）。
+
+    与 build_feature_view 同理：任何异常都降级成可复制的错误 TextView，
+    设置页打不开也绝不白屏/闪退。
+    """
+    import logging
+    import traceback
+    try:
+        import pyui_feature_settings
+        view = pyui_feature_settings.build_view(context, str(feature))
+        if view is None:
+            raise RuntimeError("pyui_feature_settings.build_view returned None")
+        return view
+    except Exception:
+        logging.getLogger("error").exception(
+            "build_feature_settings_view failed feature=%s", feature
+        )
+        import pyui_kit
+        from android.widget import ScrollView, TextView
+
+        error_view = TextView(context)
+        error_view.setTextIsSelectable(True)
+        error_view.setPadding(
+            pyui_kit.dp(context, 16), pyui_kit.dp(context, 16),
+            pyui_kit.dp(context, 16), pyui_kit.dp(context, 16),
+        )
+        error_view.setText(
+            "Feature settings UI failed for feature_%s.py:\n\n%s"
+            % (feature, traceback.format_exc()[-1500:])
+        )
         scroll = ScrollView(context)
         scroll.addView(
             error_view,
@@ -1584,6 +1626,308 @@ def update_feature_settings(feature, values, device_ref=None):
         config["feature_settings"] = all_settings
         save_config(config)
     return json.dumps(settings, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# 每 feature 参数（per-feature settings）
+#
+# feature 自己的可调参数（单次文件个数、RPC 超时…）不再挤在主界面底部，
+# 统一收进「长按 feature → Setting」打开的独立设置页。参数由 feature 脚本
+# 自己声明，APK 侧只提供通用渲染/存储，新增参数不用改 APK：
+#
+#   FEATURE = {..., "settings": [
+#       {"key": "page_size", "label": "单次文件个数", "type": "int",
+#        "default": 100, "min": 1, "max": 10000, "scope": "topic",
+#        "help": "一次扫描读取多少条"},
+#   ]}
+#
+# scope 语义（设置页逐条标注）：
+#   global —— 所有目标共用一份，存 global.json 的 feature_global_settings
+#   topic  —— 每个目标（topic）各存一份，存该 topic device.json 的
+#             feature_settings（camera/dialer 既有持久化就在这一处）
+# 生效值 = 该作用域里已保存的值，否则用声明的 default。刻意不做跨作用域
+# 回退：参数标注的作用域与真正的取值来源永远一致，不会出现「标了分 topic
+# 却读到全局值」这种说不清来源的情况。
+# ---------------------------------------------------------------------------
+_FEATURE_SETTING_TYPES = ("int", "float", "bool", "text")
+_FEATURE_SETTING_SCOPES = ("global", "topic")
+_FEATURE_SETTING_SCOPE_TEXT = {"global": "全局", "topic": "分 topic"}
+_FEATURE_TIMEOUT_KEY = "timeout"
+
+
+def _feature_setting_specs(feature):
+    """读取 feature 模块里 FEATURE["settings"] 声明，规范化为 dict 列表。"""
+    import bootstrap
+    name = _normalize_feature_name(feature)
+    module = bootstrap.load_feature(name)
+    spec = getattr(module, "FEATURE", None)
+    if not isinstance(spec, dict):
+        spec = {}
+    raw_items = spec.get("settings")
+    if isinstance(raw_items, str):
+        try:
+            raw_items = json.loads(raw_items)
+        except ValueError:
+            raw_items = []
+    if not isinstance(raw_items, (list, tuple)):
+        return []
+    items = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        key = str(raw.get("key") or "").strip()
+        if not key or any(item["key"] == key for item in items):
+            continue
+        kind = str(raw.get("type") or "text").strip().lower()
+        if kind not in _FEATURE_SETTING_TYPES:
+            kind = "text"
+        scope = str(raw.get("scope") or "topic").strip().lower()
+        if scope not in _FEATURE_SETTING_SCOPES:
+            scope = "topic"
+        items.append({
+            "key": key,
+            "label": str(raw.get("label") or key),
+            "type": kind,
+            "scope": scope,
+            "default": raw.get("default"),
+            "min": raw.get("min"),
+            "max": raw.get("max"),
+            "help": str(raw.get("help") or ""),
+        })
+    return items
+
+
+def _coerce_feature_setting_value(spec, value):
+    """按声明类型转换并夹取范围；非法输入抛 ValueError（设置页直接显示原因）。"""
+    kind = spec.get("type") or "text"
+    if kind == "bool":
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+        raise ValueError("expected true/false")
+    if kind in ("int", "float"):
+        text = str(value).strip()
+        if not text:
+            raise ValueError("value is required")
+        number = float(text)
+        if spec.get("min") is not None:
+            number = max(number, float(spec["min"]))
+        if spec.get("max") is not None:
+            number = min(number, float(spec["max"]))
+        return int(round(number)) if kind == "int" else round(number, 3)
+    return str(value)
+
+
+def _feature_topic_store(feature, device_ref=None):
+    """当前 topic 已保存的参数（topic 作用域）。"""
+    name = _normalize_feature_name(feature)
+    device_id = _memory_device_id(device_ref)
+    config = load_config()
+    all_settings = config.get("feature_settings")
+    if not isinstance(all_settings, dict):
+        return {}
+    per_device = all_settings.get(device_id)
+    if not isinstance(per_device, dict):
+        return {}
+    settings = per_device.get(name)
+    return dict(settings) if isinstance(settings, dict) else {}
+
+
+def _feature_global_store(feature):
+    """全部 topic 共用的参数（global 作用域）。"""
+    name = _normalize_feature_name(feature)
+    config = load_config()
+    all_settings = config.get("feature_global_settings")
+    if not isinstance(all_settings, dict):
+        return {}
+    settings = all_settings.get(name)
+    return dict(settings) if isinstance(settings, dict) else {}
+
+
+def _feature_store(feature, scope, device_ref=None):
+    return (_feature_global_store(feature) if scope == "global"
+            else _feature_topic_store(feature, device_ref))
+
+
+def _write_feature_setting(feature, scope, key, value, device_ref=None):
+    """写单个参数；value=None 表示删除该键（回到声明的 default）。"""
+    name = _normalize_feature_name(feature)
+    device_id = _memory_device_id(device_ref)
+    with _STATE["lock"]:
+        config = load_config()
+        if scope == "global":
+            all_settings = config.get("feature_global_settings")
+            all_settings = dict(all_settings) if isinstance(all_settings, dict) else {}
+            settings = all_settings.get(name)
+            settings = dict(settings) if isinstance(settings, dict) else {}
+            if value is None:
+                settings.pop(key, None)
+            else:
+                settings[key] = value
+            if settings:
+                all_settings[name] = settings
+            else:
+                all_settings.pop(name, None)
+            config["feature_global_settings"] = all_settings
+        else:
+            all_settings = config.get("feature_settings")
+            all_settings = dict(all_settings) if isinstance(all_settings, dict) else {}
+            per_device = all_settings.get(device_id)
+            per_device = dict(per_device) if isinstance(per_device, dict) else {}
+            settings = per_device.get(name)
+            settings = dict(settings) if isinstance(settings, dict) else {}
+            if value is None:
+                settings.pop(key, None)
+            else:
+                settings[key] = value
+            if settings:
+                per_device[name] = settings
+            else:
+                per_device.pop(name, None)
+            if per_device:
+                all_settings[device_id] = per_device
+            else:
+                all_settings.pop(device_id, None)
+            config["feature_settings"] = all_settings
+        save_config(config)
+    return settings
+
+
+def feature_settings_schema(feature, device_ref=None):
+    """设置页数据源：每条参数的声明 + 当前生效值 + 作用域标注（JSON）。"""
+    name = _normalize_feature_name(feature)
+    try:
+        specs = _feature_setting_specs(name)
+    except BaseException as error:
+        return json.dumps({
+            "ok": False,
+            "feature": name,
+            "error": f"{type(error).__name__}: {error}",
+            "settings": [],
+        }, ensure_ascii=False)
+    global_store = _feature_global_store(name)
+    topic_store = _feature_topic_store(name, device_ref)
+    device = _device_config(device_ref)
+    rows = []
+    for spec in specs:
+        store = global_store if spec["scope"] == "global" else topic_store
+        stored = spec["key"] in store
+        value = store.get(spec["key"]) if stored else spec.get("default")
+        rows.append({
+            "key": spec["key"],
+            "label": spec["label"],
+            "type": spec["type"],
+            "scope": spec["scope"],
+            "scope_text": _FEATURE_SETTING_SCOPE_TEXT[spec["scope"]],
+            "default": spec.get("default"),
+            "min": spec.get("min"),
+            "max": spec.get("max"),
+            "help": spec["help"],
+            "value": value,
+            "value_text": "" if value is None else str(value),
+            "stored": stored,
+            "source": "saved" if stored else "default",
+        })
+    return json.dumps({
+        "ok": True,
+        "feature": name,
+        "device_id": device.get("id") or device.get("request_topic"),
+        "topic": device.get("request_topic", ""),
+        "settings": rows,
+    }, ensure_ascii=False)
+
+
+def feature_settings_values(feature, device_ref=None):
+    """每参数的生效值汇总（JSON，供脚本/诊断一次性取用）。"""
+    schema = json.loads(feature_settings_schema(feature, device_ref))
+    values = {row["key"]: row["value"] for row in schema.get("settings") or []}
+    return json.dumps({
+        "ok": bool(schema.get("ok")),
+        "feature": schema.get("feature"),
+        "topic": schema.get("topic"),
+        "values": values,
+        "error": schema.get("error"),
+    }, ensure_ascii=False)
+
+
+def update_feature_setting(feature, key, value, device_ref=None):
+    """按声明的 scope 写单个参数；空值/None 表示清除覆盖、回到 default。"""
+    name = _normalize_feature_name(feature)
+    target_key = str(key or "").strip()
+    try:
+        specs = _feature_setting_specs(name)
+    except BaseException as error:
+        return json.dumps({
+            "ok": False, "feature": name, "key": target_key,
+            "error": f"{type(error).__name__}: {error}",
+        }, ensure_ascii=False)
+    spec = next((item for item in specs if item["key"] == target_key), None)
+    if spec is None:
+        return json.dumps({
+            "ok": False, "feature": name, "key": target_key,
+            "error": f"feature {name!r} does not declare setting {target_key!r}",
+        }, ensure_ascii=False)
+    cleared = value is None or (isinstance(value, str) and not value.strip())
+    try:
+        coerced = None if cleared else _coerce_feature_setting_value(spec, value)
+    except (TypeError, ValueError) as error:
+        return json.dumps({
+            "ok": False, "feature": name, "key": target_key,
+            "scope": spec["scope"],
+            "error": f"{type(error).__name__}: {error}",
+        }, ensure_ascii=False)
+    stored = _write_feature_setting(name, spec["scope"], target_key, coerced, device_ref)
+    return json.dumps({
+        "ok": True,
+        "feature": name,
+        "key": target_key,
+        "scope": spec["scope"],
+        "scope_text": _FEATURE_SETTING_SCOPE_TEXT[spec["scope"]],
+        "value": spec.get("default") if cleared else stored.get(target_key),
+        "stored": not cleared,
+        "cleared": cleared,
+    }, ensure_ascii=False)
+
+
+def reset_feature_setting(feature, key, device_ref=None):
+    """清除某参数的已保存值（回到声明的 default）。"""
+    return update_feature_setting(feature, key, None, device_ref)
+
+
+def feature_setting(feature, key, default=None):
+    """feature 运行时读取参数生效值（直接返回 Python 值，不是 JSON）。
+
+    feature 脚本里就这么用：client_service.feature_setting("files", "page_size", 100)。
+    未知 key / 模块加载失败 / 脏数据一律回退 default，绝不让参数读取把业务打断。
+    """
+    name = _normalize_feature_name(feature)
+    target_key = str(key or "").strip()
+    try:
+        spec = next((item for item in _feature_setting_specs(name)
+                     if item["key"] == target_key), None)
+        if spec is None:
+            return default
+        store = _feature_store(name, spec["scope"])
+        if spec["key"] not in store:
+            declared = spec.get("default")
+            return default if declared is None else declared
+        return _coerce_feature_setting_value(spec, store[spec["key"]])
+    except BaseException:
+        return default
+
+
+def feature_timeout(feature, default=10.0):
+    """feature 的 RPC 超时秒数：设置页配了就用配置值，否则用调用点的默认值。"""
+    value = feature_setting(feature, _FEATURE_TIMEOUT_KEY, None)
+    try:
+        seconds = float(default if value is None else value)
+    except (TypeError, ValueError):
+        return float(default)
+    return min(max(seconds, _RPC_TIMEOUT_MIN), _RPC_TIMEOUT_MAX)
 
 
 # ---------------------------------------------------------------------------

@@ -15,9 +15,21 @@ import time
 
 import client_service
 
-FEATURE = {"name": "files", "title": "Files", "version": 4,
+FEATURE = {"name": "files", "title": "Files", "version": 5,
            "actions": ["probe", "scan", "read", "hash", "upload", "delete"],
-           "ui": "python", "icon": "files"}
+           "ui": "python", "icon": "files",
+           # 主界面不再占用底部空间放可调参数：全部收进长按 → Setting 的设置页。
+           "settings": [
+               {"key": "page_size", "label": "\u5355\u6b21\u6587\u4ef6\u4e2a\u6570",
+                "type": "int", "default": 100, "min": 1, "max": 10000,
+                "scope": "topic",
+                "help": "\u6bcf\u6b21\u626b\u63cf / \u52a0\u8f7d\u66f4\u591a\u8bfb\u591a\u5c11\u6761\u76ee\u5f55\u9879\uff1b\u5206 topic \u4fdd\u5b58\uff0c\u6bcf\u4e2a\u76ee\u6807\u53ef\u4e0d\u540c\u3002"},
+               {"key": "timeout", "label": "RPC \u8d85\u65f6\uff08\u79d2）",
+                "type": "int", "default": None, "min": 1, "max": 600,
+                "scope": "topic",
+                "help": "\u7559\u7a7a = \u7528\u5404\u52a8\u4f5c\u5185\u7f6e\u9ed8\u8ba4\uff08probe 15 / scan 20 / "
+                       "read 45 / hash 60 / delete 30 / upload 120\uff09\uff1b\u586b\u4e86\u5219\u6240\u6709\u52a8\u4f5c\u90fd\u7528\u8fd9\u4e2a\u503c\u3002"},
+           ]}
 
 # 可交给 audio feature 在目标端播放的扩展名（feature 互操作白名单）。
 AUDIO_EXTENSIONS = (".mp3", ".wav", ".aac", ".m4a", ".ogg", ".oga", ".flac", ".opus", ".amr")
@@ -412,35 +424,40 @@ def build_upload_code(remote_path):
 
 # =============================== feature actions ===============================
 
+def _timeout(default):
+    """\u8d85\u65f6\u53d6\u8bbe\u7f6e\u9875\u7684\u201cRPC \u8d85\u65f6”\uff08topic \u4f5c\u7528\u57df\uff09\uff1b\u672a\u914d\u7f6e\u65f6\u7528\u52a8\u4f5c\u81ea\u5e26\u9ed8\u8ba4\u3002"""
+    return client_service.feature_timeout("files", default)
+
+
 def probe(root=""):
-    result = client_service.rpc(build_probe_code(root), timeout=15)
+    result = client_service.rpc(build_probe_code(root), timeout=_timeout(15))
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 
 def scan(root, offset=0, limit=100, recursive=False):
-    # 目录遍历按 limit 有界，20s 足够；显式超时，不吃设备默认值。
-    result = client_service.rpc(build_scan_code(root, offset, limit, recursive), timeout=20)
+    # 目录遍历按 limit 有界，20s 足够；未配置时显式超时，不吃设备默认值。
+    result = client_service.rpc(build_scan_code(root, offset, limit, recursive), timeout=_timeout(20))
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 
 def read(path, offset=0, length=DEFAULT_CHUNK):
-    result = client_service.rpc(build_read_code(path, offset, length), timeout=45)
+    result = client_service.rpc(build_read_code(path, offset, length), timeout=_timeout(45))
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 
 def hash(path):  # noqa: A001 - feature action 名固定为 hash
-    result = client_service.rpc(build_hash_code(path), timeout=60)
+    result = client_service.rpc(build_hash_code(path), timeout=_timeout(60))
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 
 def delete(paths, boundary="", recursive=True):
-    result = client_service.rpc(build_delete_code(paths, recursive, boundary), timeout=30)
+    result = client_service.rpc(build_delete_code(paths, recursive, boundary), timeout=_timeout(30))
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 
 def upload(remote_path):
-    # 上传走目标端 OpenAPI，大文件慢，给 120s；设备默认 timeout 不应掐断它。
-    result = client_service.rpc(build_upload_code(remote_path), timeout=120)
+    # 上传走目标端 OpenAPI，大文件慢，默认给 120s；设备默认 timeout 不应掐断它。
+    result = client_service.rpc(build_upload_code(remote_path), timeout=_timeout(120))
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 
@@ -618,11 +635,11 @@ def build_view(context):
     load_more.setVisibility(View.GONE)
     page.add(load_more, top=6)
 
-    # ---- 底部：页码输入 / Up / Refresh / 删除确认条 ----
+    # ---- 底部：Up / Refresh / 删除确认条 ----
+    # 单次文件个数已迁到「长按 feature → Setting」的设置页（paging 参数），
+    # 主界面底部只留导航按钮，不再占一行输入框。
     bottom_box = LinearLayout(context)
     bottom_box.setOrientation(LinearLayout.VERTICAL)
-    limit_edit = pyui_kit.make_edit(context, "100", number=True)
-    bottom_box.addView(limit_edit, LinearLayout.LayoutParams(pyui_kit.match(), pyui_kit.wrap()))
     nav_row = pyui_kit.make_hrow(context)
     up_button = pyui_kit.make_button(context, "Up", lambda: None)
     refresh_button = pyui_kit.make_button(context, "Refresh", lambda: None)
@@ -688,9 +705,11 @@ def build_view(context):
         return cut
 
     def page_size():
+        # 单次文件个数来自「长按 → Setting」的 feature 设置页（分 topic 持久化），
+        # 主界面已经没有输入框；读不到/脏数据一律回退 100。
         try:
-            return max(1, min(int(str(limit_edit.getText()) or "100"), 10000))
-        except ValueError:
+            return max(1, min(int(client_service.feature_setting("files", "page_size", 100)), 10000))
+        except (TypeError, ValueError):
             return 100
 
     def line_text(entry):

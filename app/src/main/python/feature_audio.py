@@ -7,10 +7,16 @@ import client_service
 FEATURE = {
     "name": "audio",
     "title": "Audio",
-    "version": 1,
+    "version": 2,
     "actions": ["play", "get_volume", "set_volume"],
     "ui": "python",
     "icon": "audio",
+    # 可调参数（长按 feature → Setting 的独立设置页，不占主界面）。
+    "settings": [
+        {"key": "timeout", "label": "RPC 超时（秒）", "type": "int",
+         "default": None, "min": 1, "max": 600, "scope": "topic",
+         "help": "留空 = 播放 20s / 音量 10s；填了则所有动作统一用该值。"},
+    ],
 }
 
 AUDIO_PATH = "/sdcard/apm/mm.mp3"
@@ -188,21 +194,25 @@ r = json.dumps(r, ensure_ascii=False)
 # ---------------------------------------------------------------------------
 
 def play(path=AUDIO_PATH):
-    # 起播 + 状态采集，20s 上限，不依赖设备默认 timeout。
-    result = client_service.rpc(build_play_code(path), timeout=PLAY_TIMEOUT)
+    # 起播 + 状态采集，默认 20s 上限（设置页配了 timeout 则以设置为准）。
+    result = client_service.rpc(
+        build_play_code(path), timeout=client_service.feature_timeout("audio", PLAY_TIMEOUT)
+    )
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 
 def get_volume(stream=DEFAULT_STREAM):
     result = client_service.rpc(
-        build_volume_code("get", 0, stream), timeout=VOLUME_TIMEOUT
+        build_volume_code("get", 0, stream),
+        timeout=client_service.feature_timeout("audio", VOLUME_TIMEOUT),
     )
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 
 
 def set_volume(level, stream=DEFAULT_STREAM):
     result = client_service.rpc(
-        build_volume_code("set", int(level), stream), timeout=VOLUME_TIMEOUT
+        build_volume_code("set", int(level), stream),
+        timeout=client_service.feature_timeout("audio", VOLUME_TIMEOUT),
     )
     return json.dumps(client_service.parse_json_result(result), ensure_ascii=False)
 

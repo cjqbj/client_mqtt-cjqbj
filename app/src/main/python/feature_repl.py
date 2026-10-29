@@ -17,10 +17,16 @@ import json
 import client_service
 
 FEATURE = {
-    "version": 1,
+    "version": 2,
     "actions": ["eval"],
     "icon": "terminal",
     "ui": "python",
+    # 可调参数：REPL 页面里的 timeout 输入框初始值也取这里（分 topic 保存）。
+    "settings": [
+        {"key": "timeout", "label": "默认超时（秒）", "type": "float",
+         "default": None, "min": 1, "max": 120, "scope": "topic",
+         "help": "留空 = 10s；REPL 页面上的 timeout 输入框仍可逐次临时覆盖。"},
+    ],
 }
 
 DEFAULT_TIMEOUT = 10
@@ -38,8 +44,9 @@ def _normalize_timeout(value):
     try:
         timeout = float(value)
     except (TypeError, ValueError):
-        timeout = DEFAULT_TIMEOUT
-    return min(max(timeout, _TIMEOUT_MIN), _TIMEOUT_MAX)
+        # 输入框为空/非法时用设置页里的默认值（分 topic），再不行才用 10s。
+        timeout = client_service.feature_setting("repl", "timeout", DEFAULT_TIMEOUT)
+    return min(max(float(timeout), _TIMEOUT_MIN), _TIMEOUT_MAX)
 
 
 def eval(code=None, timeout=DEFAULT_TIMEOUT):
@@ -100,7 +107,11 @@ def build_view(context):
     )
     page.add(editor, top=8)
 
-    timeout_input = pyui_kit.make_edit(context, str(DEFAULT_TIMEOUT), number=True)
+    timeout_input = pyui_kit.make_edit(
+        context,
+        str(client_service.feature_setting("repl", "timeout", DEFAULT_TIMEOUT)),
+        number=True,
+    )
     timeout_input.setHint("timeout seconds")
     timeout_input.setSingleLine(True)
     page.add(timeout_input, top=8)

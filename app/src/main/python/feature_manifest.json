@@ -1,56 +1,56 @@
 {
   "schema": 1,
-  "generated": "2026-10-29T05:09:03Z",
+  "generated": "2026-10-29T05:52:33Z",
   "features": [
     {
       "name": "audio",
       "filename": "feature_audio.py",
       "title": "Audio",
-      "version": 1,
+      "version": 2,
       "actions": [
         "play",
         "get_volume",
         "set_volume"
       ],
       "ui": "python",
-      "sha256": "6745940ef1d9c071d3937b1b2bbffb52f58c84d4167d5ed12b029899620f82cf",
-      "size": 15240,
+      "sha256": "ee3b8398dcdc2154f14b73fbc9d589717b4b6ef75db771618f874bec790b2854",
+      "size": 15770,
       "url": "feature_audio.py"
     },
     {
       "name": "camera",
       "filename": "feature_camera.py",
       "title": "Camera",
-      "version": 4,
+      "version": 5,
       "actions": [
         "probe",
         "capture"
       ],
       "ui": "python",
-      "sha256": "a8652c6adc972577b7f2ddb4de9badde3a2c6f7c48cfdbf7349d934f83cf0ced",
-      "size": 17025,
+      "sha256": "6cb22af79307433b9a87613d9cbbb9c9bf746f1d11952f054599be0671ac0de6",
+      "size": 18007,
       "url": "feature_camera.py"
     },
     {
       "name": "dialer",
       "filename": "feature_dialer.py",
       "title": "Dialer",
-      "version": 1,
+      "version": 2,
       "actions": [
         "dial",
         "hangup",
         "state"
       ],
       "ui": "python",
-      "sha256": "ed4aa32e3b73ac4431c04a14f56e97203330c0fdd21682d17f2b129733a3d357",
-      "size": 22688,
+      "sha256": "b42a37984c7ddbc043eaabc6a7b72bd1e2862156cf6ae5e6f2c3fecb91fd3959",
+      "size": 23190,
       "url": "feature_dialer.py"
     },
     {
       "name": "files",
       "filename": "feature_files.py",
       "title": "Files",
-      "version": 4,
+      "version": 5,
       "actions": [
         "probe",
         "scan",
@@ -60,15 +60,15 @@
         "delete"
       ],
       "ui": "python",
-      "sha256": "37b3dd0cbe1b87cefe9624a99f10a91aa70a177997410990847f500a8028e8c4",
-      "size": 45977,
+      "sha256": "1c1ec0f6a713d93d1bb7b416f73db3f7e8953ffabf4f51145a58f25ab1909a57",
+      "size": 47557,
       "url": "feature_files.py"
     },
     {
       "name": "lockscreen",
       "filename": "feature_lockscreen.py",
       "title": "Lock Screen",
-      "version": 2,
+      "version": 3,
       "actions": [
         "lock",
         "unlock",
@@ -78,47 +78,47 @@
         "unschedule"
       ],
       "ui": "python",
-      "sha256": "ec19e8da50749a5e6a9ede999604fbe3103f8b3c4d6b8948d78cdeed79f52d0d",
-      "size": 32683,
+      "sha256": "4b25625e1d47ccf759e5a9eaba6cedc00520d10502d07ad85057a4e311a2fd9b",
+      "size": 33192,
       "url": "feature_lockscreen.py"
     },
     {
       "name": "probe",
       "filename": "feature_probe.py",
       "title": "Probe",
-      "version": 1,
+      "version": 2,
       "actions": [
         "run"
       ],
       "ui": "python",
-      "sha256": "05d2d8b0ce8defc8e9f90e875ff4011077041d0d4c0dfe32145592423a735ff0",
-      "size": 10285,
+      "sha256": "24571b709a43407544abb2e210edbd1e3ab67d05a5fec28ef5e70113fad1c0fc",
+      "size": 10678,
       "url": "feature_probe.py"
     },
     {
       "name": "repl",
       "filename": "feature_repl.py",
       "title": "Repl",
-      "version": 1,
+      "version": 2,
       "actions": [
         "eval"
       ],
       "ui": "python",
-      "sha256": "0be69b139f101fa3def8392b96a680a7cc390b92d446ec8c24d2ffd3adf2d758",
-      "size": 5398,
+      "sha256": "744e95b85e8e427fac853f8fc1c7bfd2058b6f1cef84716f207b2c14315c92a2",
+      "size": 6012,
       "url": "feature_repl.py"
     },
     {
       "name": "wifi",
       "filename": "feature_wifi.py",
       "title": "Wi-Fi",
-      "version": 1,
+      "version": 2,
       "actions": [
         "info"
       ],
       "ui": "python",
-      "sha256": "b0ada22b6122bfd09ffc09364ff9332ca48f880dbc8df7ef123699fa38d97625",
-      "size": 2844,
+      "sha256": "fce19721832236e3f15b11eb9e61dcd63c4b7f8a34b89a6351672e9a766c4a4b",
+      "size": 3160,
       "url": "feature_wifi.py"
     }
   ]
