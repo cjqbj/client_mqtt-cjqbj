@@ -59,3 +59,9 @@ app/src/main/jni/ncnn-build
 app/src/main/jni/ncnn
 # Downloaded at build time by gradle task downloadKnf
 app/src/main/jni/third_party/
+
+# Python 构建缓存：.pyc/.pyo 是编译产物，不进版本库（.py 源码照常提交）
+__pycache__/
+*.py[cod]
+
+# 注意：刻意不忽略 *.apk / out/ —— 构建产物 APK 需要随仓库分发
