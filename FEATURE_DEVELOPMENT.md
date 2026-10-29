@@ -110,6 +110,11 @@ https://ghfast.top/https://raw.githubusercontent.com/cjqbj/client_mqtt-cjqbj/ref
   - `feature_download_settings()` / `update_feature_download_settings({"feature_url_root": ...})`
   - `install_named_feature(script_root, "demo", retries=4, timeout=20)`：接受裸名或全名，下到 py_updates 并立刻弹模块缓存+清 pyc。
   - `install_builtin_features(script_root, 4, 15)`（补缺失）/ `reinstall_builtin_features(...)`（force 全重下）/ `install_builtin_feature(script_root, filename, 4, 15)`。
+- **版本清单 `feature_manifest.json`**：裸 `.py` 没有版本索引，客户端想知道“有没有新版”必须先下全文。现在把每个 feature 的 `name/filename/version/sha256/size/url` 写到 `<root>feature_manifest.json`：
+  - 发布前在仓库根跑 `python3 tools/gen_feature_manifest.py`（AST 静态读 `FEATURE` 字典，不执行脚本），把生成的清单与 `feature_*.py` 一起提交。
+  - `feature_updates(timeout=12, force=False)`：只拉小清单（ETag + 300s 缓存），逐项对比本地 `version`/`sha256`/`source`，返回 `update_available` 与原因；内置 `.pyc` 与远端 `.py` 的 sha 天然不同，这类只比 version，py_updates 覆盖文件才额外比 sha256。
+  - `update_feature(name)` / `update_features(names=None)`：按清单 URL 下载，`bootstrap.install_feature` 做 compile + sha256 校验 + 临时文件原子替换，然后清 pyc 并 `reload_feature` 热加载。
+  - `install_builtin_features(force=False)` 已是版本感知：文件缺失/版本落后/sha 不同才下载，其余 skip；设置页现有 “Download missing feature scripts” 按钮因此能直接升级旧脚本。`force=True` 仍为全量重下。
 - **发现机制**：catalog 合并 `BUILTIN_FEATURES` + 扫描两个目录，每 3 秒自动轮询；设置页"Refresh feature list"调 `rescan_features()` 立即重扫。手动放进 py_updates 的文件刷新后即出现，下次动作按需 import；删除文件重扫后运行时模块清出 sys.modules。
 - 已加载模块常驻缓存：线上改文件后让用户长按 feature → reload（`reload_feature(name)`）；唯一自动重载是 py_updates 文件首次遮蔽内置模块。
 
