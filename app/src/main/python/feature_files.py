@@ -2,9 +2,9 @@
 
 目标端只跑标准库代码（os/json/base64/hashlib），不 import 任何 Android 或
 aliyun 模块，因此 Android / Linux / Windows 目标都能浏览、读取、删除。
-下载优先走 aliyun 中转：目标只要能 import aliyun_git 就用（不限系统），
-导入不到才退回 MQTT 分块读取（256KiB/块）。用 aliyun 前手机端弹行内
-确认条，由用户选择 Aliyun 或 MQTT，避免目标文件未经确认就被传到中转。
+下载优先走 aliyun 中转：目标只要能 import aliyun_git 就直接走快路径（不限
+系统），不再弹确认条；导入不到或中转失败才自动退回 MQTT 分块读取
+（256KiB/块）。
 """
 
 import base64
@@ -15,7 +15,7 @@ import time
 
 import client_service
 
-FEATURE = {"name": "files", "title": "Files", "version": 3,
+FEATURE = {"name": "files", "title": "Files", "version": 4,
            "actions": ["probe", "scan", "read", "hash", "upload", "delete"],
            "ui": "python", "icon": "files"}
 
@@ -585,7 +585,7 @@ def build_view(context):
         "topic": None, "key": None, "root": "", "boundary": "", "resolved": "",
         "entries": [], "has_more": False, "next_offset": 0, "limit": 100,
         "loading": False, "info": {}, "last_parent": None, "pending": None,
-        "pending_kind": "", "no_aliyun": False, "cache": {}, "roots": {}, "gen": 0,
+        "no_aliyun": False, "cache": {}, "roots": {}, "gen": 0,
     }
 
     def set_status(text):
@@ -639,12 +639,8 @@ def build_view(context):
     confirm_bar.addView(confirm_text, LinearLayout.LayoutParams(pyui_kit.match(), pyui_kit.wrap()))
     confirm_row = pyui_kit.make_hrow(context)
     confirm_yes = pyui_kit.make_button(context, "Delete", lambda: None)
-    # 传输确认条的第二个选项（Delete 时隐藏）：Aliyun / MQTT 二选一。
-    confirm_alt = pyui_kit.make_button(context, "MQTT", lambda: None)
-    confirm_alt.setVisibility(View.GONE)
     confirm_no = pyui_kit.make_button(context, "Cancel", lambda: None)
     confirm_row.addView(confirm_yes, LinearLayout.LayoutParams(0, pyui_kit.wrap(), 1.0))
-    confirm_row.addView(confirm_alt, LinearLayout.LayoutParams(0, pyui_kit.wrap(), 1.0))
     confirm_row.addView(confirm_no, LinearLayout.LayoutParams(0, pyui_kit.wrap(), 1.0))
     confirm_row_params = LinearLayout.LayoutParams(pyui_kit.match(), pyui_kit.wrap())
     confirm_row_params.topMargin = pyui_kit.dp(context, 4)
@@ -804,8 +800,6 @@ def build_view(context):
 
     def hide_pending():
         state["pending"] = None
-        state["pending_kind"] = ""
-        confirm_alt.setVisibility(View.GONE)
         confirm_bar.setVisibility(View.GONE)
 
     def load_page(start, reset=False):
@@ -919,29 +913,11 @@ def build_view(context):
 
     def begin_delete(entry):
         state["pending"] = entry
-        state["pending_kind"] = "delete"
         confirm_text.setText("Delete %s ?" % entry.get("path"))
         confirm_yes.setText("Delete")
         confirm_no.setText("Cancel")
-        confirm_alt.setVisibility(View.GONE)
         confirm_bar.setVisibility(View.VISIBLE)
         set_status("Confirm delete: %s (no undo)" % entry.get("path"))
-
-    def begin_transfer(entry):
-        """目标能 import aliyun_git 时先确认是否把文件经中转上传再下载。"""
-        state["pending"] = entry
-        state["pending_kind"] = "transfer"
-        name = str(entry.get("path")).replace("\\", "/").rsplit("/", 1)[-1]
-        confirm_text.setText(
-            "Aliyun relay available for %s. Upload it to the relay then download? "
-            "MQTT keeps the bytes on the target." % name
-        )
-        confirm_yes.setText("Aliyun")
-        confirm_alt.setText("MQTT")
-        confirm_alt.setVisibility(View.VISIBLE)
-        confirm_no.setText("Cancel")
-        confirm_bar.setVisibility(View.VISIBLE)
-        set_status("Choose transport for %s: Aliyun (fast) or MQTT" % name)
 
     def cancel_pending():
         hide_pending()
@@ -975,17 +951,13 @@ def build_view(context):
 
         pyui_kit.run_async(work, apply_ok, apply_error, buttons=(confirm_yes,))
 
-    def confirm_pending(choice):
-        """底部确认条统一入口：delete 确认或 aliyun/mqtt 传输选择。"""
+    def confirm_pending():
+        """底部确认条只剩删除一种确认。"""
         entry = state.get("pending")
-        kind = state.get("pending_kind")
         if not entry:
             return
         hide_pending()
-        if kind == "delete":
-            confirm_delete(entry)
-        elif kind == "transfer":
-            download_entry(entry, choice or "aliyun")
+        confirm_delete(entry)
 
     def on_entry_click(entry):
         if entry.get("kind") == "directory":
@@ -1017,13 +989,11 @@ def build_view(context):
         return on_progress
 
     def download_entry(entry, transfer=None):
-        # 首次点击：目标能 import aliyun_git 就先弹确认条（Aliyun / MQTT），
-        # 导入不到就直接走 MQTT，不再让中转失败后才回退。
+        # 目标能 import aliyun_git 就直接走 aliyun 快路径（不弹确认），
+        # 导入不到才走 MQTT；中转失败同样在 work() 内自动回退 MQTT。
         if transfer is None:
-            if bool((state["info"] or {}).get("aliyun")):
-                begin_transfer(entry)
-                return
-            transfer = "mqtt"
+            transfer = ("aliyun" if bool((state["info"] or {}).get("aliyun"))
+                        else "mqtt")
         remote_path = join_path(state["root"], entry.get("path"))
         name = str(entry.get("path")).replace("\\", "/").rsplit("/", 1)[-1]
         is_image = name.lower().endswith(IMAGE_EXTENSIONS)
@@ -1159,8 +1129,7 @@ def build_view(context):
     pyui_kit.click(load_more, on_load_more)
     pyui_kit.click(up_button, on_up)
     pyui_kit.click(refresh_button, on_refresh)
-    pyui_kit.click(confirm_yes, lambda: confirm_pending("aliyun"))
-    pyui_kit.click(confirm_alt, lambda: confirm_pending("mqtt"))
+    pyui_kit.click(confirm_yes, confirm_pending)
     pyui_kit.click(confirm_no, cancel_pending)
 
     def on_target(key, topic, cfg):

@@ -6,7 +6,7 @@ import time
 
 import client_service
 
-FEATURE = {"name": "camera", "title": "Camera", "version": 3,
+FEATURE = {"name": "camera", "title": "Camera", "version": 4,
            "actions": ["probe", "capture"],
            "ui": "python", "icon": "camera"}
 
@@ -188,8 +188,8 @@ def build_view(context):
     - 切 feature tab / 开覆盖页：View 常驻，状态天然不丢；
     - 切到别的目标再回来：states[key] 各自保存 facing/格式/文字/照片；
     - 文件名固定为 年份/topic名_YYYYMMDD_HHMMSS.(jpg|png)，由目标端生成；
-    - 目标能 import aliyun_git 时弹行内确认条选 Aliyun 或 MQTT；
-      导入不到就直接走 MQTT（照片先落目标临时目录再分块 read 拉回）。
+    - 目标能 import aliyun_git 时直接走 aliyun 快路径（不弹确认条）；
+      导入不到或中转失败才走 MQTT（照片先落目标临时目录再分块 read 拉回）。
     """
     import base64
     import bootstrap
@@ -215,28 +215,9 @@ def build_view(context):
     status = pyui_kit.make_text(context, "Ready", selectable=True)
     page.add(status, top=8)
 
-    # 行内确认条（项目没有原生 dialog）：目标可 import aliyun_git 时让用户
-    # 选 Aliyun 中转或 MQTT；不可导入则不弹，直接走 MQTT。
-    relay_bar = LinearLayout(context)
-    relay_bar.setOrientation(LinearLayout.VERTICAL)
-    relay_bar.setVisibility(View.GONE)
-    relay_text = pyui_kit.make_text(context, "", size=12, color=pyui_kit.SUB)
-    relay_bar.addView(relay_text, LinearLayout.LayoutParams(pyui_kit.match(), pyui_kit.wrap()))
-    relay_row = pyui_kit.make_hrow(context)
-    relay_aliyun = pyui_kit.make_button(context, "Aliyun", lambda: None)
-    relay_mqtt = pyui_kit.make_button(context, "MQTT", lambda: None)
-    relay_cancel = pyui_kit.make_button(context, "Cancel", lambda: None)
-    relay_row.addView(relay_aliyun, LinearLayout.LayoutParams(0, pyui_kit.wrap(), 1.0))
-    relay_row.addView(relay_mqtt, LinearLayout.LayoutParams(0, pyui_kit.wrap(), 1.0))
-    relay_row.addView(relay_cancel, LinearLayout.LayoutParams(0, pyui_kit.wrap(), 1.0))
-    relay_row_params = LinearLayout.LayoutParams(pyui_kit.match(), pyui_kit.wrap())
-    relay_row_params.topMargin = pyui_kit.dp(context, 4)
-    relay_bar.addView(relay_row, relay_row_params)
-    page.add(relay_bar, top=6)
-
     def new_state():
         return {"facing": 0, "image_format": "jpeg", "settings_loaded": False,
-                "status": "Ready", "bitmap": None, "pending": False,
+                "status": "Ready", "bitmap": None,
                 "caps": {"checked": False, "aliyun": False, "error": ""}}
 
     def state_for(key):
@@ -342,22 +323,7 @@ def build_view(context):
         if current["key"] and states.get(current["key"]) is st:
             paint()
 
-    def hide_relay(st):
-        st["pending"] = False
-        relay_bar.setVisibility(View.GONE)
-
-    def request_relay(st):
-        st["pending"] = True
-        relay_text.setText(
-            "Aliyun relay available. Upload this photo to Aliyun then download? "
-            "MQTT keeps the photo on the target."
-        )
-        relay_bar.setVisibility(View.VISIBLE)
-        st["status"] = "Choose transport: Aliyun (fast) or MQTT"
-        paint()
-
     def start_capture(st, transport):
-        hide_relay(st)
         facing = int(st["facing"])
         image_format = st["image_format"]
         label = current["label"] or "photo"
@@ -424,10 +390,7 @@ def build_view(context):
 
     def decide_transport(st):
         if st["caps"].get("checked"):
-            if st["caps"].get("aliyun"):
-                request_relay(st)
-            else:
-                start_capture(st, "mqtt")
+            start_capture(st, "aliyun" if st["caps"].get("aliyun") else "mqtt")
             return
         st["status"] = "Checking aliyun relay ..."
         paint()
@@ -444,7 +407,7 @@ def build_view(context):
             st["caps"] = {"checked": True, "aliyun": bool(values.get("aliyun")),
                           "error": str(values.get("error") or "")}
             if st["caps"]["aliyun"]:
-                request_relay(st)
+                start_capture(st, "aliyun")
             else:
                 st["status"] = ("Aliyun unavailable; using MQTT"
                                 if not st["caps"]["error"] else
@@ -467,38 +430,16 @@ def build_view(context):
             return
         decide_transport(state_for(current["key"]))
 
-    def choose_transport(transport):
-        st = state_for(current["key"]) if current["key"] else None
-        if not st or not st.get("pending"):
-            return
-        start_capture(st, transport)
-
-    def cancel_relay():
-        st = state_for(current["key"]) if current["key"] else None
-        if not st or not st.get("pending"):
-            return
-        hide_relay(st)
-        st["status"] = "Ready"
-        paint()
-
-
     pyui_kit.click(back, lambda: select_facing(0))
     pyui_kit.click(front, lambda: select_facing(1))
     pyui_kit.click(jpeg_button, lambda: select_format("jpeg"))
     pyui_kit.click(png_button, lambda: select_format("png"))
     pyui_kit.click(shutter, on_capture)
-    pyui_kit.click(relay_aliyun, lambda: choose_transport("aliyun"))
-    pyui_kit.click(relay_mqtt, lambda: choose_transport("mqtt"))
-    pyui_kit.click(relay_cancel, cancel_relay)
     page.bottom_add(back)
     page.bottom_add(front)
     page.bottom_add(shutter, weight=1.0)
 
     def on_target(key, topic, cfg):
-        old = states.get(current["key"]) if current["key"] else None
-        if old is not None:
-            old["pending"] = False
-        relay_bar.setVisibility(View.GONE)
         current["key"] = key
         current["topic"] = topic
         current["label"] = label_from(cfg, topic)

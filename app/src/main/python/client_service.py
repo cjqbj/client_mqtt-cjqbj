@@ -4,6 +4,7 @@ import ast
 import json
 import base64
 import copy
+import hashlib
 import importlib
 import importlib.util
 import os
@@ -387,6 +388,338 @@ def _feature_source_urls(filename, allow_fallback=True):
     return urls
 
 
+# ---------------------------------------------------------------------------
+# Feature 版本清单（feature_manifest.json）
+#
+# 裸 feature_*.py 没有版本索引，客户端只能“先下载全文再知道有没有新版”。
+# 清单把每个 feature 的 version/sha256/size 放在 URL 根下的小 JSON 里：
+#   {"schema": 1, "generated": "...", "features": [
+#       {"name": "files", "filename": "feature_files.py", "version": 4,
+#        "sha256": "...", "size": 45977, "url": "feature_files.py"}]}
+# 客户端只拉清单（ETag + 300s 缓存），version 或 sha256 不一致才下载正文；
+# 下载仍走 bootstrap.install_feature（compile + sha256 校验 + 原子替换）。
+# ---------------------------------------------------------------------------
+FEATURE_MANIFEST_NAME = "feature_manifest.json"
+_FEATURE_MANIFEST_TTL = 300.0
+_MANIFEST_CACHE = {"url": "", "etag": "", "checked": 0.0, "data": None}
+
+
+def _as_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _feature_manifest_urls():
+    """feature_manifest.json 候选地址：配置根优先，再走官方镜像回退。"""
+    urls = [feature_url_root() + FEATURE_MANIFEST_NAME]
+    for root in _FALLBACK_FEATURE_URL_ROOTS:
+        candidate = root + FEATURE_MANIFEST_NAME
+        if candidate not in urls:
+            urls.append(candidate)
+    return urls
+
+
+def _parse_feature_manifest(body, source_url=""):
+    """校验并规整版本清单；只接受 {"features": [...]} 结构。"""
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    try:
+        data = json.loads(body)
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid feature manifest JSON: %s" % error)
+    if not isinstance(data, dict):
+        raise ValueError("feature manifest must be a JSON object")
+    features = data.get("features")
+    if not isinstance(features, list):
+        raise ValueError("feature manifest must contain a features list")
+    entries = []
+    for item in features:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        filename = str(item.get("filename") or ("feature_%s.py" % name if name else ""))
+        if not name or not filename.startswith("feature_") or not filename.endswith(".py"):
+            continue
+        entries.append({
+            "name": name,
+            "filename": filename,
+            "version": _as_int(item.get("version")),
+            "size": _as_int(item.get("size")),
+            "sha256": str(item.get("sha256") or "").lower(),
+            "url": str(item.get("url") or ""),
+            "min_client_version": str(item.get("min_client_version") or ""),
+        })
+    return {
+        "schema": data.get("schema", 1),
+        "generated": str(data.get("generated") or ""),
+        "features": entries,
+        "source_url": source_url,
+    }
+
+
+def fetch_feature_manifest(timeout=12, force=False, ttl=None):
+    """拉取远端 feature_manifest.json：小文件、带 ETag，失败自动换镜像。"""
+    now = time.time()
+    ttl_seconds = _FEATURE_MANIFEST_TTL if ttl is None else float(ttl)
+    cache = _MANIFEST_CACHE
+    if not force and cache.get("data") and now - cache.get("checked", 0.0) < ttl_seconds:
+        return dict(cache["data"], cached=True, not_modified=True)
+    try:
+        timeout_seconds = min(max(float(timeout or 12), 1.0), 60.0)
+    except (TypeError, ValueError):
+        timeout_seconds = 12.0
+    attempts = []
+    for url in _feature_manifest_urls():
+        headers = {"User-Agent": "ClientMqtt/1.0", "Accept": "application/json"}
+        if cache.get("etag") and cache.get("url") == url:
+            headers["If-None-Match"] = cache["etag"]
+        attempt = {"url": url}
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                attempt["http_status"] = getattr(response, "status", 200)
+                etag = response.headers.get("ETag") or ""
+                body = response.read(1_000_000)
+            parsed = _parse_feature_manifest(body, url)
+            cache.update({"url": url, "etag": etag, "checked": now, "data": parsed})
+            attempts.append(attempt)
+            return dict(parsed, cached=False, not_modified=False, attempts=attempts)
+        except urllib.error.HTTPError as error:
+            attempt["http_status"] = error.code
+            if error.code == 304 and cache.get("data"):
+                cache["checked"] = now
+                attempts.append(attempt)
+                return dict(cache["data"], cached=True, not_modified=True,
+                            source_url=url, attempts=attempts)
+            attempt["error"] = "HTTP %d" % error.code
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            attempt["error"] = "%s: %s" % (type(error).__name__, error)
+        attempts.append(attempt)
+    last_error = next(
+        (item.get("error") for item in reversed(attempts) if item.get("error")),
+        "feature manifest unavailable",
+    )
+    raise RuntimeError(last_error)
+
+
+def _feature_version_from_source(content):
+    """从 feature_*.py 里静态读出 FEATURE["version"]（不执行脚本）。"""
+    try:
+        tree = ast.parse(content)
+    except (SyntaxError, ValueError, TypeError):
+        return 0
+    for node in getattr(tree, "body", []):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "FEATURE"
+                   for target in node.targets):
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except (ValueError, TypeError):
+            return 1
+        if isinstance(value, dict):
+            return _as_int(value.get("version"), 1) or 1
+        return 1
+    return 0
+
+
+def _describe_local_feature_file(path):
+    """py_updates 里某个 feature_*.py 的 version/sha256/size。"""
+    try:
+        with open(path, "rb") as handle:
+            content = handle.read()
+    except OSError:
+        return {"version": 0, "sha256": "", "size": 0}
+    return {
+        "version": _feature_version_from_source(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size": len(content),
+    }
+
+
+def _compare_feature_entry(remote, local):
+    """纯函数：远端清单项 vs 本地状态 -> (有新版?, 原因)。"""
+    if not local.get("present"):
+        return True, "not installed"
+    remote_version = _as_int(remote.get("version"))
+    local_version = _as_int(local.get("version"))
+    if remote_version and remote_version > local_version:
+        return True, "version %d -> %d" % (local_version, remote_version)
+    if remote_version and local_version and remote_version < local_version:
+        return False, "local version %d is newer" % local_version
+    remote_sha = str(remote.get("sha256") or "").lower()
+    local_sha = str(local.get("sha256") or "").lower()
+    # APK 内置模块读的是 .pyc，和远端 .py 的 sha 天然不同，只比 version。
+    if remote_sha and local_sha and remote_sha != local_sha \
+            and local.get("source") != "builtin":
+        return True, "sha256 differs"
+    return False, "up to date"
+
+
+def _feature_update_rows(manifest):
+    """把清单逐项和本地已加载模块/文件比对，返回可直接渲染的行。"""
+    import bootstrap
+    descriptors = {}
+    try:
+        descriptors = {str(item.get("name")): item for item in bootstrap.describe_features()}
+    except BaseException:
+        descriptors = {}
+    rows = []
+    for remote in (manifest or {}).get("features") or []:
+        name = remote["name"]
+        descriptor = descriptors.get(name) or {}
+        local = {"present": False, "version": 0, "sha256": "", "source": "absent"}
+        file_info = {}
+        if descriptor:
+            local["present"] = True
+            local["version"] = _as_int(descriptor.get("version"))
+            local["source"] = str(descriptor.get("source") or "")
+            try:
+                file_info = bootstrap.feature_file_info(name)
+            except BaseException:
+                file_info = {}
+            if local["source"] == "py_updates":
+                local["sha256"] = str(file_info.get("sha256") or "").lower()
+        update, reason = _compare_feature_entry(remote, local)
+        rows.append({
+            "name": name,
+            "filename": remote["filename"],
+            "local_version": local["version"],
+            "remote_version": remote["version"],
+            "local_source": local["source"],
+            "local_sha256": local["sha256"],
+            "remote_sha256": remote["sha256"],
+            "remote_size": remote["size"],
+            "update_available": bool(update),
+            "reason": reason,
+        })
+    return rows
+
+
+def feature_updates(timeout=12, force=False):
+    """比对远端 feature_manifest.json 与本地：哪些 feature 有新版本可更新。"""
+    try:
+        manifest = fetch_feature_manifest(timeout=timeout, force=force)
+        rows = _feature_update_rows(manifest)
+    except BaseException as error:
+        return json.dumps({
+            "ok": False,
+            "features": [],
+            "error": f"{type(error).__name__}: {error}",
+        }, ensure_ascii=False)
+    return json.dumps({
+        "ok": True,
+        "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source_url": manifest.get("source_url") or "",
+        "manifest_generated": manifest.get("generated") or "",
+        "cached": bool(manifest.get("cached")),
+        "available": sum(1 for item in rows if item.get("update_available")),
+        "features": rows,
+    }, ensure_ascii=False)
+
+
+def _update_feature_result(name, timeout=20, manifest=None):
+    """按清单更新单个 feature：下载 -> sha256 校验 -> 原子替换 -> 热加载。"""
+    import bootstrap
+    update_dir = bootstrap.update_dir()
+    if not update_dir:
+        raise RuntimeError("bootstrap is not initialized (no py_updates dir)")
+    if manifest is None:
+        manifest = fetch_feature_manifest(timeout=timeout, force=True)
+    remote = next(
+        (item for item in (manifest or {}).get("features") or []
+         if item.get("name") == str(name) or item.get("filename") == str(name)),
+        None,
+    )
+    if not remote:
+        raise ValueError(f"feature {name!r} is not listed in feature_manifest.json")
+    filename = remote["filename"]
+    url = remote.get("url") or ""
+    if not (url.startswith("http://") or url.startswith("https://")):
+        url = feature_url_root() + (url or filename)
+    fallbacks = [
+        root + filename for root in _FALLBACK_FEATURE_URL_ROOTS
+        if root + filename != url
+    ]
+    result = bootstrap.install_feature(
+        url,
+        filename,
+        sha256=remote.get("sha256") or "",
+        update_dir=update_dir,
+        retries=3,
+        timeout=timeout,
+        fallback_urls=fallbacks,
+        progress=_append_operation_log,
+    )
+    module_name = "feature_" + str(remote["name"])
+    try:
+        sys.modules.pop(module_name, None)
+        bootstrap._purge_feature_pyc(module_name)
+        bootstrap.load_feature(remote["name"], force_reload=True)
+        result["reloaded"] = True
+    except BaseException as error:
+        result["reloaded"] = False
+        result["reload_error"] = f"{type(error).__name__}: {error}"
+    result.update({
+        "name": remote["name"],
+        "version": remote["version"],
+        "file_info": bootstrap.feature_file_info(remote["name"]),
+    })
+    return result
+
+
+def update_feature(name, timeout=20):
+    """更新单个 feature（设置页按钮）；返回 JSON 字符串。"""
+    try:
+        manifest = fetch_feature_manifest(timeout=timeout, force=True)
+        result = _update_feature_result(name, timeout=timeout, manifest=manifest)
+        return json.dumps(result, ensure_ascii=False)
+    except BaseException as error:
+        return json.dumps({
+            "ok": False,
+            "name": str(name),
+            "error": f"{type(error).__name__}: {error}",
+        }, ensure_ascii=False)
+
+
+def update_features(names=None, timeout=20):
+    """批量更新：names 为空时更新清单里所有有新版的 feature。"""
+    try:
+        manifest = fetch_feature_manifest(timeout=timeout, force=True)
+        rows = _feature_update_rows(manifest)
+        wanted = {str(item).strip() for item in names} if names else None
+        targets = [
+            row for row in rows
+            if row.get("update_available") and (wanted is None or row.get("name") in wanted)
+        ]
+    except BaseException as error:
+        return json.dumps({
+            "ok": False,
+            "results": [],
+            "error": f"{type(error).__name__}: {error}",
+        }, ensure_ascii=False)
+    results = []
+    for row in targets:
+        try:
+            results.append(_update_feature_result(
+                row["name"], timeout=timeout, manifest=manifest
+            ))
+        except BaseException as error:
+            results.append({
+                "ok": False,
+                "name": row.get("name"),
+                "error": f"{type(error).__name__}: {error}",
+            })
+    return json.dumps({
+        "ok": all(bool(item.get("ok")) for item in results),
+        "updated": len(results),
+        "results": results,
+    }, ensure_ascii=False)
+
+
 def call_feature(feature, action="run", *args):
     """Dispatch through the stable bootstrap so feature modules can be replaced."""
     import bootstrap
@@ -637,25 +970,63 @@ def install_builtin_features(script_root, retries=4, timeout=15, force=False):
         ("Force reinstalling" if force else "Installing")
         + f" built-in features into {update_dir}"
     )
+    # 版本清单让小文件先判断“有没有新版”，只有缺失/版本落后/sha 不同才下载正文。
+    manifest_items = {}
+    if not force:
+        try:
+            manifest = fetch_feature_manifest(timeout=min(float(timeout or 15), 15.0))
+            manifest_items = {
+                item["filename"]: item for item in manifest.get("features") or []
+            }
+            _append_operation_log(
+                "Version manifest: %d entries%s"
+                % (len(manifest_items), " (cached)" if manifest.get("cached") else "")
+            )
+        except BaseException as manifest_error:
+            _append_operation_log(
+                "Version manifest unavailable (%s); falling back to presence check"
+                % f"{type(manifest_error).__name__}: {manifest_error}"[:200]
+            )
     results = []
 
     for filename in _builtin_feature_filenames():
         destination = os.path.join(update_dir, filename)
+        remote = manifest_items.get(filename) or {}
+        action = "reinstalled" if force else "installed"
         if not force and os.path.isfile(destination):
-            try:
-                with open(destination, "rb") as feature_file:
-                    compile(feature_file.read(), filename, "exec")
-                _append_operation_log(f"{filename}: already present; skipped")
-                results.append({"filename": filename, "ok": True, "skipped": True})
-                continue
-            except (OSError, SyntaxError):
-                _append_operation_log(f"{filename}: existing file is invalid; downloading replacement")
+            if remote:
+                local = _describe_local_feature_file(destination)
+                local["present"] = True
+                local["source"] = "py_updates"
+                update_available, reason = _compare_feature_entry(remote, local)
+                if update_available:
+                    _append_operation_log(f"{filename}: update available ({reason})")
+                    action = "updated"
+                else:
+                    _append_operation_log(f"{filename}: up to date ({reason}); skipped")
+                    results.append({"filename": filename, "ok": True, "skipped": True,
+                                    "action": "skipped", "reason": reason})
+                    continue
+            else:
+                try:
+                    with open(destination, "rb") as feature_file:
+                        compile(feature_file.read(), filename, "exec")
+                    _append_operation_log(f"{filename}: already present; skipped")
+                    results.append({"filename": filename, "ok": True, "skipped": True,
+                                    "action": "skipped", "reason": "no manifest entry"})
+                    continue
+                except (OSError, SyntaxError):
+                    _append_operation_log(
+                        f"{filename}: existing file is invalid; downloading replacement"
+                    )
 
         try:
             result = _install_builtin_feature_file(
-                bootstrap, filename, update_dir, retries, timeout
+                bootstrap, filename, update_dir, retries, timeout,
+                sha256=remote.get("sha256") or "",
             )
-            if force and result.get("ok"):
+            result["action"] = action
+            if result.get("ok") and (force or action == "updated"):
                 # 丢弃旧缓存，下一次动作/打开页面即用新文件。
                 feature_name = filename[8:-3]
                 try:
@@ -694,7 +1065,8 @@ def _builtin_feature_filenames():
     return [f"feature_{name}.py" for name in bootstrap.BUILTIN_FEATURES]
 
 
-def _install_builtin_feature_file(bootstrap, filename, update_dir, retries, timeout):
+def _install_builtin_feature_file(bootstrap, filename, update_dir, retries, timeout,
+                                  sha256=""):
     filename = str(filename)
     if filename not in _builtin_feature_filenames():
         raise ValueError(f"unknown built-in feature file: {filename}")
@@ -702,6 +1074,7 @@ def _install_builtin_feature_file(bootstrap, filename, update_dir, retries, time
     return bootstrap.install_feature(
         urls[0],
         filename,
+        sha256=sha256,
         update_dir=update_dir,
         retries=retries,
         timeout=timeout,
