@@ -57,6 +57,19 @@ logger = logging.getLogger("MultiMQTT")
 PERIODIC_WAKEUP_TOPIC = "__periodic_wakeup__"
 PERIODIC_WAKEUP_SENTINEL = (PERIODIC_WAKEUP_TOPIC, None, None)
 
+
+def _normalize_stats_interval(value, name):
+    """统计周期校验：接受 >=0 的 int/float/纯数字字符串，0 表示停用该周期任务。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{name} 必须是 >=0 的秒数")
+    try:
+        number = float(value.strip() if isinstance(value, str) else value)
+    except ValueError as error:
+        raise ValueError(f"{name} 必须是 >=0 的秒数") from error
+    if number < 0.0 or number != number or number == float("inf"):
+        raise ValueError(f"{name} 必须是 >=0 的秒数")
+    return number
+
 # =========================================================================
 # 预设公共 MQTT Broker 列表
 # -------------------------------------------------------------------------
@@ -154,7 +167,7 @@ def process_cipher(data, decrypt=False, enabled=False, key=AES_KEY):
 
 class TTLCache:
     """轻量级内存去重缓存（[修复-容量上限] 新增 max_size，超限按 FIFO 淘汰）"""
-    # [修复] 默认 max_size=50000。原先无上限：30 秒 TTL 内的瞬时峰值可能被恶意
+    # [修复] 默认 max_size=50000。原先无上限：TTL 窗口内的瞬时峰值可能被恶意
     # 灌入海量不同 req_id（即使每条只有 512 字节上限），连发百万级也能顶爆内存。
     # 加上限后，超过时按 OrderedDict 插入顺序淘汰最老条目，保证内存有界。
     def __init__(self, ttl_seconds=30, max_size=50000):
@@ -470,9 +483,11 @@ class BrokerStat:
 
 class ConnectionQualityStats:
     """网络连接质量统筹管理器，可方便开启与关闭"""
-    # [可配置] Ping 周期（秒）。原代码硬编码在 _monitor_loop 里，
-    # 现抽出为类属性：保留默认 600，也不影响 __init__ 签名（便于 diff）。
+    # [可配置] 周期 Ping（秒）。保留类属性作为默认值，实例值见 ping_interval。
+    # 0 表示停用周期 Ping，报告仅展示已有统计。
     PING_INTERVAL = 600
+    # [可配置] 连接质量报告的周期打印间隔（秒）。0 表示停用周期报告。
+    PRINT_INTERVAL = 3600
     # [修复-M4] 单条 ping 记录的最长存活时间：超过该时长仍未收到 ACK，
     # 认为该 ping 已经彻底丢失（QoS1 重传也救不回来），从待确认表中清除，
     # 防止 pending_pings 因极端网络状况无限膨胀。
@@ -483,11 +498,18 @@ class ConnectionQualityStats:
     #   - 由 MultiMQTTManager 传入 → 与 manager 共享同一把锁，
     #     保证 self.clients_ref（就是 manager.clients 同一个 dict）
     #     的读取与 manager 的 clients 写入使用同一把锁，彻底消除跨锁竞态。
-    def __init__(self, enabled=True, print_interval=3600, lock=None):
+    def __init__(self, enabled=True, print_interval=None, ping_interval=None, lock=None):
         self.enabled = enabled
         self.stats = {}
         self.lock = lock if lock is not None else threading.Lock()
-        self.print_interval = print_interval
+        self.print_interval = _normalize_stats_interval(
+            self.PRINT_INTERVAL if print_interval is None else print_interval,
+            "print_interval",
+        )
+        self.ping_interval = _normalize_stats_interval(
+            self.PING_INTERVAL if ping_interval is None else ping_interval,
+            "ping_interval",
+        )
         self.running = False
         # [合并线程] 不再维护独立监控线程，相关属性已删除
         self.clients_ref = {}
@@ -850,7 +872,7 @@ class MultiMQTTManager:
     # [修复-N3] stop() 中等待分发线程退出的超时（秒）。
     DISPATCH_JOIN_TIMEOUT = 5.0
 
-    def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60*5, max_reconnect_delay=3600, recovery_enabled=True, recovery_interval=15.0, recovery_probe_timeout=3.0, recovery_force_gap=30.0, recovery_start_grace=90.0, timestamp_window=120.0):
+    def __init__(self,brokers=BROKER_LIST,log_messages=False,enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60*5, max_reconnect_delay=3600, recovery_enabled=True, recovery_interval=15.0, recovery_probe_timeout=3.0, recovery_force_gap=30.0, recovery_start_grace=90.0,timestamp_window=400,stats_print_interval=None, stats_ping_interval=None):
         self.brokers = brokers
         self.keepalive = keepalive
         self.max_reconnect_delay = max_reconnect_delay
@@ -894,13 +916,29 @@ class MultiMQTTManager:
         # --- [统计功能] ---
         self.enable_stats = enable_stats
         self.log_connection = log_connection if log_connection is not None else not enable_stats
-        self.stats = ConnectionQualityStats(enabled=self.enable_stats, lock=self.lock)
+        self.stats = ConnectionQualityStats(
+            enabled=self.enable_stats,
+            print_interval=stats_print_interval,
+            ping_interval=stats_ping_interval,
+            lock=self.lock,
+        )
         # ------------------
-        self.dedup_cache = TTLCache(ttl_seconds=30, max_size=50000)
         # [重放窗口] 已验签消息的 timestamp 允许与本机时钟的最大偏差（秒）。
         # <=0 表示关闭校验（兼容调试/手动调时场景）。仅对"配置了公钥且验签
         # 通过"的消息生效，见 _on_message。
+        # 默认 400s：公网 broker 实测同一帧副本最迟到 230s，120s 会把正常迟到
+        # 副本当重放拒收（并回错误包）；窗口放宽后去重 TTL 同步到 430s。
         self.timestamp_window = float(timestamp_window)
+        # [去重 TTL 覆盖重放窗口] 多 broker 广播必然产生重复副本，公网实测迟到
+        # 副本可达 86~230s（2026-10-30 broker.mqtt.cool 同一帧迟到 173s）。
+        # TTL 若固定 30s，落在 30s~window 之间的迟到副本会先躲过去重、又满足
+        # timestamp 新鲜度检查，导致同一 code 被二次执行；TTL 必须覆盖"窗口内
+        # 仍会被接受"的全部时间，再加 30s 余量。超窗副本仍由 _on_message 的
+        # timestamp 检查明确拒收（保留不静默的诊断语义）。
+        dedup_ttl = 30.0
+        if self.timestamp_window > 0:
+            dedup_ttl = max(dedup_ttl, self.timestamp_window + 30.0)
+        self.dedup_cache = TTLCache(ttl_seconds=dedup_ttl, max_size=50000)
         self.message_callback = None
         self.subscribed_topics = set()
         self._stop_event = threading.Event()
@@ -935,6 +973,38 @@ class MultiMQTTManager:
                 self._msg_queue.put_nowait(PERIODIC_WAKEUP_SENTINEL)
             except Exception:
                 pass   # 哨兵投递失败无害：分发线程按 next_periodic_at 兜底检测
+
+    def _wake_dispatch_loop(self):
+        """向分发线程投递唤醒哨兵，使其立即重算下一次 Ping/报告/周期任务时间。"""
+        try:
+            self._msg_queue.put_nowait(PERIODIC_WAKEUP_SENTINEL)
+        except Exception:
+            pass   # 队列满/已停止时无需唤醒，分发线程仍按旧 deadline 兜底
+
+    def set_stats_print_interval(self, seconds):
+        """热更新连接质量报告的打印间隔（秒）；0 表示关闭周期报告。
+
+        仅改值不会让分发线程重新排序 deadline，因此投递唤醒哨兵：
+        分发线程醒来后按新间隔重排下一次打印，无需重启 manager。
+        """
+        interval = _normalize_stats_interval(seconds, "stats_print_interval")
+        with self.lock:
+            if self.stats.print_interval == interval:
+                return
+            self.stats.print_interval = interval
+        self._wake_dispatch_loop()
+
+    def set_stats_ping_interval(self, seconds):
+        """热更新周期 Ping 间隔（秒）；0 表示停用周期 Ping。
+
+        与报告间隔同样经唤醒哨兵热生效，避免改配置后仍等待旧 deadline。
+        """
+        interval = _normalize_stats_interval(seconds, "stats_ping_interval")
+        with self.lock:
+            if self.stats.ping_interval == interval:
+                return
+            self.stats.ping_interval = interval
+        self._wake_dispatch_loop()
 
     def get_connection_snapshot(self):
         """返回 {host: 是否在线} 快照，供上层做断线/重连检测。"""
@@ -1366,11 +1436,14 @@ class MultiMQTTManager:
                         return
                     # [重放窗口] 验签只证明"签名者签过这条消息"，不证明它是新近
                     # 发出的。公共 broker 允许 # 通配订阅（见 BROKER_LIST 上方
-                    # 注释），合法签名帧可被被动嗅探；原先唯一防线是 30s 的
-                    # dedup TTLCache，TTL 过期后同一帧可原样重发并通过验签，
+                    # 注释），合法签名帧可被被动嗅探；原先唯一防线是 dedup
+                    # TTLCache，TTL 过期后同一帧可原样重发并通过验签，
                     # 对任意 code 执行通道等于重放 RCE。这里在验签通过后校验
                     # timestamp 与本机时钟的偏差，超窗即拒绝，使嗅探/重放的
                     # 旧帧天然失效（客户端签名时 timestamp 均取 utc_ms()）。
+                    # 注意去重 TTL 现在随窗口放大（见 __init__），窗口内的重复
+                    # 副本会先被静默去重，不会走到这里；走到这里的只有首次出现
+                    # 的旧帧/超窗副本。
                     if self.timestamp_window and self.timestamp_window > 0:
                         try:
                             _ts_ms = float(data.get("timestamp"))
@@ -1420,9 +1493,10 @@ class MultiMQTTManager:
         [合并线程] 独立的分发线程：串行消费队列，并统一驱动 Stats 的 Ping 与报告打印。
         """
         if self.enable_stats:
-            ping_interval = self.stats.PING_INTERVAL
+            ping_interval = self.stats.ping_interval
             print_interval = self.stats.print_interval
-            next_ping_at = time.time() #首次 Ping 不要等
+            # 0 表示停用对应周期任务：用 inf 让 queue.get 不再为它提前唤醒
+            next_ping_at = time.time() if ping_interval > 0 else float('inf')  # 首次 Ping 不要等
             next_print_at = (time.time() + print_interval) if print_interval > 0 else float('inf')
         else:
             next_ping_at = next_print_at = float('inf')
@@ -1438,17 +1512,30 @@ class MultiMQTTManager:
         while not self._stop_event.is_set():
             now = time.time()
 
+            # 热更新检查：set_stats_print_interval / set_stats_ping_interval
+            # 改值后投递唤醒哨兵，这里按新间隔重排 deadline；未变化时零开销。
+            if self.enable_stats:
+                if self.stats.ping_interval != ping_interval:
+                    ping_interval = self.stats.ping_interval
+                    next_ping_at = (now + ping_interval) if ping_interval > 0 else float('inf')
+                if self.stats.print_interval != print_interval:
+                    print_interval = self.stats.print_interval
+                    next_print_at = (now + print_interval) if print_interval > 0 else float('inf')
+
             # 兼容分发线程启动后才注册的周期任务（next_periodic_at 仍为 inf）：
             # 首跳立即，避免对齐到已推进的 ping 节拍导致 startup 报告延迟
             if self._periodic_fn is not None and next_periodic_at == float('inf'):
                 next_periodic_at = now
 
             # 周期任务参与等待时长计算；无任务且无 stats 时保持原始 None
-            # （queue.get 无限阻塞等消息），注册任务由唤醒哨兵打断，无轮询开销
+            # （queue.get 无限阻塞等消息），注册任务由唤醒哨兵打断，无轮询开销。
+            # 已停用的周期项 deadline 为 inf，不能传给 queue.get（会 OverflowError）。
             wait_list = []
             if self.enable_stats:
-                wait_list.append(next_ping_at - now)
-                wait_list.append(next_print_at - now)
+                if next_ping_at != float('inf'):
+                    wait_list.append(next_ping_at - now)
+                if next_print_at != float('inf'):
+                    wait_list.append(next_print_at - now)
             if next_periodic_at != float('inf'):
                 wait_list.append(next_periodic_at - now)
             wait_time = max(0.1, min(wait_list)) if wait_list else None
@@ -1499,7 +1586,7 @@ class MultiMQTTManager:
                         self._periodic_fn(now)
                     except Exception:
                         logger.exception("周期任务执行失败: %s", getattr(self._periodic_fn, "__name__", self._periodic_fn))
-                    if self.enable_stats and self._periodic_interval == self.stats.PING_INTERVAL:
+                    if self.enable_stats and self._periodic_interval == self.stats.ping_interval:
                         next_periodic_at = next_ping_at   # 并入 ping 序列，唤醒合并不分叉
                     else:
                         next_periodic_at = now + self._periodic_interval

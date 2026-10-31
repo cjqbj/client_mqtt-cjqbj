@@ -12,6 +12,7 @@ mqtt_topics_dump.db-wal
 *.db-shm
 *.db-wal
 
+_*.txt
 _*.sh
 _*.py
 !client/pty/__*.py

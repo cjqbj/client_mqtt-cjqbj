@@ -3,6 +3,7 @@ import json
 import types
 import sys
 import tempfile
+import time
 import unittest
 import urllib.parse
 import urllib.request
@@ -17,7 +18,8 @@ import server_mqtt
 class FakeMQTTManager:
     instances = []
 
-    def __init__(self, brokers, server_public_key_bytes=None, **_kwargs):
+    def __init__(self, brokers, server_public_key_bytes=None,
+                 stats_print_interval=None, stats_ping_interval=None, **_kwargs):
         self.brokers = brokers
         self.server_public_key_bytes = server_public_key_bytes
         self.server_vk = None
@@ -27,7 +29,21 @@ class FakeMQTTManager:
         self.unsubscribed = []
         self.stopped = False
         self.callback = None
+        self.stats_print_interval = (
+            server_mqtt.DEFAULT_STATS_PRINT_INTERVAL
+            if stats_print_interval is None else stats_print_interval
+        )
+        self.stats_ping_interval = (
+            server_mqtt.DEFAULT_STATS_PING_INTERVAL
+            if stats_ping_interval is None else stats_ping_interval
+        )
         self.__class__.instances.append(self)
+
+    def set_stats_print_interval(self, seconds):
+        self.stats_print_interval = seconds
+
+    def set_stats_ping_interval(self, seconds):
+        self.stats_ping_interval = seconds
 
     def set_on_message(self, callback):
         self.callback = callback
@@ -69,7 +85,6 @@ class ServerMqttConfigTests(unittest.TestCase):
             brokers=[("old-broker.example", 1883)],
             request_topic="old/request",
             server_public_key_bytes=None,
-            enable_global_topic_list=False,
         )
         self.server.mqtt_net.start()
         self.server.mqtt_net.subscribe(self.server.request_topic)
@@ -241,31 +256,204 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.assertEqual(config["request_topic"], "partial/request")
         self.assertEqual(config["broker_list"], server_mqtt._default_rpc_config()["broker_list"])
         self.assertEqual(config["pub_key"], server_mqtt.DEFAULT_PUB_KEY)
-        self.assertEqual(config["global_topic_url"], server_mqtt.DEFAULT_GLOBAL_TOPIC_URL)
+        self.assertEqual(config["global_topic_url_list"],
+                         server_mqtt._default_rpc_config()["global_topic_url_list"])
         self.assertNotIn("obsolete_option", config)
 
-    def test_global_topic_url_update_is_saved_and_used(self):
-        url = "https://reports.example.net/topics/"
-        result = server_mqtt.rpc_config(global_topic_url=url)
+    def test_global_topic_url_list_update_is_saved_and_used(self):
+        url = "https://reports.example.net/topics/REPORT_BODY"
+        result = server_mqtt.rpc_config(global_topic_url_list=[url])
 
-        self.assertEqual(result["global_topic_url"], url)
-        self.assertEqual(self.server.global_topic_url, url)
+        self.assertEqual(result["global_topic_url_list"], [url])
+        self.assertEqual(self.server.global_topic_url_list, [url])
         self.assertEqual(
-            json.loads(self.config_path.read_text())["global_topic_url"],
-            url,
+            json.loads(self.config_path.read_text())["global_topic_url_list"],
+            [url],
         )
 
         response = mock.MagicMock()
         response.__enter__.return_value = response
         with mock.patch("urllib.request.urlopen", return_value=response) as urlopen:
-            self.server._publish_global_topic_list("test")
-        request = urlopen.call_args.args[0]
-        self.assertTrue(request.full_url.startswith(url + "with%20open"))
+            self.server._publish_global_topic_list("test", confirm_timeout=0)
+            deadline = time.time() + 5          # 上报已改异步线程，轮询等它发出
+            while not urlopen.called and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(urlopen.called, "远端上报线程未在 5s 内发出请求")
+            request = urlopen.call_args.args[0]
+        self.assertTrue(request.full_url.startswith(url.replace("REPORT_BODY", "%7B")))
+        self.assertNotIn("REPORT_BODY", request.full_url)
 
-    def test_invalid_global_topic_url_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "HTTP\\(S\\) URL"):
-            server_mqtt.rpc_config(global_topic_url="ftp://reports.example.net/")
-        self.assertFalse(self.config_path.exists())
+    def test_invalid_url_entries_are_skipped_and_only_empty_list_disables(self):
+        """URL 模板逐条校验：坏项只跳过坏项；只有显式 [] 才关闭远端上报。"""
+        good = "https://reports.example.net/topics/REPORT_BODY"
+
+        # 同一数组里，合法 URL 保留，非法项（None / 非 http(s)）只被跳过
+        result = server_mqtt.rpc_config(
+            global_topic_url_list=[good, None, "ftp://reports.example.net/"])
+        self.assertEqual(result["global_topic_url_list"], [good])
+        self.assertEqual(self.server.global_topic_url_list, [good])
+        self.assertEqual(
+            json.loads(self.config_path.read_text())["global_topic_url_list"], [good])
+
+        # 只有明确设置 [] 才是关闭上报
+        result = server_mqtt.rpc_config(global_topic_url_list=[])
+        self.assertEqual(result["global_topic_url_list"], [])
+        self.assertEqual(self.server.global_topic_url_list, [])
+        self.assertEqual(
+            json.loads(self.config_path.read_text())["global_topic_url_list"], [])
+
+        # 非数组、或整组全非法：回落代码默认值（≠ 关闭）
+        defaults = server_mqtt._default_rpc_config()["global_topic_url_list"]
+        result = server_mqtt.rpc_config(
+            global_topic_url_list="https://reports.example.net/")
+        self.assertEqual(result["global_topic_url_list"], defaults)
+        result = server_mqtt.rpc_config(
+            global_topic_url_list=["ftp://reports.example.net/"])
+        self.assertEqual(result["global_topic_url_list"], defaults)
+
+    def test_shipped_url_list_entries_are_plain_strings(self):
+        """默认列表里每项必须是字符串：模板曾被写成 list/tuple，默认上报被静默关闭。"""
+        shipped = server_mqtt.DEFAULT_GLOBAL_TOPIC_URL_LIST
+        self.assertTrue(shipped)
+        for entry in shipped:
+            self.assertIsInstance(entry, str)
+            self.assertTrue(entry.strip())
+            self.assertIn(server_mqtt.REPORT_BODY_TOKEN, entry)
+
+        defaults = server_mqtt._default_global_topic_url_list()
+        self.assertTrue(defaults)                       # 默认值可用（不是 []）
+        self.assertEqual(defaults,
+                         server_mqtt._default_rpc_config()["global_topic_url_list"])
+
+    def test_load_rpc_config_falls_back_for_invalid_file_values(self):
+        """rpc.json 里的脏值只丢该项、回落代码默认值，绝不阻断启动。"""
+        self.config_path.write_text(
+            json.dumps({
+                "request_topic": "device/topic",
+                "global_topic_url_list": [None],       # 元素类型错
+                "stats_ping_interval": "abc",          # 不是数字
+                "global_topic_list": "",               # 空字符串
+            }),
+            encoding="utf-8",
+        )
+
+        config = server_mqtt.load_rpc_config()
+        defaults = server_mqtt._default_rpc_config()
+
+        self.assertEqual(config["request_topic"], "device/topic")
+        self.assertEqual(config["global_topic_url_list"],
+                         defaults["global_topic_url_list"])
+        self.assertEqual(config["stats_ping_interval"], defaults["stats_ping_interval"])
+        self.assertEqual(config["global_topic_list"], defaults["global_topic_list"])
+
+    def test_load_rpc_config_survives_broken_json_and_bad_shape(self):
+        """整份 JSON 坏掉或不是 object 时同样回落默认值，不抛异常。"""
+        self.config_path.write_text("{ not json", encoding="utf-8")
+        config = server_mqtt.load_rpc_config()
+        self.assertEqual(config["broker_list"], server_mqtt._default_rpc_config()["broker_list"])
+
+        self.config_path.write_text('["not", "an", "object"]', encoding="utf-8")
+        config = server_mqtt.load_rpc_config()
+        self.assertEqual(config["request_topic"], server_mqtt.REQUEST_TOPIC)
+
+    def test_rpc_json_partial_bad_urls_keep_valid_entries(self):
+        """rpc.json 里同组 URL：坏项只跳过坏项，合法 URL 照常生效。"""
+        good = "https://reports.example.net/topics/REPORT_BODY"
+        self.config_path.write_text(
+            json.dumps({"global_topic_url_list": [good, None, "ftp://bad.example/"]}),
+            encoding="utf-8",
+        )
+
+        config = server_mqtt.load_rpc_config()
+
+        self.assertEqual(config["global_topic_url_list"], [good])
+
+    def test_rpc_json_empty_url_list_disables_remote_report(self):
+        """只有显式空数组才关闭远端上报；缺键仍是默认值（默认开启）。"""
+        self.config_path.write_text(
+            json.dumps({"global_topic_url_list": []}), encoding="utf-8")
+
+        config = server_mqtt.load_rpc_config()
+
+        self.assertEqual(config["global_topic_url_list"], [])
+        self.assertNotEqual(
+            server_mqtt._default_rpc_config()["global_topic_url_list"], [])
+        self.assertEqual(
+            server_mqtt.load_rpc_config(path=self.config_path)["global_topic_url_list"], [])
+
+    def test_cli_overrides_fall_back_for_bad_urls_and_keep_strictness_elsewhere(self):
+        """文件/命令行的 URL 脏值都只降级不报错；其他显式键仍严格。"""
+        self.config_path.write_text(
+            json.dumps({"global_topic_url_list": [[None]]}),
+            encoding="utf-8",
+        )
+
+        config = server_mqtt._rpc_config_with_cli_overrides()
+        self.assertEqual(config["global_topic_url_list"],
+                         server_mqtt._default_rpc_config()["global_topic_url_list"])
+
+        # 命令行显式 []：关闭上报（不是回落默认值）
+        config = server_mqtt._rpc_config_with_cli_overrides(global_topic_url_list=[])
+        self.assertEqual(config["global_topic_url_list"], [])
+
+        # 命令行显式合法 URL：只保留合法项
+        url = "https://reports.example.net/log/REPORT_BODY"
+        config = server_mqtt._rpc_config_with_cli_overrides(
+            global_topic_url_list=[url, "ftp://bad.example/"])
+        self.assertEqual(config["global_topic_url_list"], [url])
+
+        # 其它显式键（非 URL）仍严格报错
+        with self.assertRaisesRegex(ValueError, "request_topic"):
+            server_mqtt._rpc_config_with_cli_overrides(request_topic=" ")
+
+    def test_bad_edge_stats_only_fall_back_that_key(self):
+        """边缘统计是附加功能：坏一项只回落该项，其他统计与主流程项照常生效。"""
+        config = server_mqtt._normalize_rpc_config({
+            "request_topic": "device/topic",
+            "global_topic_url_list": [None],        # URL 模板写错
+            "global_topic_list_check_interval": "abc",  # tick 粒度写错
+            "stats_ping_interval": 30,              # 同族统计，必须保留
+            "global_topic_list_interval": 120,      # 同族统计，必须保留
+        })
+
+        defaults = server_mqtt._default_rpc_config()
+        self.assertEqual(config["request_topic"], "device/topic")
+        self.assertEqual(config["global_topic_url_list"],
+                         defaults["global_topic_url_list"])
+        self.assertEqual(config["global_topic_list_check_interval"],
+                         defaults["global_topic_list_check_interval"])
+        self.assertEqual(config["stats_ping_interval"], 30.0)
+        self.assertEqual(config["global_topic_list_interval"], 120.0)
+
+    def test_broken_json_does_not_block_cli_startup(self):
+        """整份 rpc.json 不可解析时命令行启动路径也必须能算出一份可用配置。"""
+        self.config_path.write_text("{ not json", encoding="utf-8")
+
+        config = server_mqtt._rpc_config_with_cli_overrides()
+
+        self.assertEqual(config["broker_list"],
+                         server_mqtt._normalize_broker_list(
+                             server_mqtt.BROKER_LIST, "broker_list"))
+        self.assertIsInstance(config["request_topic"], str)
+        self.assertTrue(config["request_topic"].strip())
+
+    def test_server_starts_even_when_shipped_url_default_is_broken(self):
+        """回归：APK 打包的默认 URL 模板写成嵌套 list 时，手机也不能启动崩溃。
+
+        默认值有误属于代码/打包 bug，边缘统计必须静默降级（关闭远端上报），
+        而不是让 load_rpc_config 抛 ValueError 把整个 start() 打断。
+        """
+        broken = [["https://reports.example.net/REPORT_BODY"]]
+        with mock.patch.object(server_mqtt, "DEFAULT_GLOBAL_TOPIC_URL_LIST", broken):
+            server = server_mqtt.MQTTServer(
+                brokers=[("old-broker.example", 1883)],
+                request_topic="old/request",
+            )
+
+        self.assertEqual(server.global_topic_url_list, [],
+                         "非法默认值必须降级为关闭远端上报")
+        self.assertEqual(server.get_rpc_config()["global_topic_url_list"], [])
+        self.assertIsNotNone(server.mqtt_net)
 
     def test_timestamp_reject_publishes_explicit_error_reply(self):
         """重放窗口拒收不得静默：按标准回包格式向 reply_topic 发明确错误。
@@ -330,8 +518,8 @@ class ServerMqttConfigTests(unittest.TestCase):
             brokers=[("b.example", 1883)],
             request_topic="t/request",
             server_public_key_bytes=None,
-            enable_global_topic_list=False,
             global_topic_list_publish_kwargs={"retain": False, "qos": 0},
+            global_topic_url_list=[],          # 本用例只验证 qos，不上报远端
         )
         self.assertEqual(other.global_topic_list_publish_kwargs["qos"], 1)
 
@@ -345,7 +533,7 @@ class ServerMqttConfigTests(unittest.TestCase):
         response = mock.MagicMock()
         response.__enter__.return_value = response
         with mock.patch("urllib.request.urlopen", return_value=response):
-            other._publish_global_topic_list("test")
+            other._publish_global_topic_list("test", confirm_timeout=0)
         self.assertEqual(recorded.get("qos"), 1)
 
     def test_global_topic_list_settings_load_from_rpc_json(self):
@@ -356,7 +544,6 @@ class ServerMqttConfigTests(unittest.TestCase):
                 "global_topic_list_interval": 30,
                 "global_topic_list_idle_threshold": 60,
                 "global_topic_list_check_interval": 15,
-                "enable_global_topic_list": False,
                 "global_topic_list_publish_kwargs": {"retain": False},
             }),
             encoding="utf-8",
@@ -367,7 +554,7 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.assertEqual(config["global_topic_list_interval"], 30.0)
         self.assertEqual(config["global_topic_list_idle_threshold"], 60.0)
         self.assertEqual(config["global_topic_list_check_interval"], 15.0)
-        self.assertFalse(config["enable_global_topic_list"])
+        self.assertNotIn("enable_global_topic_list", config)
         self.assertEqual(config["global_topic_list_publish_kwargs"], {"retain": False})
 
         server = server_mqtt.MQTTServer(
@@ -380,7 +567,7 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.assertEqual(server.global_topic_list_interval, 30.0)
         self.assertEqual(server.global_topic_list_idle_threshold, 60.0)
         self.assertEqual(server.global_topic_list_check_interval, 15.0)
-        self.assertFalse(server.enable_global_topic_list)
+        self.assertFalse(hasattr(server, "enable_global_topic_list"))
         # rpc.json 值进入 _rpc_config：get_rpc_config()/后续 rpc_config() 以此为基线
         self.assertEqual(server.get_rpc_config()["global_topic_list_interval"], 30.0)
         # qos 无论配置什么都不允许跌回低档（retain 可自定义）
@@ -404,12 +591,8 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.assertEqual(stored["global_topic_list"], "hot/topic_list")
 
     def test_rpc_config_check_interval_change_reregisters_tick(self):
-        """check_interval 变更须以新粒度重注册 tick；开关翻转须注册/注销。"""
-        server_mqtt.rpc_config(
-            enable_global_topic_list=True,
-            global_topic_list_check_interval=5.0,
-        )
-        self.assertTrue(self.server.enable_global_topic_list)
+        """check_interval 变更须以新粒度重注册 tick（报告常开，无开关）。"""
+        server_mqtt.rpc_config(global_topic_list_check_interval=5.0)
         self.assertIs(
             self.server.mqtt_net.periodic_fn.__func__,
             self.server.global_topic_list_tick.__func__,
@@ -419,10 +602,6 @@ class ServerMqttConfigTests(unittest.TestCase):
         server_mqtt.rpc_config(global_topic_list_check_interval=17.0)
         self.assertEqual(self.server.mqtt_net.periodic_interval, 17.0)
 
-        server_mqtt.rpc_config(enable_global_topic_list=False)
-        self.assertIsNone(self.server.mqtt_net.periodic_fn)
-        self.assertFalse(self.server.enable_global_topic_list)
-
     def test_invalid_global_topic_list_settings_rejected(self):
         """非法报告参数必须整体拒收：运行时与 rpc.json 均不变。"""
         for bad_updates in (
@@ -430,7 +609,6 @@ class ServerMqttConfigTests(unittest.TestCase):
             {"global_topic_list_idle_threshold": -5},
             {"global_topic_list_check_interval": "abc"},
             {"global_topic_list": " "},
-            {"enable_global_topic_list": "yes"},
             {"global_topic_list_publish_kwargs": "qos1"},
         ):
             with self.assertRaises(ValueError):
@@ -438,6 +616,132 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.assertEqual(self.server.global_topic_list_interval,
                          server_mqtt.DEFAULT_GLOBAL_TOPIC_LIST_INTERVAL)
         self.assertFalse(self.config_path.exists())
+
+    def test_stats_intervals_load_from_rpc_json(self):
+        """rpc.json 中的 stats_print_interval / stats_ping_interval 必须生效。"""
+        self.config_path.write_text(
+            json.dumps({
+                "stats_print_interval": 120,
+                "stats_ping_interval": 30,
+            }),
+            encoding="utf-8",
+        )
+
+        config = server_mqtt.load_rpc_config()
+        self.assertEqual(config["stats_print_interval"], 120.0)
+        self.assertEqual(config["stats_ping_interval"], 30.0)
+
+        server = server_mqtt.MQTTServer(
+            brokers=[("b.example", 1883)],
+            request_topic="t/request",
+            server_public_key_bytes=None,
+            rpc_config_source=config,
+        )
+        self.assertEqual(server.stats_print_interval, 120.0)
+        self.assertEqual(server.stats_ping_interval, 30.0)
+        # 配置值已传给网络层 stats，报告/Ping 按新周期运行
+        self.assertEqual(server.mqtt_net.stats_print_interval, 120.0)
+        self.assertEqual(server.mqtt_net.stats_ping_interval, 30.0)
+        self.assertEqual(server.get_rpc_config()["stats_print_interval"], 120.0)
+        self.assertEqual(server.get_rpc_config()["stats_ping_interval"], 30.0)
+
+    def test_rpc_config_updates_stats_intervals_hot(self):
+        """只改统计周期时热更新现有 manager，不重建网络连接。"""
+        manager_count = len(FakeMQTTManager.instances)
+
+        result = server_mqtt.rpc_config(
+            stats_print_interval=15.0,
+            stats_ping_interval=5.0,
+        )
+
+        self.assertEqual(result["stats_print_interval"], 15.0)
+        self.assertEqual(result["stats_ping_interval"], 5.0)
+        self.assertEqual(self.server.stats_print_interval, 15.0)
+        self.assertEqual(self.server.stats_ping_interval, 5.0)
+        self.assertEqual(self.server.mqtt_net.stats_print_interval, 15.0)
+        self.assertEqual(self.server.mqtt_net.stats_ping_interval, 5.0)
+        self.assertEqual(len(FakeMQTTManager.instances), manager_count)
+        stored = json.loads(self.config_path.read_text())
+        self.assertEqual(stored["stats_print_interval"], 15.0)
+        self.assertEqual(stored["stats_ping_interval"], 5.0)
+
+    def test_stats_intervals_allow_zero_to_disable(self):
+        """0 是合法值：关闭周期报告 / 停用周期 Ping。"""
+        result = server_mqtt.rpc_config(
+            stats_print_interval=0,
+            stats_ping_interval=0,
+        )
+        self.assertEqual(result["stats_print_interval"], 0.0)
+        self.assertEqual(result["stats_ping_interval"], 0.0)
+        self.assertEqual(self.server.mqtt_net.stats_print_interval, 0.0)
+        self.assertEqual(self.server.mqtt_net.stats_ping_interval, 0.0)
+
+    def test_invalid_stats_intervals_rejected(self):
+        """负数/非数字/NaN/inf 必须整体拒收，不落盘。"""
+        for bad_updates in (
+            {"stats_print_interval": -1},
+            {"stats_ping_interval": -5},
+            {"stats_print_interval": "abc"},
+            {"stats_ping_interval": float("inf")},
+            {"stats_print_interval": float("nan")},
+            {"stats_ping_interval": True},
+        ):
+            with self.assertRaises(ValueError):
+                server_mqtt.rpc_config(**bad_updates)
+        self.assertEqual(self.server.stats_print_interval,
+                         server_mqtt.DEFAULT_STATS_PRINT_INTERVAL)
+        self.assertEqual(self.server.stats_ping_interval,
+                         server_mqtt.DEFAULT_STATS_PING_INTERVAL)
+
+    def test_client_stats_print_interval_loads_without_touching_server(self):
+        """客户端专属键写入配置，但服务端统计周期仍按 stats_print_interval。"""
+        self.config_path.write_text(
+            json.dumps({
+                "client_stats_print_interval": 90,
+                "stats_print_interval": 120,
+            }),
+            encoding="utf-8",
+        )
+
+        config = server_mqtt.load_rpc_config()
+        self.assertEqual(config["client_stats_print_interval"], 90.0)
+        self.assertEqual(config["stats_print_interval"], 120.0)
+
+        server = server_mqtt.MQTTServer(
+            brokers=[("b.example", 1883)],
+            request_topic="t/request",
+            server_public_key_bytes=None,
+            rpc_config_source=config,
+        )
+        # 服务端只应用 stats_print_interval，不应用 client_stats_print_interval
+        self.assertEqual(server.stats_print_interval, 120.0)
+        self.assertEqual(server.mqtt_net.stats_print_interval, 120.0)
+        self.assertEqual(
+            server.get_rpc_config()["client_stats_print_interval"], 90.0)
+
+    def test_client_stats_print_interval_hot_update_and_unset(self):
+        """rpc_config 可设置/清除客户端专属键，且不影响服务端周期。"""
+        result = server_mqtt.rpc_config(client_stats_print_interval=45)
+        self.assertEqual(result["client_stats_print_interval"], 45.0)
+        self.assertEqual(self.server.stats_print_interval,
+                         server_mqtt.DEFAULT_STATS_PRINT_INTERVAL)
+        stored = json.loads(self.config_path.read_text())
+        self.assertEqual(stored["client_stats_print_interval"], 45.0)
+
+        # null/空字符串表示未设置：客户端会继续回退 stats_print_interval
+        for unset in (None, ""):
+            result = server_mqtt.rpc_config(client_stats_print_interval=unset)
+            self.assertIsNone(result["client_stats_print_interval"])
+            stored = json.loads(self.config_path.read_text())
+            self.assertIsNone(stored["client_stats_print_interval"])
+
+    def test_client_stats_print_interval_invalid_rejected(self):
+        """客户端专属键只接受 null/空串或 >=0 的秒数。"""
+        for bad_value in (-1, "abc", float("inf"), float("nan"), True):
+            with self.assertRaises(ValueError):
+                server_mqtt.rpc_config(client_stats_print_interval=bad_value)
+        self.assertIsNone(self.server.get_rpc_config()[
+            "client_stats_print_interval"])
 
     def test_rpc_functions_are_callable_over_http(self):
         import server_http
@@ -503,7 +807,6 @@ class ReplyPublishFallbackTests(unittest.TestCase):
             brokers=[("b.example", 1883)],
             request_topic="t/request",
             server_public_key_bytes=None,
-            enable_global_topic_list=False,
         )
 
     def tearDown(self):

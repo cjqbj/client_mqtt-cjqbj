@@ -1,20 +1,23 @@
 {
   "schema": 1,
-  "generated": "2026-10-29T06:40:20Z",
+  "generated": "2026-10-31T11:50:03Z",
   "features": [
     {
       "name": "audio",
       "filename": "feature_audio.py",
       "title": "Audio",
-      "version": 2,
+      "version": 4,
       "actions": [
         "play",
+        "speak",
+        "status",
+        "stop",
         "get_volume",
         "set_volume"
       ],
       "ui": "python",
-      "sha256": "ee3b8398dcdc2154f14b73fbc9d589717b4b6ef75db771618f874bec790b2854",
-      "size": 15770,
+      "sha256": "3c068c21a755ffeeb2286a921afd2cca597dfa87515471c5fdacc899e70213f0",
+      "size": 56370,
       "url": "feature_audio.py"
     },
     {
@@ -86,13 +89,13 @@
       "name": "probe",
       "filename": "feature_probe.py",
       "title": "Probe",
-      "version": 2,
+      "version": 3,
       "actions": [
         "run"
       ],
       "ui": "python",
-      "sha256": "24571b709a43407544abb2e210edbd1e3ab67d05a5fec28ef5e70113fad1c0fc",
-      "size": 10678,
+      "sha256": "f521dde6687213005ed5584c072d70f49bdfe45b2b0e70bf02123cd440a1087b",
+      "size": 12216,
       "url": "feature_probe.py"
     },
     {

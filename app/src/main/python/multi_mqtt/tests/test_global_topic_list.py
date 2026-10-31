@@ -120,7 +120,6 @@ class StubbedGlobalTopicListTests(unittest.TestCase):
         from server_mqtt import start as module_start
 
         cfg = {
-            "mqtt_enable_global_topic_list": True,
             "mqtt_global_topic_list": "cfg/topic_list",
             "mqtt_global_topic_list_interval": 30.0,
             "mqtt_global_topic_list_idle_threshold": 60.0,
@@ -131,7 +130,6 @@ class StubbedGlobalTopicListTests(unittest.TestCase):
             MockServer.return_value.start.return_value = "started"
             self.assertEqual(module_start(config=cfg, globals={}), "started")
             _, kwargs = MockServer.call_args
-            self.assertTrue(kwargs["enable_global_topic_list"])
             self.assertEqual(kwargs["global_topic_list"], "cfg/topic_list")
             self.assertEqual(kwargs["global_topic_list_interval"], 30.0)
             self.assertEqual(kwargs["global_topic_list_idle_threshold"], 60.0)
@@ -156,15 +154,15 @@ class StubbedGlobalTopicListTests(unittest.TestCase):
         self.assertIsNone(s.mqtt_net._periodic_fn)
         self.assertEqual(threading.active_count(), before)   # 注册/清除不创建线程
 
-    def test_publish_now_skips_remote_and_returns_ack_status(self):
-        """立即发布接口：自定义 reason、等待 QoS1 确认、默认不追加远端 topics。"""
+    def test_publish_now_appends_remote_and_returns_ack_status(self):
+        """立即发布接口：自定义 reason、等待 QoS1 确认、默认上报全部 URL。"""
         s = make_stub_server()
         confirmed = []
         s.mqtt_net.publish_broadcast_confirmed = lambda topic, payload, **ka: (
             confirmed.append((topic, payload, ka))
             or {"queued": 2, "acked": 1, "timeout": True}
         )
-        remote = s.remote_appends                 # fixture 默认已打桩远端追加
+        remote = s.remote_appends                 # fixture 默认已打桩远端上报
         before = time.time()
         status = s.publish_global_topic_list_now(reason="ime_feedback")
         self.assertEqual(confirmed[0][0], "global_topic_list")
@@ -178,7 +176,8 @@ class StubbedGlobalTopicListTests(unittest.TestCase):
         self.assertEqual(status["acked"], 1)
         self.assertTrue(status["sent"])          # 至少一个 broker 收到 PUBACK
         self.assertTrue(status["timeout"])       # 仍有 broker 未确认
-        self.assertEqual(remote, [])             # 交互路径默认跳过 9 秒远端追加
+        self.assertEqual(len(remote), 1)          # 交互路径也上报远端（异步不阻塞）
+        self.assertEqual(remote[0]["reason"], "ime_feedback")
         self.assertGreaterEqual(s._last_gtl_publish_ts, before)
 
     def test_publish_now_without_confirm_falls_back_to_queued_count(self):
@@ -209,11 +208,49 @@ class StubbedGlobalTopicListTests(unittest.TestCase):
         self.assertFalse(status["sent"])
 
     def test_tick_still_appends_remote_by_default(self):
-        """周期 tick 行为不变：仍追加远端 topics，仅交互接口默认跳过。"""
+        """周期 tick 行为不变：仍然上报远端 topics。"""
         s = make_stub_server()
         stub_snapshot(s, {"brokerA": True})
         s.global_topic_list_tick()
         self.assertEqual(len(s.remote_appends), 1)
+
+    def test_remote_report_fans_out_to_all_url_templates(self):
+        """每个模板一个线程：REPORT_BODY 替换为编码正文，无占位符的模板原样发送。"""
+        s = make_stub_server(global_topic_url_list=[
+            "https://a.example.net/log/REPORT_BODY",
+            "https://b.example.net/fixed",
+        ])
+        sent = []
+        s._send_global_topic_report = sent.append
+        MQTTServer._append_global_topic_list_remote(s, {"reason": "ime_feedback"})
+        self.assertTrue(_wait_until(lambda: len(sent) == 2, 5), f"上报线程未发齐: {sent}")
+        self.assertTrue(sent[0].startswith("https://a.example.net/log/%7B%22reason%22"))
+        self.assertTrue(sent[0].endswith("%0A"))   # 末尾换行，远端一行一条
+        self.assertEqual(sent[1], "https://b.example.net/fixed")
+
+    def test_remote_report_is_skipped_when_url_list_empty(self):
+        """global_topic_url_list=[] 即关闭远端上报，不产生任何线程/请求。"""
+        s = make_stub_server(global_topic_url_list=[])
+        sent = []
+        s._send_global_topic_report = sent.append
+        MQTTServer._append_global_topic_list_remote(s, {"reason": "ime_feedback"})
+        self.assertEqual(sent, [])
+
+    def test_remote_report_ignores_tls_verify_errors(self):
+        """上报故意跳过证书校验（curl -k）：部分机型证书库残留过期根证书。"""
+        import ssl
+        from unittest import mock
+
+        s = make_stub_server()
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        with mock.patch("urllib.request.urlopen", return_value=response) as urlopen:
+            s._send_global_topic_report("https://reports.example.net/log/x")
+        context = urlopen.call_args.kwargs["context"]
+        self.assertFalse(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_NONE)
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 9)
+        response.read.assert_called_once()
 
 
 class BroadcastConfirmedTests(unittest.TestCase):
@@ -320,6 +357,7 @@ class LiveBrokerGlobalTopicListTests(unittest.TestCase):
             global_topic_list_interval=5.0,            # 模拟"每小时"
             global_topic_list_idle_threshold=10.0,     # 模拟"距上次指令 24 小时"
             global_topic_list_check_interval=1.0,
+            global_topic_url_list=[],                 # 端到端测试不上报远端站点
         )
         started = cls.server.start(block=False)
         if started is None:

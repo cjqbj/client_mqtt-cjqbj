@@ -7,6 +7,9 @@
     http://127.0.0.1:1144/import%20rdp;rdp.html(p)
 改完本文件想立即生效(不重启服务)可加一段 reload:
     http://127.0.0.1:1144/from%20client%20import%20rdp;import%20importlib;rdp=importlib.reload(rdp);rdp.html(p)
+页面设置区(黑白模式那一行)末尾的「重载 rdp」按钮做的是同一件事:先在
+服务端 importlib.reload 本模块(即重新读磁盘上的最新代码),再刷新页面取到
+新模板,不用手拼这条 URL。
 
 RPC 入口(仅 html/screen 需要 server_http 注入的请求级 response 对象 p):
     html(p)                           内嵌控制页(默认彩色、不自动刷新)
@@ -22,6 +25,14 @@ RPC 入口(仅 html/screen 需要 server_http 注入的请求级 response 对象
     clipboard()                       读取远端剪贴板文本
     setclip('text')                   把文本写入远端剪贴板
     key('ctrl+shift+esc')             按键 / 组合键,加号连接
+
+页面设置区的「服务端日志」开关(默认开)关闭后,页面所有请求都带
+``X-RDP-Log: 0``;本模块在 import 时把这条规则作为**过滤器**注入 server_http
+(``add_log_filter('rdp-slog', ...)``),server_http 据此跳过这些请求的
+``[RPC]`` 访问行——每点一下、每张自动刷新截图都是一条 HTTP 请求,否则日志台
+会被刷满。静音只作用于本页发出的请求,其它客户端的日志照常输出,4xx/5xx 也
+仍保留便于排查。server_http 不需要认识 rdp;注册失败(独立使用本模块、或
+server_http 不在 sys.path)只跳过,不影响页面和主流程。
 
 除 html/screen 外都只用返回值回传结果,不需要 p;页面里的 RPC 表达式
 一律按本模块真实导入身份生成(见 _mod_expr),所以 ``import rdp``、
@@ -427,6 +438,8 @@ label { color: var(--muted); display: flex; align-items: center; gap: 4px; curso
 #keyboard { order: 20; padding: 8px 6px 8px; background: var(--panel); }
 /* 开关行:输入区与日志之间 */
 #switches { order: 40; display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 4px 12px 8px; background: var(--panel); border-bottom: 1px solid var(--line); }
+/* 开关行里的按钮(重载 rdp):与复选框同高同字号,不把整行撑高 */
+#switches .swbtn { flex: 0 0 auto; padding: 4px 10px; font-size: 11px; }
 /* 默认布局按钮:输入区上移(非默认布局)时高亮提示可点回 */
 body.textfocus #btn-layout { background: var(--accent); color: #08201c; border-color: var(--accent); font-weight: 700; }
 /* 输入区:默认排键盘下方;聚焦后上移画面正下方并保持,点默认布局按钮才复位 */
@@ -508,6 +521,9 @@ body.textfocus #inputzone { order: 1; }
         <option value="40"></option>
       </datalist>
     </label>
+    <label title="关闭后本页所有请求都带 X-RDP-Log:0,server_http 不再打印这些请求的 [RPC] 访问行">
+      <input type="checkbox" id="slog" checked> 服务端日志</label>
+    <button id="btn-reload" class="swbtn" title="在服务端 importlib.reload 本模块,随后刷新页面:改完 rdp.py 不用重启服务即可生效;新代码有语法错误时页面保留原状并报错">重载 rdp</button>
   </div>
   <div id="log"></div>
  </div>
@@ -535,6 +551,19 @@ bwEl.checked = savedBw === null ? __BW__ : savedBw === '1';
 function screenExpr() { return bwEl.checked ? MOD + '.screen(p,1)' : MOD + '.screen(p)'; }
 bwEl.onchange = () => { saveSetting('rdp_bw', bwEl.checked ? '1' : '0');
                         log('黑白模式: ' + (bwEl.checked ? '开' : '关'), 'act'); refresh(); };
+// 服务端日志开关:默认开(保持原行为);关掉后页面所有请求带 X-RDP-Log:0,
+// server_http 就不再为每次点击/每张自动刷新截图打一条 [RPC] 访问行
+const slogEl = document.getElementById('slog');
+const savedSlog = localStorage.getItem('rdp_slog');
+slogEl.checked = savedSlog === null ? true : savedSlog === '1';
+slogEl.onchange = () => { saveSetting('rdp_slog', slogEl.checked ? '1' : '0');
+                          log('服务端日志: ' + (slogEl.checked ? '开' : '关'), 'act'); };
+// 页面所有 fetch 的统一选项:同源请求带自定义头不触发预检
+function fetchOpts() {
+    const opts = { cache: 'no-store' };
+    if (!slogEl.checked) opts.headers = { 'X-RDP-Log': '0' };
+    return opts;
+}
 const revEl = document.getElementById('rev');    // 滚轮取反:默认开,上拖=向下滚(手机自然方向)
 const savedRev = localStorage.getItem('rdp_rev');
 if (savedRev !== null) revEl.checked = savedRev === '1';
@@ -548,6 +577,16 @@ textin.addEventListener('focus', () => { document.body.classList.add('textfocus'
 document.getElementById('btn-layout').onclick = () => {
     textin.blur();
     document.body.classList.remove('textfocus');
+};
+// 重载 rdp:服务端 importlib.reload(本模块) 后也就是读了磁盘上的最新代码,
+// 再刷新页面让新模板/新接口生效;reload 失败(如新代码有语法错误)时页面
+// 保持原样,错误信息落在页面日志里。表达式全用 __import__,不依赖服务端
+// 命名空间里是否绑定了 rdp/importlib 这两个名字
+document.getElementById('btn-reload').onclick = () => {
+    log('重载 rdp 模块…', 'act');
+    rpc("__import__('importlib').reload(" + MOD + ")")
+        .then(() => { log('重载完成,刷新页面…', 'act'); location.reload(); })
+        .catch(() => {});
 };
 function autoGrow() {                       // 多行时自动长高,封顶 160px 转内部滚动
     textin.style.height = 'auto';
@@ -683,7 +722,7 @@ function log(msg, cls) {
 
 function rpc(expr) {
     const started = performance.now();
-    return fetch(BASE + encodeURIComponent(expr), { cache: 'no-store' })
+    return fetch(BASE + encodeURIComponent(expr), fetchOpts())
         .then(async resp => {
             const text = await resp.text();
             const ms = Math.round(performance.now() - started);
@@ -705,7 +744,7 @@ function refresh(snap) {
     busy = true;
     const t0 = performance.now();
     let tHead = 0;
-    fetch(BASE + screenExpr(), { cache: 'no-store' })
+    fetch(BASE + screenExpr(), fetchOpts())
         .then(resp => {
             if (!resp.ok) throw new Error('HTTP ' + resp.status);
             tHead = performance.now();               // 响应头到达:含服务端截图+编码+网络往返
@@ -903,6 +942,16 @@ document.addEventListener('selectstart', e => {
 
 // ---------- 全键盘 ----------
 const MODS = new Set(['ctrl', 'alt', 'shift', 'win']);
+// Shift 按住时键面改成实际会发送的字符(2→@、`→~、[→{ …):手机屏上键太小,
+// 一个键放不下 2/@ 两个字符,所以按住 Shift 时数字/符号键切换显示,松开还原。
+// 键按 code 索引(而不是显示文本),反斜杠等特殊字符不必再转义。
+const SHIFT_LABELS = {
+ '1': '!', '2': '@', '3': '#', '4': '$', '5': '%',
+ '6': '^', '7': '&', '8': '*', '9': '(', '0': ')',
+ 'backtick': '~', 'minus': '_', 'equal': '+',
+ 'lbracket': '{', 'rbracket': '}', 'backslash': '|',
+ 'semicolon': ':', 'quote': '"', 'comma': '<', 'period': '>', 'slash': '?'
+};
 const ROWS = [
  [['Esc','esc'],['F1','f1'],['F2','f2'],['F3','f3'],['F4','f4'],['F5','f5'],['F6','f6'],['F7','f7'],['F8','f8'],['F9','f9'],['F10','f10'],['F11','f11'],['F12','f12'],['PrtSc','prtsc'],['ScrLk','scrolllock'],['Pause','pause']],
  [['`','backtick'],['1','1'],['2','2'],['3','3'],['4','4'],['5','5'],['6','6'],['7','7'],['8','8'],['9','9'],['0','0'],['-','minus'],['=','equal'],['Backspace','backspace',2],['Ins','insert'],['Home','home'],['PgUp','pageup']],
@@ -920,6 +969,8 @@ ROWS.forEach(row => {
         const btn = document.createElement('button');
         btn.className = 'key' + (MODS.has(item[1]) ? ' mod' : '');
         if (item[2]) btn.style.flexGrow = item[2];
+        btn.dataset.code = item[1];             // 供 Shift 键面切换用
+        btn.dataset.base = item[0];             // 原始键面文字
         btn.textContent = item[0];
         btn.onclick = () => onKey(item[1], btn);
         rowEl.appendChild(btn);
@@ -927,10 +978,24 @@ ROWS.forEach(row => {
     kb.appendChild(rowEl);
 });
 
+function paintKeyboard() {
+    const shift = held.has('shift');
+    kb.querySelectorAll('.key').forEach(el => {
+        const code = el.dataset.code;
+        let label = el.dataset.base;
+        if (shift) {
+            if (SHIFT_LABELS[code]) label = SHIFT_LABELS[code];
+            else if (code.length === 1 && code >= 'a' && code <= 'z') label = code.toUpperCase();
+        }
+        if (el.textContent !== label) el.textContent = label;
+    });
+}
+
 function onKey(code, btn) {
     if (MODS.has(code)) {                       // 修饰键:点击进入/退出组合状态
         if (held.has(code)) { held.delete(code); btn.classList.remove('held'); }
         else { held.add(code); btn.classList.add('held'); }
+        paintKeyboard();                        // Shift 按住时键面切换成 @ # ~ 等实际字符
         log(held.size ? '组合修饰键: ' + [...held].join('+') + '+ …' : '修饰键已清空', 'act');
         return;
     }
@@ -939,6 +1004,7 @@ function onKey(code, btn) {
         combo = [...held].join('+') + '+' + code;
         held.clear();
         document.querySelectorAll('.key.mod.held').forEach(el => el.classList.remove('held'));
+        paintKeyboard();                        // 组合已发出,键面还原成原始字符
     }
     rpc(MOD + ".key('" + combo + "')").then(scheduleRefresh).catch(() => {});
 }
@@ -949,3 +1015,33 @@ refresh();                              // 首次加载不归位红点,只有一
 </script>
 </body>
 </html>'''
+
+
+# --------------------------------------------------------------------------- #
+# 「服务端日志」开关的静音规则：本模块只声明“请求带 X-RDP-Log: 0 就不写
+# 访问行”，通过 server_http 的过滤器注册接口注入，server_http 不需要认识
+# rdp。注册失败（独立 import 本模块、或 server_http 不在 sys.path）只跳过，
+# 绝不影响页面和主流程。
+# --------------------------------------------------------------------------- #
+_SILENCE_VALUES = ('0', 'off', 'false', 'no')
+
+
+def _silence_access_log(handler):
+    """server_http 日志过滤器：本页请求头带 X-RDP-Log: 0 时静音访问行。"""
+    headers = getattr(handler, 'headers', None)
+    if headers is None:      # 测试/WSGI 垫片可能是 __new__ 出来的 handler
+        return False
+    try:
+        value = headers.get('X-RDP-Log', '')
+    except Exception:
+        return False
+    return str(value).strip().lower() in _SILENCE_VALUES
+
+
+try:  # 只有跑在 server_http 进程里才需要注册；独立 import 时静默跳过
+    import server_http
+
+    # 同名覆盖：页面「重载 rdp」reload 本模块时不会累积重复过滤器
+    server_http.add_log_filter('rdp-slog', _silence_access_log)
+except Exception:
+    pass

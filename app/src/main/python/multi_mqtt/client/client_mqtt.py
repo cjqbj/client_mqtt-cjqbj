@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse,time,threading,os, sys, logging, codeop, importlib,builtins as _builtins
+import argparse,time,threading,os, sys, logging, codeop, importlib,builtins as _builtins, json
 
 # 本模块已迁移到 client/ 子目录：把项目根目录与本目录加入 sys.path，
 # 同时兼容「python client/client_mqtt.py」直接运行与「from client import ...」包导入。
@@ -14,6 +14,58 @@ from rpc_executor import utc_ms
 logger = logging.getLogger(__file__)
 from server_mqtt import REQUEST_TOPIC, DEFAULT_REPLY_TOPIC as REPLY_TOPIC
 DEFAULT_TIMEOUT = 30
+
+# 客户端与 service 端共用项目根目录的 rpc.json；client/ 子目录向上一级。
+CLIENT_RPC_CONFIG_PATH = os.path.join(os.path.dirname(_HERE), "rpc.json")
+
+
+def load_client_rpc_config(path=None):
+    """读取客户端 rpc.json。
+
+    返回原始 JSON dict；文件不存在/损坏/非 object 时返回空 dict，
+    绝不让客户端因为服务端配置问题启动失败。
+    """
+    path = CLIENT_RPC_CONFIG_PATH if path is None else path
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            document = json.load(file)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as error:
+        logger.warning("读取客户端 rpc.json 失败，回退默认统计周期：%s", error)
+        return {}
+    return document if isinstance(document, dict) else {}
+
+
+def _client_stats_interval(value):
+    """解析客户端周期字段；None/非法值返回 None，交给下一级回退。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value.strip() if isinstance(value, str) else value)
+    except (TypeError, ValueError):
+        return None
+    if number < 0.0 or number != number or number == float("inf"):
+        return None
+    return number
+
+
+def resolve_client_stats_print_interval(stats_print_interval=None, path=None):
+    """解析客户端报告打印间隔，优先级：
+
+    1. 显式参数（CLI / rpc(...) / 构造参数）最高；
+    2. rpc.json 的客户端专属 client_stats_print_interval；
+    3. rpc.json 的 stats_print_interval；
+    4. 都没有 → None，沿用 MultiMQTTManager/ConnectionQualityStats 原默认行为。
+    """
+    if stats_print_interval is not None:
+        return stats_print_interval
+    config = load_client_rpc_config(path)
+    for key in ("client_stats_print_interval", "stats_print_interval"):
+        interval = _client_stats_interval(config.get(key))
+        if interval is not None:
+            return interval
+    return None
 
 # ================= 统一别名表（小写变量名） =================
 # 语义别名，不含 "--" / "%" 前缀。三处共用同一份：
@@ -32,6 +84,10 @@ alias_exit         =('exit', 'quit')
 alias_timeout      =('timeout','time','wait','second','sec','to')
 alias_timestamp_ms =('timestamp_ms','ts','server_ms')
 alias_min_broker_count =('min_broker_count','mb','min')
+# 统一命名 stats_print_interval / stats_ping_interval；
+# 兼容历史叫法 report_interval/print_interval/ping_interval 等，实际键仍归一。
+alias_stats_print_interval =('stats_print_interval','stats_report_interval','report_interval','print_interval','ri')
+alias_stats_ping_interval  =('stats_ping_interval','ping_interval','pi')
 
 def _cli_opts(*names):
     """从别名生成 argparse 选项：自动加 --/- 前缀，_ 与 - 都支持；单字符只出 -x。
@@ -52,10 +108,23 @@ _default_client = None
 _default_client_lock = threading.Lock()
 
 class MQTTClientNode:
-    def __init__(self, client_private_key_bytes=None, allow_no_server_pubkey_response: bool = False):
+    def __init__(
+        self,
+        client_private_key_bytes=None,
+        allow_no_server_pubkey_response: bool = False,
+        stats_print_interval=None,
+        stats_ping_interval=None,
+    ):
         self.client_private_key_bytes = client_private_key_bytes
         self.allow_no_server_pubkey_response = allow_no_server_pubkey_response
-        self.mqtt_net = MultiMQTTManager(log_messages=False, client_private_key_bytes=client_private_key_bytes)
+        stats_print_interval = resolve_client_stats_print_interval(
+            stats_print_interval)
+        self.mqtt_net = MultiMQTTManager(
+            log_messages=False,
+            client_private_key_bytes=client_private_key_bytes,
+            stats_print_interval=stats_print_interval,
+            stats_ping_interval=stats_ping_interval,
+        )
         self.mqtt_net.set_on_message(self._on_message)
         self.pending_requests = {}
         self.lock = threading.Lock()
@@ -191,8 +260,9 @@ class MQTTClientNode:
         # 连接的 broker，启动瞬间往往只有 1 个 broker 在线，之后几秒内其余
         # broker 才陆续连上——它们永远收不到首发请求，首包只能赌首发那条
         # 路径的当下延迟。按同一 req_id 补发是安全的：服务端 dedup_cache
-        # （30s TTL）丢弃重复副本，幂等请求（如 PTY 握手同 sid）还另有会话
-        # 注册表兜底；首包一到立即停发，健康链路下零额外开销。
+        # 的 TTL 覆盖整个重放窗口（默认 150s）并丢弃重复副本，幂等请求
+        # （如 PTY 握手同 sid）还另有会话注册表兜底；首包一到立即停发，
+        # 健康链路下零额外开销。
         repub_at = sorted(float(x) for x in (republish_delays or ()) if x > 0)
         repub_i = 0
         is_success = False
@@ -361,11 +431,15 @@ def rpc(code: str, request_topic: str = REQUEST_TOPIC, timeout: float = DEFAULT_
     timeout=get_duplicated_kargs(ka,*alias_timeout,default=timeout)
     timestamp_ms=get_duplicated_kargs(ka,*alias_timestamp_ms,default=None)
     min_broker_count=get_duplicated_kargs(ka,*alias_min_broker_count,default=min_broker_count)
+    stats_print_interval=get_duplicated_kargs(ka,*alias_stats_print_interval,default=None)
+    stats_ping_interval=get_duplicated_kargs(ka,*alias_stats_ping_interval,default=None)
     with _default_client_lock:
         if _default_client is None:
             _default_client = MQTTClientNode(
                 client_private_key_bytes=client_private_key_bytes,
                 allow_no_server_pubkey_response=allow_no_server_pubkey_response,
+                stats_print_interval=stats_print_interval,
+                stats_ping_interval=stats_ping_interval,
             )
             _default_client.start()
         client = _default_client
@@ -763,6 +837,14 @@ if __name__ == "__main__":
         help="命令等待远端响应的超时时间，单位秒。",
     )
     parser.add_argument(
+        *_cli_opts(*alias_stats_print_interval), type=float, default=None,
+        help="连接质量报告打印间隔（秒），0=关闭周期报告；默认 3600。",
+    )
+    parser.add_argument(
+        *_cli_opts(*alias_stats_ping_interval), type=float, default=None,
+        help="周期 Ping 间隔（秒），0=停用周期 Ping；默认 600。",
+    )
+    parser.add_argument(
         *_cli_opts(*alias_allow_no_pub),
         action="store_true",
         help="允许在私钥模式下接收无公钥服务器的返回。默认会拦截。",
@@ -799,6 +881,8 @@ if __name__ == "__main__":
         _default_client = MQTTClientNode(
             client_private_key_bytes=key_bytes,
             allow_no_server_pubkey_response=args.allow_no_server_pubkey_response,
+            stats_print_interval=args.stats_print_interval,
+            stats_ping_interval=args.stats_ping_interval,
         )
         _default_client.mqtt_net.is_windows_cmd=(sys.platform=="win32")
         _default_client.start()

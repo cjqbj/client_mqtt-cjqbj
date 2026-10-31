@@ -63,8 +63,9 @@ login shell 的 argv0 带 `-` 前缀；子进程 `setsid()` + `TIOCSCTTY` 拿控
 
 ## 4. 去重（多 broker 环境的正确性核心）
 
-- **RPC 帧**：网络层 `MultiMQTTManager.dedup_cache`（TTLCache，30s，5 万条）按
-  `req_id` 首帧放行；签名帧的 req_id 形如 `<base>|<sig_hex>`，验签后剥签名。
+- **RPC 帧**：网络层 `MultiMQTTManager.dedup_cache`（TTLCache，5 万条；TTL 覆盖
+  重放窗口，默认 400s 窗口 → 430s）按 `req_id` 首帧放行；签名帧的 req_id 形如
+  `<base>|<sig_hex>`，验签后剥签名。
 - **PTY 下行**：`RemotePty` 内 `deque(maxlen=256)` 按 `seq` 去重；只认同号副本，
   不假设严格递增（跨 broker 会乱序）。
 - **PTY 上行**：服务端 `_in_loop` 内 `deque(maxlen=256)` 按 `iseq` 去重；序号由

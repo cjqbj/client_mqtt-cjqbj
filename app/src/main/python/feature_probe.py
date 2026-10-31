@@ -14,18 +14,23 @@ topic 不写死：默认跟随当前选中目标（client_service 里的 request
 超时时间由页面底部的输入框指定，按 target 持久化保存到磁盘，缺省 2 秒。
 取值会被夹到 [1, 600] 之间（参照 §6 的显式超时范围）。
 
-结果区展示完整 RPC 响应（req_id / r / stdout / ok / server_time /
-server_from / latency_ms / client_from），逐字段一行便于核对；
-'r' 保持原始字符串形式，不做二次解析。
+结果区只展示 RPC 的【原始返回 dict】：
+    {'req_id': ..., 'r': "('/system/bin/app_process64', ...)", 'stdout': ...,
+     'ok': ..., 'server_time': ..., 'server_from': ..., 'latency_ms': ...,
+     'client_from': ...}
+逐字段一行便于核对；'r' 保持目标回传的原始字符串（四元组的 repr），
+绝不在客户端二次解析成 executable/node/machine/release —— 解析后的字段
+只用于在线判定，不进入界面展示。
 """
 import json
+import pprint
 
 import client_service
 
 FEATURE = {
     "actions": ["run"],
     "icon": "bug",
-    "version": 2,
+    "version": 3,
     # 界面由本脚本用 Chaquopy 自绘（见 build_view），APK 只有通用宿主。
     "ui": "python",
     # 与页面上的 timeout 输入框共用同一个分 topic 键，两处看到的值永远一致。
@@ -40,6 +45,13 @@ DEFAULT_TIMEOUT = client_service.PROBE_TIMEOUT
 # 超时输入的取值范围（秒），与 §6 的 [1,600] 一致
 TIMEOUT_MIN = 1.0
 TIMEOUT_MAX = 600.0
+
+# 原始 RPC envelope 的字段顺序：pprint(sort_dicts=False) 按字典插入顺序排版，
+# 目标端回包天然是这个顺序，这里只作为文档/兜底说明。
+ENVELOPE_KEYS = (
+    "req_id", "r", "stdout", "ok", "server_time",
+    "server_from", "latency_ms", "client_from",
+)
 
 
 def _default_timeout_text():
@@ -68,27 +80,44 @@ def run(topic=None, timeout=DEFAULT_TIMEOUT):
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _parse_result(raw):
-    """兼容 bootstrap.call_feature 可能返回 dict 或 str 的情况。
+def _as_dict(raw):
+    """把 bootstrap.call_feature 可能返回的 dict / JSON 字符串统一成 dict。
 
-    仅内部逻辑（例如将来要做 ok 判断）使用，UI 展示不依赖它。
+    只做外层解包，不对 'r' 做任何解析（探针界面要求原样展示）。
     """
     if isinstance(raw, dict):
-        if "r" in raw:
-            r_val = raw["r"]
-            if isinstance(r_val, str):
-                try:
-                    return json.loads(r_val)
-                except Exception:
-                    return {}
-            return r_val
         return raw
     if isinstance(raw, str):
         try:
-            return json.loads(raw)
-        except Exception:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
             return {}
+        return value if isinstance(value, dict) else {}
     return {}
+
+
+def format_response(raw):
+    """把探针的 RPC 返回【原样】排版成可读文本（界面的唯一结果渲染入口）。
+
+    优先取 payload["response"]（probe_online 保留的原始 envelope），这样界面
+    上只剩 req_id / r / stdout / ok / server_time / server_from / latency_ms /
+    client_from 这些真实回包字段；'r' 是目标回传的字符串原文，不解析。
+
+    超时/离线时没有 envelope，退化为展示 probe_online 自己的结构化 payload
+    （topic / timeout / error），便于判断是网络问题还是目标不在线。
+    """
+    data = _as_dict(raw)
+    response = data.get("response")
+    if isinstance(response, dict):
+        target = response
+    elif isinstance(response, str):
+        # 理论上不会走到这里；万一 response 是字符串也保持原样展示。
+        return response.strip() or repr(response)
+    else:
+        target = data
+    if not target:
+        return "(empty RPC response)"
+    return pprint.pformat(target, sort_dicts=False, width=80)
 
 
 def build_view(context):
@@ -96,7 +125,7 @@ def build_view(context):
 
     - topic 实时跟随选中目标；
     - timeout 按 target 持久化，缺省 2 秒，范围 [1,600]；
-    - 结果区展示完整 RPC 响应，逐字段一行，可上下滚动。
+    - 结果区原样展示 RPC envelope（含 req_id / latency_ms，'r' 不解析）。
     """
     import bootstrap
     import pyui_kit
@@ -108,7 +137,8 @@ def build_view(context):
         context,
         "点按钮向【当前选中目标】发送最小探针；\n"
         "切换目标后按钮上的 topic 和超时会自动跟着变。\n"
-        "结果区统一展示 RPC 返回的完整 dict（含 req_id / latency_ms）。",
+        "结果区只展示 RPC 原始返回 dict：req_id / r / stdout / ok / server_time /\n"
+        "server_from / latency_ms / client_from，'r' 保持原始字符串。",
         selectable=True,
     )
     page.add(result)
@@ -291,8 +321,8 @@ def build_view(context):
             return bootstrap.call_feature("probe", "run", None, t)
 
         def apply_ok(raw):
-            # 统一展示：与其它 feature 相同的结果渲染（完整 dict + 摘要行）。
-            result.setText(pyui_kit.render_result(raw))
+            # 只渲染原始 RPC envelope；不解析 'r'，也不加客户端摘要行。
+            result.setText(format_response(raw))
 
         def apply_error(error):
             result.setText("ERROR %s: %s" % (type(error).__name__, error))

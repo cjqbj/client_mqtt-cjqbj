@@ -15,13 +15,20 @@ HTTP GET，path 即 Python 表达式，由 server_http.handle_rpc 在持久命�
 
 保存语义：输入停顿 0.8 秒自动保存（Ctrl+S 立即保存），临时文件 + os.replace
 原子落盘；文件不存在时自动创建（含父目录）。多标签/多人同时编辑为最后写入
-者胜，不做冲突检测。大文件超出单条 URL 承载（http.server 请求行上限
-65536 字节）时页面自动切换分块上传：up_begin / up_push / up_end。
+者胜，不做冲突检测。
+
+正文传输：页面用 POST body 调 save_body（URL 里只有 token，长度与文件大小无关）。
+不能用 URL 携带正文——网关的请求行上限远小于 http.server 的 65536：pythonanywhere
+的 nginx 在 URI 约 8KB 时就回 414 Request-URI Too Large，而 414 是 HTML 错误页，
+页面取末行只能显示"保存失败: </html>"（apk.html 28KB 正文编码后 55KB，实测必挂）。
+save_body 不可用（线上还是旧模块、或网关吞 body）时页面退回分块上传
+up_begin / up_push / up_end，单条 URL 预算压到 6000 编码字符以适配 8KB 网关。
 
 RPC 入口（p / response 由 server_http.handle_rpc 注入）：
     http_editor.html(p, file=None)           编辑页；file 缺省编 default_file
     http_editor.read(p, key=None)            读文件原文；key 为 token 或路径
-    http_editor.save(p, key=None, content)   小文件整体保存
+    http_editor.save_body(p, key=None)       整体保存，正文取 POST 请求体（页面用）
+    http_editor.save(p, key=None, content)   整体保存，正文写在代码里（curl/旧页面用）
     http_editor.up_begin(p, key=None)        分块上传开始，返回 uid
     http_editor.up_push(p, uid, chunk)       追加一块，返回累计字符数
     http_editor.up_end(p, uid)               合并落盘，返回 revision
@@ -65,11 +72,23 @@ class Editor:
         return self.path.read_text(encoding='utf-8')
 
     def write(self, content):
-        # 临时文件 + os.replace 原子落盘，读方永远不会看到半截文件
-        temporary = self.path.with_name('.' + self.path.name + '.http-editor.tmp')
-        temporary.write_text(content, encoding='utf-8')
-        os.replace(temporary, self.path)
+        """落盘并返回 revision；内容与磁盘一致时不重复写盘、也不涨 revision。
+
+        revision 是"文件内容版本"，不是"保存动作次数"：Ctrl+S 连按、自动保存与
+        手动保存撞车、保存到相同内容，都只回当前 revision，页面上的数字才有
+        比较价值。真实内容有变化（包括外部进程改过文件）才写盘并 +1。
+        整段持锁：同一文件的两条保存请求不会共用同一个临时文件互相踩踏。
+        """
         with self.lock:
+            try:
+                if self.path.read_text(encoding='utf-8') == content:
+                    return self.revision
+            except (OSError, UnicodeDecodeError):
+                pass  # 读不到旧内容就不做去重，照常写盘
+            # 临时文件 + os.replace 原子落盘，读方永远不会看到半截文件
+            temporary = self.path.with_name('.' + self.path.name + '.http-editor.tmp')
+            temporary.write_text(content, encoding='utf-8')
+            os.replace(temporary, self.path)
             self.revision += 1
             return self.revision
 
@@ -133,9 +152,51 @@ def read(p, key=None):
 
 
 def save(p, key=None, content=''):
-    """整体保存：小文件一条 URL 搞定；超出单条 URL 承载请走 up_* 分块。"""
+    """整体保存：正文写在代码里（URL 形式）；超出单条 URL 承载请走 save_body/up_*。"""
     editor = _resolve(key)
     content = str(content)
+    revision = editor.write(content)
+    return _json(p, {'ok': True, 'revision': revision, 'size': len(content)})
+
+
+def _read_body(p):
+    """取 POST 请求体原文（UTF-8）。
+
+    p 是 handle_rpc 注入的 ResponseWrapper，其 .handler 是底层 handler：
+    http.server 用 handler.rfile；WSGI 垫片只有 environ['wsgi.input']；
+    ASGI 垫片两者都有。取不到正文就报错，绝不把"没读到"当成空内容写盘。
+    """
+    handler = getattr(p, 'handler', p)
+    headers = getattr(handler, 'headers', None) or {}
+    method = str(getattr(handler, 'command', '') or '').upper()
+    if method != 'POST':
+        # GET 也可能带 Content-Length: 0（WSGI 网关常见），此时绝不能当空内容写盘，
+        # 否则一次误调用就把文件清空。只认显式 POST 入口。
+        raise RuntimeError('保存失败：save_body 需要 POST 正文，当前请求方法为 %r'
+                           % (method or 'GET',))
+    stream = getattr(handler, 'rfile', None)
+    if stream is None:
+        stream = (getattr(handler, 'environ', None) or {}).get('wsgi.input')
+    if stream is None:
+        raise RuntimeError('请求体不可读：当前 RPC handler 未提供 rfile / wsgi.input')
+    raw_length = headers.get('Content-Length')
+    if raw_length in (None, ''):
+        # 空文件的 POST 可能不带 Content-Length（部分网关如此）：保存空内容是合法语义
+        return ''
+    try:
+        length = int(raw_length)
+    except (TypeError, ValueError):
+        raise RuntimeError('保存失败：Content-Length 非法 %r' % (raw_length,))
+    raw = stream.read(length) if length > 0 else b''
+    if len(raw) < length:
+        raise RuntimeError('保存失败：请求体不完整，期望 %d 字节，实收 %d' % (length, len(raw)))
+    return raw.decode('utf-8')
+
+
+def save_body(p, key=None):
+    """整体保存：正文取自 POST 请求体，URL 只带 token，不受网关请求行长度限制。"""
+    editor = _resolve(key)
+    content = _read_body(p)
     revision = editor.write(content)
     return _json(p, {'ok': True, 'revision': revision, 'size': len(content)})
 
@@ -215,6 +276,7 @@ footer { height: 30px; flex: 0 0 30px; display: flex; align-items: center; gap: 
 <script>
 const BASE = location.pathname.split(';')[0] + ';';   // /from%20client%20import%20http_editor;
 const fileName = __FILE_NAME__;
+document.title = fileName + ' - HTTP Editor';         // 标签页以正在编辑的文件名开头，多标签一眼区分
 const token = __TOKEN__;                              // 路径 md5 前 12 位，页面 RPC 凭它定位文件
 const editor = document.getElementById('editor');
 const state = document.getElementById('state');
@@ -226,9 +288,16 @@ let dirty = false;
 let saving = false;
 let saveTimer = null;
 
-async function rpc(expr) {
+async function rpc(expr, body) {
     const sentAt = performance.now();
-    const resp = await fetch(BASE + encodeURIComponent(expr), { cache: 'no-store' });
+    const init = { cache: 'no-store' };
+    if (body !== undefined) {
+        // 正文走 POST body：URL 只留极短的代码，彻底避开网关的请求行上限
+        init.method = 'POST';
+        init.headers = { 'Content-Type': 'text/plain; charset=utf-8' };
+        init.body = body;
+    }
+    const resp = await fetch(BASE + encodeURIComponent(expr), init);
     latency.textContent = '延迟 ' + Math.max(0, Math.round(performance.now() - sentAt)) + ' ms';
     const server = resp.headers.get('X-Server-Time');
     if (server) serverTime.textContent = '服务器时间 ' + new Date(server).toLocaleString();
@@ -239,8 +308,10 @@ async function rpc(expr) {
 
 function scheduleSave(delay) { clearTimeout(saveTimer); saveTimer = setTimeout(save, delay); }
 
-// 大内容按编码后长度切块：CJK 每字符 9 字节、标点至多 3 字节，预算 15000
-// 留足余量，单条 URL 仍远小于 http.server 请求行 65536 字节上限
+// 分块兜底的单条 URL 预算：网关（pythonanywhere 的 nginx）在请求行约 8KB 时
+// 回 414，预算压到 6000 编码字符，CJK 每字符至多 9 字节也还有余量
+const SAVE_URL_BUDGET = 6000;
+
 function splitChunks(text, budget) {
     const chunks = [];
     let size = 4000, i = 0;
@@ -248,6 +319,12 @@ function splitChunks(text, budget) {
         let piece = text.slice(i, i + size);
         while (piece.length > 1 && encodeURIComponent(piece).length > budget) {
             piece = piece.slice(0, Math.ceil(piece.length / 2));
+        }
+        // 切点可能落在代理对中间：把末尾孤立的高代理留给下一块，
+        // 否则 JSON.stringify 输出 \udXXX，落盘时 UTF-8 编码报错
+        if (piece.length > 1 && piece.charCodeAt(piece.length - 1) >= 0xD800 &&
+            piece.charCodeAt(piece.length - 1) <= 0xDBFF) {
+            piece = piece.slice(0, -1);
         }
         size = piece.length;
         chunks.push(piece);
@@ -264,12 +341,13 @@ async function save() {
     state.textContent = '保存中...'; state.className = '';
     try {
         let text;
-        const expr = "http_editor.save(p,'" + token + "'," + JSON.stringify(content) + ")";
-        if (encodeURIComponent(expr).length <= 15000) {
-            text = await rpc(expr);
-        } else {
+        try {
+            // 主路径：正文放 POST body，URL 只带 token（28KB 的 apk.html 一次搞定）
+            text = await rpc("http_editor.save_body(p,'" + token + "')", content);
+        } catch (bodyError) {
+            // 兜底：线上模块还没有 save_body（未 reload）或网关吞 body 时分块上传
             const uid = JSON.parse(await rpc("http_editor.up_begin(p,'" + token + "')")).uid;
-            const chunks = splitChunks(content, 15000);
+            const chunks = splitChunks(content, SAVE_URL_BUDGET);
             for (let i = 0; i < chunks.length; i++) {
                 state.textContent = '上传中 ' + (i + 1) + '/' + chunks.length;
                 await rpc("http_editor.up_push(p,'" + uid + "'," + JSON.stringify(chunks[i]) + ")");

@@ -88,25 +88,59 @@ class ProbeRunTests(unittest.TestCase):
         self.assertEqual(kwargs["timeout"], 2.0)
         device_config.assert_called_with(None)
 
-    def test_format_full_displays_complete_rpc_response(self):
-        response = {
-            "req_id": "20261010_170202.208",
+    def test_format_response_keeps_raw_envelope_and_r_verbatim(self):
+        raw_r = "('/system/bin/app_process64', 'localhost', 'aarch64', '15')"
+        envelope = {
+            "req_id": "20261031_153521.068",
+            "r": raw_r,
             "stdout": "",
             "ok": True,
-            "server_time": 1791622923368,
-            "server_from": "mqtt.loralab.org",
-            "latency_ms": 629.82,
-            "client_from": "mqtt.loralab.org",
+            "server_time": 1793432121869,
+            "server_from": "broker.mqtt.cool",
+            "latency_ms": 239.72,
+            "client_from": "broker.codenow.cn",
         }
-        rendered = feature_probe.format_full(json.dumps({
+        rendered = feature_probe.format_response(json.dumps({
             "ok": True,
-            "topic": "sys/device/k12",
-            "response": response,
+            "topic": "sys/device/14c",
+            "response": envelope,
         }))
-        for key in response:
+        # 'r' 原样保留（含引号的 repr 文本），绝不解析成 executable/node 等字段。
+        self.assertIn(repr(raw_r), rendered)
+        self.assertNotIn("'executable'", rendered)
+        self.assertNotIn("'node'", rendered)
+        # 只展示 RPC envelope，不混入探针 payload 的 topic/timeout 包装。
+        self.assertNotIn("'topic'", rendered)
+        for key in envelope:
             self.assertIn(repr(key), rendered)
-        self.assertIn("'req_id': '20261010_170202.208'", rendered)
-        self.assertIn("'latency_ms': 629.82", rendered)
+        self.assertIn("'latency_ms': 239.72", rendered)
+
+    def test_format_response_accepts_bare_envelope_dict(self):
+        envelope = {
+            "req_id": "20261031_153521.068",
+            "r": "('py', 'node', 'arm64', '15')",
+            "ok": True,
+        }
+        rendered = feature_probe.format_response(envelope)
+        self.assertIn("'req_id': '20261031_153521.068'", rendered)
+        self.assertIn("('py', 'node', 'arm64', '15')", rendered)
+
+    def test_format_response_falls_back_to_structured_error(self):
+        payload = {
+            "ok": False,
+            "topic": "sys/device/k12",
+            "timeout": 2.0,
+            "error": "no response before timeout (target offline?)",
+        }
+        rendered = feature_probe.format_response(json.dumps(payload))
+        self.assertIn("'ok': False", rendered)
+        self.assertIn("'topic': 'sys/device/k12'", rendered)
+        self.assertIn("target offline", rendered)
+
+    def test_format_response_survives_junk_input(self):
+        self.assertEqual(feature_probe.format_response(""), "(empty RPC response)")
+        self.assertEqual(feature_probe.format_response("not json"), "(empty RPC response)")
+        self.assertEqual(feature_probe.format_response(None), "(empty RPC response)")
 
     def test_run_without_topic_follows_selected_target(self):
         raw_repr = "('/usr/bin/python3', 'k12', 'x86_64', '5.15.0')"

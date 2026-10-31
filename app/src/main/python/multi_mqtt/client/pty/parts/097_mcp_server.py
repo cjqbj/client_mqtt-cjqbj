@@ -682,6 +682,42 @@ def _mcp_hook_handler(Handler) -> None:
             setattr(Handler, name, _wrap(base))
 
 
+_MCP_LOG_FILTER_NAME = "pty-mcp"  # server_http 注册表里的名字；同名覆盖 = reload 幂等
+
+
+def _mcp_access_log_off(handler) -> bool:
+    """server_http 日志过滤器：MCP 端点（/mcp，sse 退回模式是 /sse+/messages）静音。
+
+    一次 MCP 工具调用在 HTTP 层会伴随 initialize / notifications / tools/call
+    多条 POST，既无工具名也无参数，只会把日志冲散；真正的调用轨迹由 pty 侧
+    ``[MCP] <id> 开始/完成`` 首尾配对承担。判定只认实际挂载的路径集合
+    （_MCP_HTTP_PATHS，与前置分发钩子同一个集合）：未挂载/已卸载时集合为空，
+    一律照常打日志，不会误伤其它 RPC / 日志台 URL。
+    """
+    if not _MCP_HTTP_PATHS:
+        return False
+    try:
+        path = getattr(handler, "path", "") or ""
+    except Exception:
+        return False
+    return path.split("?", 1)[0] in _MCP_HTTP_PATHS
+
+
+def _mcp_register_access_log_filter() -> None:
+    """把 MCP 端点静音规则注册到 server_http（同名覆盖，失败只降级）。
+
+    规则属于 pty 的 MCP 服务自身，不硬编码在 server_http 里：server_http 只
+    提供 add_log_filter() 挂点（rdp 页「服务端日志」走同一机制）。注册失败
+    最多多打几行访问日志，绝不影响 PTY 会话。
+    """
+    try:
+        import server_http
+        server_http.add_log_filter(_MCP_LOG_FILTER_NAME, _mcp_access_log_off)
+    except Exception as exc:
+        _emit_local("[pty][MCP][WARN] 访问行静音规则注册失败，照常打日志: %r\n"
+                    % exc)
+
+
 def mount_mcp_on_rpc(prefer: str = "", host: str = "0.0.0.0") -> dict:
     """把 MCP 端点挂到 --port 已起的 HTTP RPC 服务器上（同口复用，不新开端口）。
 
@@ -710,6 +746,7 @@ def mount_mcp_on_rpc(prefer: str = "", host: str = "0.0.0.0") -> dict:
     _MCP_SERVER = server
     _MCP_HTTP_PATHS = frozenset(paths)
     _MCP_ASGI_APP = app
+    _mcp_register_access_log_filter()  # 静音 /mcp 的 2xx 访问行：规则由本模块自注册，失败只多打日志
     _emit_local("[pty][MCP] MCP 工具服务已挂到 RPC 口：路径 %s（与 RPC/日志台同口复用）"
                 "  工具：pty_run/pty_send/pty_status/pty_log/pty_redraw + "
                 "fs_read/fs_write/fs_edit/fs_glob/fs_grep/fs_ls/fs_mkdir/fs_move/fs_delete\n"

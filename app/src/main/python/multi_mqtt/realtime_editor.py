@@ -14,6 +14,10 @@ URL 即代码，等价于执行 ``import realtime_editor;realtime_editor.html(re
 （类属性字典，请求期实时可见），因此模块被 URL import 的同时即可收 WebSocket
 连接，不依赖启动参数 websocket_handler，也无需重启服务。
 
+编辑页底部在文件名后显示可读权限（如 rw-r--r-- (644)）；保存仍是临时文件
+原子替换，但会先把原文件权限 chmod 回临时文件，Linux 下不会因编辑把 755/600
+改成 umask 默认值；权限读不到时显示“权限 --”，不影响打开与保存。
+
 RPC 入口（p / response 由 server_http.handle_rpc 注入）：
     realtime_editor.html(p)                  编辑默认文件 default_file
     realtime_editor.html(p, '/tmp/txt')      位置参数亦可
@@ -27,6 +31,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import threading
 import time
 from datetime import datetime, timezone
@@ -43,6 +48,29 @@ default_file = 'realtime_editor.txt'
 _editors = globals().setdefault('_editors', {})  # setdefault 防 importlib.reload：reload 复用同一模块 __dict__ 重执行顶层，普通赋值把名字重绑到空 dict——已开编辑器（带活 WS 推送连接）变孤儿、同一文件再开时新建第二个 Editor 双实例并发写
 _editors_lock = globals().setdefault('_editors_lock', threading.RLock())  # 锁必须与表一起 setdefault：reload 重造新锁对象后，已攥旧锁的线程与拿新锁的线程互不排斥、同时进临界区
 
+
+def _mode_info(path):
+    """读取文件权限，返回 (rwxrwxrwx 可读串, 三位八进制串)。
+
+    权限取不到（文件不存在、stat 被拒、平台不支持等）时返回 (None, None)，
+    让页面显示“权限 --”，而不是让加载/保存流程抛异常。
+    """
+    try:
+        bits = stat.S_IMODE(os.stat(path).st_mode)
+    except Exception:
+        return None, None
+    try:
+        # filemode 首字符是文件类型（- / d / l ...），这里只要后九位权限
+        readable = stat.filemode(stat.S_IFREG | bits)[1:]
+    except Exception:
+        readable = None
+    try:
+        octal = format(bits, '03o')
+    except Exception:
+        octal = None
+    return readable, octal
+
+
 PAGE = r'''<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -55,7 +83,8 @@ PAGE = r'''<!doctype html>
 html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 body { display: flex; flex-direction: column; overflow: hidden; }
 header { height: 44px; flex: 0 0 44px; display: flex; align-items: center; padding: 0 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
-.title { font-size: 14px; font-weight: 700; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.title { font-size: 14px; font-weight: 700; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; min-width: 0; }
+#mode { flex: 0 0 auto; white-space: nowrap; }
 #editor { flex: 1 1 auto; width: 100%; resize: none; border: 0; outline: 0; padding: 18px 20px; color: var(--text); background: #101416; font: 14px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; tab-size: 4; }
 footer { height: 30px; flex: 0 0 30px; display: flex; align-items: center; gap: 18px; padding: 0 12px; border-top: 1px solid var(--line); color: var(--muted); background: var(--panel); font-size: 12px; }
 #state { color: var(--accent); } .error { color: #ee8f82 !important; }
@@ -64,15 +93,19 @@ footer { height: 30px; flex: 0 0 30px; display: flex; align-items: center; gap: 
 <body>
 
 <textarea id="editor" spellcheck="false" autofocus></textarea>
-<footer><span id="state">连接中...</span><span id="latency">延迟 --</span><span id="server-time">服务器时间 --</span> <div class="title" id="filename"></div> </footer>
+<footer><span id="state">连接中...</span><span id="latency">延迟 --</span><span id="server-time">服务器时间 --</span> <div class="title" id="filename"></div><span id="mode">权限 --</span> </footer>
 <script>
 const fileName = __FILE_NAME__;
+document.title = fileName + ' - Realtime Editor';   // 标签页以正在编辑的文件名开头，多标签一眼区分
 // 本页对应的 WebSocket 路由，按文件分发：/ws/realtime_editor/<md5前12位>
 const wsPath = __WS_PATH__;
+const fileMode = __FILE_MODE__;
+const fileModeOctal = __FILE_MODE_OCTAL__;
 const editor = document.getElementById('editor');
 const state = document.getElementById('state');
 const latency = document.getElementById('latency');
 const serverTime = document.getElementById('server-time');
+const modeText = document.getElementById('mode');
 document.getElementById('filename').textContent = fileName;
 let socket;
 let revision = 0;
@@ -82,6 +115,12 @@ let localChange = false;
 function showServerTime(value) {
     if (value) serverTime.textContent = '服务器时间 ' + new Date(value).toLocaleString();
 }
+// 权限来自服务器每次消息的 mode/mode_octal；null 表示服务器取不到，显示 -- 不报错
+function showMode(mode, octal) {
+    if (!mode) { modeText.textContent = '权限 --'; return; }
+    modeText.textContent = '权限 ' + mode + (octal ? ' (' + octal + ')' : '');
+}
+showMode(fileMode, fileModeOctal);
 function connect() {
     clearTimeout(reconnectTimer);
     socket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + wsPath);
@@ -94,6 +133,7 @@ function connect() {
     socket.onmessage = (event) => {
         const message = JSON.parse(event.data);
         showServerTime(message.server_time);
+        if (message.mode !== undefined) showMode(message.mode, message.mode_octal);
         if (message.type === 'snapshot') {
             revision = message.revision;
             if (document.activeElement !== editor || !localChange) editor.value = message.content;
@@ -167,10 +207,13 @@ class Editor:
             return None
 
     def _message(self, message_type, **values):
+        mode, mode_octal = _mode_info(self.path)  # 每次都取，外部 chmod 也能随 ping/pong 秒级刷到页面
         return json.dumps({
             'type': message_type,
             'revision': self.revision,
             'server_time': datetime.now(timezone.utc).isoformat(),
+            'mode': mode,
+            'mode_octal': mode_octal,
             **values,
         }, ensure_ascii=False)
 
@@ -194,7 +237,21 @@ class Editor:
 
     def save(self, content):
         temporary = self.path.with_name('.' + self.path.name + '.realtime-editor.tmp')
+        # os.replace 会把临时文件这个新 inode 换到目标路径上，权限按当前 umask
+        # （通常 644）重建。Linux 上原文件若是 755/600/…，编辑一次就被永久改掉。
+        # 先记住原权限，写完临时文件后 chmod 回原值，再原子替换；取不到权限或
+        # chmod 失败时只告警，仍按默认权限保存，不能因此让编辑功能报错。
+        target_mode = None
+        try:
+            target_mode = stat.S_IMODE(os.stat(self.path).st_mode)
+        except Exception:
+            pass
         temporary.write_text(content, encoding='utf-8',) # newline='' 低版本py不支持
+        if target_mode is not None:
+            try:
+                os.chmod(temporary, target_mode)
+            except Exception as e:
+                self.logger.warning(f"恢复文件权限 0o{target_mode:o} 失败（继续保存）: {e}")
         os.replace(temporary, self.path)
         self.content = content
         self.signature = self._signature()
@@ -291,9 +348,12 @@ def get_editor(path=None):
 
 
 def _render(editor):
+    mode, mode_octal = _mode_info(editor.path)
     return (PAGE
             .replace('__FILE_NAME__', json.dumps(str(editor.path), ensure_ascii=False))
-            .replace('__WS_PATH__', json.dumps(editor.ws_path)))
+            .replace('__WS_PATH__', json.dumps(editor.ws_path))
+            .replace('__FILE_MODE__', json.dumps(mode))
+            .replace('__FILE_MODE_OCTAL__', json.dumps(mode_octal)))
 
 
 # ------------------------------------------------------------------ #

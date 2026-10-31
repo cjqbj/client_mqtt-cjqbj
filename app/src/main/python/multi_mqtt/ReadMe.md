@@ -1,7 +1,7 @@
 这是一个以 Python 为主的 MQTT RPC 项目，辅助逻辑分散在根目录、`client/` 和 `.trae/skills/` 中，没有单独的 `utils/` 模块。
 
 - 核心通信层：`multi_mqtt.py` 管理 MQTT Broker 连接、消息分发、去重、签名和连接统计。
-- RPC 执行与服务端：`rpc_executor.py` 提供持久化 Python 执行器；`server_mqtt.py`、`server_http.py`、`server_http_wsgi.py` 和 `rpc_tcp.py` 分别提供 MQTT、HTTP、WSGI 和 TCP 服务。
+- RPC 执行与服务端：`rpc_executor.py` 提供持久化 Python 执行器；`server_mqtt.py`、`server_http.py`、`server_http_asgi.py`（HTTP + WebSocket 一体化单体 ASGI 应用）、`server_http_wsgi.py`（WSGI 形态）和 `rpc_tcp.py` 分别提供 MQTT、HTTP、ASGI、WSGI 和 TCP 服务。
 - 客户端：`client/` 包含 MQTT REPL、远端命令/PTY、HTTP 文件同步和 SOCKS5 客户端。
 - 其他：`U.py` 查询设备信息；`realtime_editor.py` 是实时协作编辑工具；`tests/` 放测试；`.trae/skills/` 放独立自动化脚本。
 

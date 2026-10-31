@@ -451,10 +451,26 @@ class PtyCliPreCommandTests(unittest.TestCase):
         self.assertEqual(pcm._join_pre_command(args.command), "tmux at")
 
     def test_command_own_dash_options_are_not_consumed_by_client(self):
-        # REMAINDER：tmux attach -d 里的 -d 是给远端命令的，不能报无法识别
+        # 单横线长别名（-dir/-dead*/-detach*）会让命令里的 -d 被当成歧义缩写；
+        # 解析器在命令起点前插入 --，命令原样交给 REMAINDER。
         args = pcm.build_parser().parse_args(["tmux", "attach", "-d", "-t", "x"])
         self.assertEqual(pcm._join_pre_command(args.command),
                          "tmux attach -d -t x")
+
+    def test_option_values_are_not_mistaken_for_command_start(self):
+        # --term q 的值 q 不是命令起点：-- 只插在真正的命令前，term 仍被正确消费
+        args = pcm.build_parser().parse_args(
+            ["--term", "q", "tmux", "attach", "-d"])
+        self.assertEqual(args.term, "q")
+        self.assertEqual(pcm._join_pre_command(args.command), "tmux attach -d")
+
+    def test_explicit_separator_is_not_duplicated(self):
+        # 用户主动写 -- 时分隔符只出现一次，_join_pre_command 负责剥掉它
+        args = pcm.build_parser().parse_args(
+            ["--term", "q", "--", "tmux", "attach", "-d"])
+        self.assertEqual(args.term, "q")
+        self.assertEqual(pcm._join_pre_command(args.command), "tmux attach -d")
+        self.assertEqual(args.command.count("--"), 1)
 
     def test_double_dash_separator_stripped(self):
         self.assertEqual(pcm._join_pre_command(["--", "tmux at"]), "tmux at")
@@ -1806,6 +1822,112 @@ class TerminalWriterTests(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         self.assertTrue(captured[0].startswith("[RPC]"))
         self.assertIn("1.2.3.4:5555", captured[0])
+
+    def test_injected_log_filter_silences_only_2xx(self):
+        # 下游模块不再把静音规则硬编码进 server_http，而是注册过滤器：
+        # 过滤器只在这个请求的 2xx/3xx 访问行上被询问，4xx/5xx 与未命中
+        # 的请求照常输出（rdp 页的 X-RDP-Log 规则即由 client/rdp.py 注入）。
+        import server_http
+
+        def silent_request(handler):
+            headers = getattr(handler, 'headers', {}) or {}
+            return str(headers.get('X-Test-Silence', '')) == '1'
+
+        server_http.add_log_filter('unit-test-silence', silent_request)
+        self.addCleanup(server_http.remove_log_filter, 'unit-test-silence')
+        h = server_http.RPCRequestHandler.__new__(server_http.RPCRequestHandler)
+        h.client_address = ("1.2.3.4", 5555)
+        captured = []
+        h.log_sink = captured.append
+        h.headers = {"X-Test-Silence": "1"}
+        h.log_message('"%s" %s %s', "GET /rdp.click(1,2) HTTP/1.0", 200, "-")
+        self.assertEqual(captured, [])
+        h.log_message('"%s" %s %s', "GET /rdp.click(1,2) HTTP/1.0", 500, "-")
+        self.assertEqual(len(captured), 1)
+        self.assertIn("[RPC]", captured[0])
+        h.headers = {}
+        h.log_message('"%s" %s %s', "GET /x HTTP/1.0", 200, "-")
+        self.assertEqual(len(captured), 2)
+
+    def test_broken_log_filter_degrades_to_logging(self):
+        # 过滤器自身出错只是“照常输出”并告警一次，不能让日志钩子打挂请求，
+        # 也不能静默丢日志。
+        import server_http
+
+        def broken(_handler):
+            raise RuntimeError('filter boom')
+
+        server_http.add_log_filter('unit-test-broken', broken)
+        self.addCleanup(server_http.remove_log_filter, 'unit-test-broken')
+        h = server_http.RPCRequestHandler.__new__(server_http.RPCRequestHandler)
+        h.client_address = ("1.2.3.4", 5555)
+        captured = []
+        h.log_sink = captured.append
+        with self.assertLogs('app', level='WARNING') as logs:
+            h.log_message('"%s" %s %s', "GET /boom HTTP/1.0", 200, "-")
+            h.log_message('"%s" %s %s', "GET /boom HTTP/1.0", 200, "-")
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(len(logs.records), 1)      # 同一过滤器只告警一次
+        self.assertIn('filter boom', logs.output[0])
+
+    def test_add_log_filter_replaces_and_remove(self):
+        import server_http
+
+        def first(_handler):
+            return True
+
+        def second(_handler):
+            return False
+
+        server_http.add_log_filter('unit-test-replace', first)
+        self.addCleanup(server_http.remove_log_filter, 'unit-test-replace')
+        server_http.add_log_filter('unit-test-replace', second)
+        self.assertIs(server_http._LOG_FILTERS['unit-test-replace'], second)
+        self.assertTrue(server_http.remove_log_filter('unit-test-replace'))
+        self.assertFalse(server_http.remove_log_filter('unit-test-replace'))
+
+    def test_add_log_filter_requires_callable(self):
+        import server_http
+        with self.assertRaises(TypeError):
+            server_http.add_log_filter('unit-test-bad', None)
+
+    def test_pty_mcp_access_log_filter_registers_itself(self):
+        # MCP 端点静音规则属于 pty（server_http 只留 add_log_filter 挂点，
+        # 不再内置任何规则）：pty 按「实际挂载的路径集合」注册，4xx/5xx 保留，
+        # 集合外路径与卸载后的 /mcp 都不误伤。
+        import server_http
+
+        old_paths = pcm._MCP_HTTP_PATHS
+        self.addCleanup(server_http.remove_log_filter, pcm._MCP_LOG_FILTER_NAME)
+        self.addCleanup(setattr, pcm, "_MCP_HTTP_PATHS", old_paths)
+        pcm._MCP_HTTP_PATHS = frozenset({"/mcp", "/mcp/"})
+        pcm._mcp_register_access_log_filter()
+        self.assertIs(server_http._LOG_FILTERS[pcm._MCP_LOG_FILTER_NAME],
+                      pcm._mcp_access_log_off)
+
+        h = server_http.RPCRequestHandler.__new__(server_http.RPCRequestHandler)
+        h.client_address = ("1.2.3.4", 5555)
+        captured = []
+        h.log_sink = captured.append
+        h.headers = {}
+        h.path = "/mcp"
+        h.log_message('"%s" %s %s', "POST /mcp HTTP/1.0", 200, "-")
+        self.assertEqual(captured, [])
+        h.path = "/mcp/"
+        h.log_message('"%s" %s %s', "POST /mcp/ HTTP/1.0", 200, "-")
+        self.assertEqual(captured, [])
+        h.path = "/mcp?session=1"
+        h.log_message('"%s" %s %s', "POST /mcp?session=1 HTTP/1.0", 200, "-")
+        self.assertEqual(captured, [])
+        h.log_message('"%s" %s %s', "POST /mcp?session=1 HTTP/1.0", 500, "-")
+        self.assertEqual(len(captured), 1)          # 5xx 永远保留
+        h.path = "/x/mcp-alias"
+        h.log_message('"%s" %s %s', "GET /x/mcp-alias HTTP/1.0", 200, "-")
+        self.assertEqual(len(captured), 2)          # 集合外路径不误伤
+        pcm._MCP_HTTP_PATHS = frozenset()           # 未挂载/已卸载：静音自动失效
+        h.path = "/mcp"
+        h.log_message('"%s" %s %s', "POST /mcp HTTP/1.0", 200, "-")
+        self.assertEqual(len(captured), 3)
 
     def test_log_message_falls_back_when_sink_raises(self):
         import server_http

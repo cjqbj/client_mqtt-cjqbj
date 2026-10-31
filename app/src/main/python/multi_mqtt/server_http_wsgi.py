@@ -17,6 +17,18 @@ server_http_wsgi.py — 把 server_http.py 的 RPC 处理器包装成 WSGI 应�
     uwsgi --http :6080 --module server_http_wsgi:application --enable-threads
     python3 server_http_wsgi.py        # 本地调试（多线程 wsgiref）
 
+URL 形态（RPC_KEY / RPC_ALIAS_URL 环境变量可覆盖，默认 '-' / 'raw'）：
+    https://<host>/-<code>             例：/-r=1+1
+    https://<host>/-/<code>            兼容旧写法
+    https://<host>/<别名>              已注册别名免前缀（alias_url='raw'）
+    https://<host>/                    执行 root 别名（RPC_ROOT_ALIAS，默认
+                                       'root'；定义 #alias root 后首页显示它
+                                       产出的 HTML）
+
+别名持久化：默认开启，注册 / 更新 / 删除 #alias 都写仓库根目录的
+rpc.json（http_aliases 段，与 server_mqtt 的 request_topic 等同文件共存），
+进程重启 / SIGHUP 后自动恢复；RPC_PERSIST_ALIASES=0 可关闭。
+
 注意：
     * RPC 的持久命名空间是进程内单例，请使用单 worker（-w 1）。
     * WSGI 不支持 WebSocket 升级；需要 /ws 请继续用 server_http.py。
@@ -39,6 +51,28 @@ from wsgiref.simple_server import WSGIServer, WSGIRequestHandler
 
 import server_http
 from server_http import RPCRequestHandler
+
+
+# 本 WSGI 应用的部署配置（pythonanywhere 线上默认 key='-'，URL 形如
+# /-<code>；alias_url='raw' 让已注册别名可直接作 URL，如 /add）。
+# 用环境变量覆盖便于同一份代码在本地调试或换前缀，置空 RPC_KEY 即回到无前缀。
+RPC_KEY = os.environ.get('RPC_KEY', '-')
+ALIAS_URL = os.environ.get('RPC_ALIAS_URL', 'raw')
+# alias_url 归一化成 (路由模式 'dash'/'raw', 是否 JSON 解码 query 值)。
+# 环境变量属于显式配置，写错时降级为默认 dash 并 WARNING，不让整个 WSGI
+# 应用 import 失败（AGENTS.md：附加功能出问题只降级，不阻塞主流程）。
+try:
+    _ALIAS_URL_MODE, _ALIAS_JSON = server_http.normalize_alias_url(ALIAS_URL)
+except ValueError as _alias_url_error:
+    logging.getLogger('app').warning(
+        'RPC_ALIAS_URL=%r 无效，降级为 dash: %s', ALIAS_URL, _alias_url_error)
+    _ALIAS_URL_MODE, _ALIAS_JSON = server_http.ALIAS_URL_DASH, False
+# 首页 / 执行的别名名（默认 root）与别名持久化开关（默认开启，写 rpc.json）。
+RPC_ROOT_ALIAS = os.environ.get('RPC_ROOT_ALIAS', 'root')
+RPC_PERSIST_ALIASES = os.environ.get(
+    'RPC_PERSIST_ALIASES', '1').strip().lower() not in ('0', 'false', 'no', 'off', '')
+# 本应用自己的执行器，start_rpc_server 初始化后绑定（见文件末尾）
+_APP_EXECUTOR = None
 
 
 def _wsgi_unescape(value: str) -> str:
@@ -134,6 +168,9 @@ class _WSGIHandlerShim:
         path = _wsgi_unescape(environ.get('PATH_INFO', '') or '')
         self.path = path + (
             '?' + urllib.parse.unquote(qs, encoding='utf-8') if qs else '')
+        # 别名参数（alias.md 8.1）：从**原始** QUERY_STRING 解析一次，
+        # handle_rpc 优先读这里，避免对已 unquote 的 self.path 二次解码。
+        self.query_params = server_http.parse_query_params(qs)
         # 告知 handle_rpc：路径已是解码后的文本，不要再 unquote。
         self.path_already_decoded = True
 
@@ -148,10 +185,21 @@ class _WSGIHandlerShim:
             headers['Content-Length'] = environ['CONTENT_LENGTH']
         self.headers = _CIDict(headers)
 
-        # 从 RPCRequestHandler 同步类级状态（每请求新建 shim，运行期
-        # 动态改动 set_basic_auth / key 后下一请求立即生效）
-        self.key = RPCRequestHandler.key
-        self.executor = RPCRequestHandler.executor
+        # 每请求新建 shim。basic_auth 仍读类级状态，运行期 set_basic_auth
+        # 下个请求即生效；key / alias_url 固定用本应用部署配置（RPC_KEY /
+        # ALIAS_URL），否则同进程再起一台无 key 的 start_rpc_server（测试或
+        # 本地调试）会把类属性改回 ''，线上 /- 地址会整体 403。
+        self.key = RPC_KEY
+        self.alias_url = _ALIAS_URL_MODE
+        self.alias_json = _ALIAS_JSON
+        # 首页别名 / 持久化开关同样固定在部署配置上：同进程再起别的服务器
+        # （测试或本地调试）改类属性也不能改变线上首页与落盘行为。
+        self.root_alias = RPC_ROOT_ALIAS
+        self.persist_aliases = RPC_PERSIST_ALIASES
+        # executor 固定绑本应用启动时的那一个（pythonanywhere 是单 app 进程）：
+        # 同进程再起别的服务器会替换类属性，WSGI 请求不能跟着跑到别人的
+        # 命名空间和别名表里。
+        self.executor = _APP_EXECUTOR or RPCRequestHandler.executor
         self.basic_auth = RPCRequestHandler.basic_auth
 
         # 响应状态
@@ -192,8 +240,11 @@ class _WSGIHandlerShim:
             state['chunks'].put(buffered)
 
     def send_error(self, code, message=None, explain=None):
-        # handle_rpc 在 403 / 400 / 500 兜底时会调用它
+        # handle_rpc 在 403 / 400 / 500 兜底时会调用它。原生 send_error 会
+        # 立刻发状态行；这里也必须先 end_headers 提交，否则 application 的
+        # finally 会把未提交的响应兜底成 200，403 变成"200 + 空 body"。
         self._status = int(code)
+        self.end_headers()
         self.wfile.write(f"{code} {message or ''}".encode('utf-8'))
 
     def log_message(self, fmt, *args):
@@ -407,11 +458,18 @@ def _build_wsgi_application():
 server_http.start_rpc_server(
     port=int(os.environ.get('RPC_PORT', '6080')),
     ip='0.0.0.0',
-    key='',
+    key=RPC_KEY,
+    alias_url=_ALIAS_URL_MODE,
+    root_alias=RPC_ROOT_ALIAS,
+    persist_aliases=RPC_PERSIST_ALIASES,
     globals=globals(),
     locals=locals(),
     listen=False,           # 关键：只初始化状态
 )
+
+# 绑定本应用的执行器（持久命名空间/别名表），后续同进程再起别的服务器
+# 不会影响 WSGI 请求。
+_APP_EXECUTOR = RPCRequestHandler.executor
 
 application = _build_wsgi_application()
 

@@ -1,11 +1,13 @@
 import builtins
+import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -100,6 +102,95 @@ class ClientMqttTests(unittest.TestCase):
     def test_expression_private_key_is_supported(self):
         pem = get_standard_pem_bytes("1+1")
         self.assertIn(b"BEGIN EC PRIVATE KEY", pem)
+
+    def test_stats_intervals_are_applied_to_mqtt_net(self):
+        """client_mqtt 的统计周期参数必须透传到 MultiMQTTManager.stats。"""
+        node = client_mqtt.MQTTClientNode(
+            stats_print_interval=75,
+            stats_ping_interval=25,
+        )
+        self.assertEqual(node.mqtt_net.stats.print_interval, 75.0)
+        self.assertEqual(node.mqtt_net.stats.ping_interval, 25.0)
+
+        default_node = self._node_with_client_rpc({})
+        self.assertEqual(
+            default_node.mqtt_net.stats.print_interval,
+            default_node.mqtt_net.stats.PRINT_INTERVAL,
+        )
+        self.assertEqual(
+            default_node.mqtt_net.stats.ping_interval,
+            default_node.mqtt_net.stats.PING_INTERVAL,
+        )
+
+    def test_stats_interval_cli_aliases_are_generated(self):
+        """CLI 同时支持新键名与历史 report/print 别名。"""
+        options = client_mqtt._cli_opts(*client_mqtt.alias_stats_print_interval)
+        self.assertIn("--stats_print_interval", options)
+        self.assertIn("--report_interval", options)
+        self.assertIn("--print_interval", options)
+        ping_options = client_mqtt._cli_opts(*client_mqtt.alias_stats_ping_interval)
+        self.assertIn("--stats_ping_interval", ping_options)
+        self.assertIn("--ping_interval", ping_options)
+
+    def _node_with_client_rpc(self, document, **kwargs):
+        """用临时 rpc.json 构造客户端，避免读仓库根目录的真实配置。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "rpc.json")
+            with open(path, "w", encoding="utf-8") as file:
+                json.dump(document, file)
+            with patch.object(client_mqtt, "CLIENT_RPC_CONFIG_PATH", path):
+                return client_mqtt.MQTTClientNode(**kwargs)
+
+    def test_client_stats_print_interval_prefers_client_specific_key(self):
+        """client_stats_print_interval 优先于 stats_print_interval。"""
+        node = self._node_with_client_rpc({
+            "client_stats_print_interval": 90,
+            "stats_print_interval": 120,
+        })
+        self.assertEqual(node.mqtt_net.stats.print_interval, 90.0)
+
+    def test_client_stats_print_interval_falls_back_to_shared_key(self):
+        """客户端专属键缺失/null 时回退 stats_print_interval。"""
+        for document in (
+            {"stats_print_interval": 120},
+            {"client_stats_print_interval": None, "stats_print_interval": 120},
+            {"client_stats_print_interval": "", "stats_print_interval": 120},
+        ):
+            node = self._node_with_client_rpc(document)
+            self.assertEqual(node.mqtt_net.stats.print_interval, 120.0)
+
+    def test_client_stats_print_interval_falls_back_to_original_default(self):
+        """两个键都没有时回退 Python 原有默认行为（3600s）。"""
+        node = self._node_with_client_rpc({})
+        self.assertEqual(
+            node.mqtt_net.stats.print_interval,
+            node.mqtt_net.stats.PRINT_INTERVAL,
+        )
+
+    def test_client_stats_print_interval_explicit_argument_wins(self):
+        """CLI/rpc(...)/构造参数显式传入时优先于 rpc.json。"""
+        node = self._node_with_client_rpc(
+            {"client_stats_print_interval": 90},
+            stats_print_interval=30,
+        )
+        self.assertEqual(node.mqtt_net.stats.print_interval, 30.0)
+
+    def test_client_stats_print_interval_invalid_values_fall_back(self):
+        """非法客户端值不阻塞启动：回退 stats_print_interval，再回退默认。"""
+        node = self._node_with_client_rpc({
+            "client_stats_print_interval": "bad",
+            "stats_print_interval": 120,
+        })
+        self.assertEqual(node.mqtt_net.stats.print_interval, 120.0)
+
+        node = self._node_with_client_rpc({
+            "client_stats_print_interval": -1,
+            "stats_print_interval": "bad",
+        })
+        self.assertEqual(
+            node.mqtt_net.stats.print_interval,
+            node.mqtt_net.stats.PRINT_INTERVAL,
+        )
 
     def test_signed_request_is_blocked_when_server_pubkey_is_missing(self):
         node = client_mqtt.MQTTClientNode(

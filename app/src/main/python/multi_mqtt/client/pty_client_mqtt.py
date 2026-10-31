@@ -3487,6 +3487,42 @@ def _mcp_hook_handler(Handler) -> None:
             setattr(Handler, name, _wrap(base))
 
 
+_MCP_LOG_FILTER_NAME = "pty-mcp"  # server_http 注册表里的名字；同名覆盖 = reload 幂等
+
+
+def _mcp_access_log_off(handler) -> bool:
+    """server_http 日志过滤器：MCP 端点（/mcp，sse 退回模式是 /sse+/messages）静音。
+
+    一次 MCP 工具调用在 HTTP 层会伴随 initialize / notifications / tools/call
+    多条 POST，既无工具名也无参数，只会把日志冲散；真正的调用轨迹由 pty 侧
+    ``[MCP] <id> 开始/完成`` 首尾配对承担。判定只认实际挂载的路径集合
+    （_MCP_HTTP_PATHS，与前置分发钩子同一个集合）：未挂载/已卸载时集合为空，
+    一律照常打日志，不会误伤其它 RPC / 日志台 URL。
+    """
+    if not _MCP_HTTP_PATHS:
+        return False
+    try:
+        path = getattr(handler, "path", "") or ""
+    except Exception:
+        return False
+    return path.split("?", 1)[0] in _MCP_HTTP_PATHS
+
+
+def _mcp_register_access_log_filter() -> None:
+    """把 MCP 端点静音规则注册到 server_http（同名覆盖，失败只降级）。
+
+    规则属于 pty 的 MCP 服务自身，不硬编码在 server_http 里：server_http 只
+    提供 add_log_filter() 挂点（rdp 页「服务端日志」走同一机制）。注册失败
+    最多多打几行访问日志，绝不影响 PTY 会话。
+    """
+    try:
+        import server_http
+        server_http.add_log_filter(_MCP_LOG_FILTER_NAME, _mcp_access_log_off)
+    except Exception as exc:
+        _emit_local("[pty][MCP][WARN] 访问行静音规则注册失败，照常打日志: %r\n"
+                    % exc)
+
+
 def mount_mcp_on_rpc(prefer: str = "", host: str = "0.0.0.0") -> dict:
     """把 MCP 端点挂到 --port 已起的 HTTP RPC 服务器上（同口复用，不新开端口）。
 
@@ -3515,6 +3551,7 @@ def mount_mcp_on_rpc(prefer: str = "", host: str = "0.0.0.0") -> dict:
     _MCP_SERVER = server
     _MCP_HTTP_PATHS = frozenset(paths)
     _MCP_ASGI_APP = app
+    _mcp_register_access_log_filter()  # 静音 /mcp 的 2xx 访问行：规则由本模块自注册，失败只多打日志
     _emit_local("[pty][MCP] MCP 工具服务已挂到 RPC 口：路径 %s（与 RPC/日志台同口复用）"
                 "  工具：pty_run/pty_send/pty_status/pty_log/pty_redraw + "
                 "fs_read/fs_write/fs_edit/fs_glob/fs_grep/fs_ls/fs_mkdir/fs_move/fs_delete\n"
@@ -4905,11 +4942,77 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
 
 # ============================ CLI ============================
 
+def _pre_command_index(parser, argv):
+    """SSH 式前置命令的起始下标：跳过选项及其值后的第一个非选项 token。
+
+    返回 None = 整行都是选项（没有前置命令）；返回下标 i 表示 argv[i] 起
+    都该按位置参数处理。``--`` 是显式的命令分隔符，返回它后面的下标。
+    选项值识别规则：``--opt=value`` 自带值；``store_true`` 等 nargs=0 的
+    动作不带走下一个 token；其余动作（nargs=None/int>0）认为值在下一个
+    token。认不出的选项（未知名或歧义缩写）按“不取值”处理，把下一个非
+    选项 token 当命令起点，让 argparse 自己报选项错误——扫描阶段绝不替
+    argparse 猜测，更不吞掉用户真实的命令。
+    """
+    i, n = 0, len(argv)
+    while i < n:
+        tok = argv[i]
+        if tok == "--":
+            return i + 1
+        if not tok or tok == "-" or not tok.startswith("-"):
+            return i                       # 第一个位置参数 = 命令起点
+        if tok[1:2].isdigit():
+            return i                       # 负数字面量，argparse 同样当位置参数
+        i += 1
+        takes_value = _option_takes_value(parser, tok)
+        if takes_value:
+            i += 1                         # 跳过该选项的值（可能不存在，越界即到头）
+    return None
+
+
+def _option_takes_value(parser, token) -> bool:
+    """该选项是否把下一个 token 当自己的值（只读 argparse 已注册的动作表）。"""
+    action = parser._option_string_actions.get(token)
+    explicit_arg = None
+    if action is None:  # 缩写/歧义：用 argparse 自己的前缀匹配结果判定
+        try:
+            tuples = parser._get_option_tuples(token)
+        except Exception:
+            return False
+        if len(tuples) != 1:
+            return False
+        action, _opt, explicit_arg = tuples[0]
+    if "=" in token or explicit_arg is not None:
+        return False                       # --opt=value 已内联，不再吃下一个
+    nargs = action.nargs
+    if nargs in (None, "?", "+"):
+        return True
+    return isinstance(nargs, int) and nargs > 0
+
+
+class _PreCommandParser(argparse.ArgumentParser):
+    """自动为 SSH 式前置命令插入 ``--`` 的 ArgumentParser。
+
+    本客户端的选项别名里有单横线长名（-dir/-dead_timeout/-detach_key），
+    argparse 会把命令自身的 ``-d``（如 ``tmux attach -d``）当成这些长名的
+    缩写并报 ``ambiguous option: -d``（allow_abbrev=False 只关双横线长名的
+    缩写，管不住单横线长名）。在命令起点前插入 ``--`` 后，选项解析到此为止，
+    其后每个 token（含 -d/-t 和它们的值）都按位置参数交给 nargs=REMAINDER，
+    与 ssh 的“命令放最后”语义一致；用户在命令前主动写的 ``--`` 不会被重复插入。
+    """
+
+    def parse_known_args(self, args=None, namespace=None):
+        argv = list(sys.argv[1:] if args is None else args)
+        idx = _pre_command_index(self, argv)
+        if idx is not None and (idx == 0 or argv[idx - 1] != "--"):
+            argv.insert(idx, "--")
+        return super().parse_known_args(argv, namespace)
+
+
 def build_parser() -> argparse.ArgumentParser:
     # 选项名一律由文件前面的 alias_xxx 别名表 + client_mqtt._cli_opts 生成，
     # 与本地魔术栏命令、rpc(**ka) 别名三处永远一致；禁止再硬编码 "--xxx"。
     # dest 保持历史字段名（args.interval/args.port 等），调用方无需改动。
-    p = argparse.ArgumentParser(
+    p = _PreCommandParser(
         prog="pty_client_mqtt",
         description="PTY over MQTT：SSH 式远程交互终端（常驻 shell，逐键过 broker）")
     # 连接参数（topic/key/allow/timeout）：直接复用 client_mqtt 别名表

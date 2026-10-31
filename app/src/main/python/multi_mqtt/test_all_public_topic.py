@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import sys
 import time
@@ -468,7 +469,21 @@ class RawSnifferManager(MultiMQTTManager):
             logger.exception("原始消息回调处理失败 [%s] topic=%s", host, msg.topic)
 
 
-def main():
+def build_parser():
+    """命令行参数：默认值保持脚本原来的行为（6080 / 0.0.0.0 / '-'）。"""
+    parser = argparse.ArgumentParser(
+        description="订阅所有公开 topic，并起 HTTP RPC 查询/编辑服务")
+    parser.add_argument('--port', type=int, default=6080,
+                        help='RPC 监听端口（默认 6080）')
+    parser.add_argument('--ip', default='0.0.0.0',
+                        help='RPC 监听地址（默认 0.0.0.0）')
+    parser.add_argument('--key', default='-',
+                        help='RPC 路径前缀（默认 -）')
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
     engine = SnifferEngine()
 
     def on_raw_message(topic, payload_bytes, host):
@@ -484,7 +499,8 @@ def main():
     manager.subscribe("#")
     
     import server_http
-    ghs = server_http.start_rpc_server(port=6080,ip='0.0.0.0',globals=globals(),locals=locals(),key='-')
+    logger.info("HTTP RPC 监听 %s:%s (key=%r)", args.ip, args.port, args.key)
+    ghs = server_http.start_rpc_server(port=args.port,ip=args.ip,globals=globals(),locals=locals(),key=args.key)
     try:
         while True:
             time.sleep(1)
