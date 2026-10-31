@@ -743,6 +743,28 @@ def call_feature(feature, action="run", *args):
         return json.dumps({"ok": True, "result": str(result)}, ensure_ascii=False)
 
 
+def _rebuild_with_builtin_feature(feature, context):
+    """移走返回 None 的 py_updates 覆盖件，用内置版本重建视图；失败返回 None。"""
+    import logging
+    import bootstrap
+    try:
+        source = bootstrap.feature_source_info(feature)
+        runtime_file = str(source.get("runtime_file") or "")
+        if source.get("source") != "py_updates" or not os.path.isfile(runtime_file):
+            return None
+        quarantine = "%s.bad-%s" % (runtime_file, time.strftime("%Y%m%d-%H%M%S"))
+        os.replace(runtime_file, quarantine)
+        logging.getLogger("error").warning(
+            "feature %s build_view returned None; quarantined %s; using builtin",
+            feature, quarantine,
+        )
+        module = bootstrap.reload_feature(feature)
+        builder = getattr(module, "build_view", None)
+        return builder(context) if callable(builder) else None
+    except Exception:
+        return None
+
+
 def build_feature_view(feature, context):
     """宿主桥：让 feature 脚本自己用 Chaquopy 构建原生 View。
 
@@ -762,6 +784,10 @@ def build_feature_view(feature, context):
                 f"feature {feature!r} has no callable build_view(context)"
             )
         view = builder(context)
+        if view is None:
+            # py_updates 覆盖件坏了（典型：下载被截断，文件还能编译但没有结尾
+            # return）时移走坏文件、回退内置版本重建；边缘功能只降级不白屏。
+            view = _rebuild_with_builtin_feature(feature, context)
         if view is None:
             raise RuntimeError("build_view(context) returned None")
         return view
@@ -1308,6 +1334,21 @@ def rescan_features():
     return feature_catalog()
 
 
+def _feature_manifest_sha256(filename, timeout=15):
+    """查 feature_manifest.json 里该文件的 sha256；清单不可用时返回空串（只降级）。"""
+    try:
+        manifest = fetch_feature_manifest(timeout=min(float(timeout or 15), 15.0))
+        for item in manifest.get("features") or []:
+            if str(item.get("filename") or "") == str(filename):
+                return str(item.get("sha256") or "")
+    except BaseException as error:
+        _append_operation_log(
+            "Version manifest unavailable (%s); checksum disabled for %s"
+            % (f"{type(error).__name__}: {error}"[:200], filename)
+        )
+    return ""
+
+
 def install_builtin_feature(script_root, filename, retries=4, timeout=15):
     """Download or refresh one selected built-in feature script."""
     import bootstrap
@@ -1319,7 +1360,8 @@ def install_builtin_feature(script_root, filename, retries=4, timeout=15):
     _append_operation_log(f"Installing {filename} into {update_dir}")
     try:
         result = _install_builtin_feature_file(
-            bootstrap, filename, update_dir, retries, timeout
+            bootstrap, filename, update_dir, retries, timeout,
+            sha256=_feature_manifest_sha256(filename, timeout),
         )
     except Exception as error:
         detail = f"{type(error).__name__}: {error}"[:300]

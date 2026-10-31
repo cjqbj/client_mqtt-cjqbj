@@ -62,3 +62,19 @@
 
 ## Next step
 Install the generated APK and validate external script downloads on the target network, the visible retry log, feature override, camera capture/preview, and remaining device workflows.
+
+## 2026-10-31 feature 单文件下载被截断导致 build_view returned None
+
+- 现象：设置页单文件 Download 后长按 Reload，Audio 页显示 `RuntimeError: build_view(context) returned None`。
+- 根因：设置页 `install_builtin_feature`（单文件按钮）下载时不带 sha256；弱网/代理中途断流时 `urlopen` 可能静默返回半截正文，
+  Python 允许用 EOF 结束代码块，截断文件仍能 `compile` 通过，但 `build_view` 缺少结尾 `return page.root`，于是返回 None。
+  （已用 v4 音频文件截到 1300 行复现：可编译、无 `return page.root`、调用即返回 None。）
+- 修复：
+  1. `client_service._feature_manifest_sha256`：单文件下载复用 feature_manifest.json 的 sha256；清单不可用时只打日志降级。
+  2. `bootstrap.install_feature`：有 Content-Length 就逐字节核对，并把 ValueError 纳入重试/回退链路（原来 sha 不符会直接放弃回退源）。
+  3. `client_service.build_feature_view`：`build_view` 返回 None 时把 py_updates 坏覆盖件改名为 `*.bad-<时间戳>`，
+     清除缓存后回退内置版本重建，仍然失败才显示错误页（边缘功能只降级不白屏）。
+- 测试：`tests/test_bootstrap.py` +2（截断拒装、长度一致仍安装），`tests/test_client_service.py` +2（sha 来源与降级）；
+  远端 unittest 通过（client_service 另有 2 个与本次无关的既有失败）。
+- 真机验证：k12 推入“截断但仍可编译”的 feature_audio.py → 打开 Audio 自动隔离为 `feature_audio.py.bad-20261031-212310`，
+  内置界面正常显示（TTS ready）。

@@ -1676,3 +1676,23 @@ class ClientServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class FeatureChecksumDegradeTests(unittest.TestCase):
+    """单文件下载的 sha256 来源：清单可用就校验，清单坏掉只降级不阻塞。"""
+
+    def test_sha_lookup_returns_manifest_value(self):
+        with mock.patch.object(
+            client_service, "fetch_feature_manifest",
+            return_value={"features": [{"filename": "feature_audio.py", "sha256": "abc"}]},
+        ):
+            self.assertEqual(
+                client_service._feature_manifest_sha256("feature_audio.py"), "abc"
+            )
+
+    def test_sha_lookup_degrades_when_manifest_broken(self):
+        with mock.patch.object(
+            client_service, "fetch_feature_manifest", side_effect=RuntimeError("boom"),
+        ):
+            self.assertEqual(
+                client_service._feature_manifest_sha256("feature_audio.py"), ""
+            )

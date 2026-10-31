@@ -192,3 +192,71 @@ class BootstrapTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+import io
+
+
+class FeatureDownloadHardeningTests(unittest.TestCase):
+    """下载链路防截断：Content-Length 不符必须拒装，且不得留下半个文件。"""
+
+    class FakeResponse(io.BytesIO):
+        def __init__(self, body, content_length=None):
+            super().__init__(body)
+            self.headers = (
+                {"Content-Length": str(content_length)}
+                if content_length is not None else {}
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _install(self, directory, responses, retries=2):
+        with mock.patch.object(
+            bootstrap.urllib.request, "urlopen", side_effect=responses,
+        ), mock.patch.object(bootstrap.time, "sleep"):
+            return bootstrap.install_feature(
+                "https://github.com/example/feature_demo.py",
+                "feature_demo.py",
+                update_dir=directory,
+                retries=retries,
+                timeout=5,
+            )
+
+    def test_truncated_body_is_rejected_and_not_installed(self):
+        previous_update_dir = bootstrap._UPDATE_DIR
+        previous_path = list(sys.path)
+        body = b"FEATURE = {'name': 'demo'}\ndef run():\n    return 'ready'\n"
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                bootstrap.init_env(directory)
+                with self.assertRaises(RuntimeError):
+                    self._install(
+                        directory,
+                        [
+                            self.FakeResponse(body[:20], len(body)),
+                            self.FakeResponse(body[:20], len(body)),
+                        ],
+                    )
+                self.assertFalse((Path(directory) / "feature_demo.py").exists())
+            finally:
+                bootstrap._UPDATE_DIR = previous_update_dir
+                sys.path[:] = previous_path
+
+    def test_matching_content_length_still_installs(self):
+        previous_update_dir = bootstrap._UPDATE_DIR
+        previous_path = list(sys.path)
+        body = b"FEATURE = {'name': 'demo'}\ndef run():\n    return 'ready'\n"
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                bootstrap.init_env(directory)
+                result = self._install(
+                    directory, [self.FakeResponse(body, len(body))]
+                )
+                self.assertTrue(result["ok"])
+                self.assertTrue((Path(directory) / "feature_demo.py").is_file())
+            finally:
+                bootstrap._UPDATE_DIR = previous_update_dir
+                sys.path[:] = previous_path

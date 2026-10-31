@@ -336,9 +336,24 @@ def install_feature(
         try:
             request = urllib.request.Request(source, headers={"User-Agent": "ClientMqtt/1.0"})
             with urllib.request.urlopen(request, timeout=float(timeout)) as response:
+                headers = getattr(response, "headers", None)
+                expected_size = headers.get("Content-Length") if headers else None
                 content = response.read(MAX_FEATURE_SIZE + 1)
             if len(content) > MAX_FEATURE_SIZE:
                 raise ValueError("feature file exceeds size limit")
+            # 弱网/代理中途断流时 urlopen 可能静默返回半截内容，而 Python 允许用
+            # EOF 结束代码块，截断文件常常仍能 compile；装进去后 build_view 会缺
+            # 结尾 return 变成 None。有 Content-Length 就逐字节核对。
+            if expected_size:
+                try:
+                    expected_size = int(expected_size)
+                except (TypeError, ValueError):
+                    expected_size = 0
+                if expected_size and len(content) != expected_size:
+                    raise ValueError(
+                        "feature file truncated: %d/%d bytes"
+                        % (len(content), expected_size)
+                    )
             compile(content, name, "exec")
             digest = hashlib.sha256(content).hexdigest()
             if sha256 and digest.lower() != str(sha256).lower():
@@ -351,7 +366,7 @@ def install_feature(
             importlib.invalidate_caches()
             report(f"{name}: installed, sha256={digest}")
             return {"ok": True, "filename": name, "sha256": digest, "attempts": attempt}
-        except (URLError, TimeoutError, OSError, SyntaxError) as error:
+        except (URLError, TimeoutError, OSError, SyntaxError, ValueError) as error:
             last_error = error
             report(f"{name}: attempt {attempt} failed: {type(error).__name__}: {error}")
             if attempt < max_attempts:
